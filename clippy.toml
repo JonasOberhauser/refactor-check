@@ -1,0 +1,2 @@
+# Feature branch: moderate clippy
+# Run with: cargo clippy -- -W clippy::all

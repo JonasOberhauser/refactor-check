@@ -8,30 +8,26 @@ A Rust CLI tool that checks whether a "before" and "after" function are equivale
 4. Using a cheaper LLM to validate the first LLM's judgment of reasonableness
 
 ## Input Format
-A `.txt` file (see `src_stats.stats_general_print.txt` example) with sections:
-- Header: function name, source location
-- `--- BEFORE ---` / `--- AFTER ---`: the two function versions
-- `REFERENCED SYMBOLS`: recursively listed symbols (functions, macros, types)
+A `.txt` file (see `src_stats.stats_general_print.txt` example) containing before/after function code and referenced symbols. The file is passed verbatim to the LLM — no parsing needed.
 
 ## Architecture
 
 ### Modules
-1. **`input`** — Parse the txt file into a structured `RefactorInput` (before_code, after_code, referenced_symbols)
-2. **`llm`** — Async OpenAI-compatible client (via `async-openai`) supporting two models:
+1. **`llm`** — Async OpenAI-compatible client (via `async-openai`) supporting two models:
    - Primary LLM: generates formulas, analyzes solver output
    - Judge LLM (cheaper): summarizes as YES/NO
-3. **`smt`** — Extract SMT formulas from LLM responses, run Z3, classify output (error vs clean)
-4. **`agent`** — The main agent loop:
-   - Send input to primary LLM → extract formula
+2. **`smt`** — Extract SMT formulas from LLM responses, run Z3, classify output (error vs clean)
+3. **`agent`** — The main agent loop:
+   - Send input file verbatim to primary LLM → extract formula
    - If zero or multiple formulas found, insist until exactly one
    - Run Z3 on the formula
-   - On solver error: send full history (input + all prior formulas + solver responses + current formula + current solver response) to primary LLM
+   - On solver error: send full history (input file + all prior formulas + solver responses + current formula + current solver response) to primary LLM
    - On solver success: send formula + solver output to primary LLM, ask if reasonable or new formula needed
    - Pass primary LLM's response to judge LLM → YES/NO
    - On YES: output primary LLM response + formula to stdout, exit
    - On NO: loop back with full history
    - On other answer: insist judge LLM answer only YES or NO
-5. **`main`** — CLI entry point: parse args (input file, solver path, model configs), run agent
+4. **`main`** — CLI entry point: parse args (input file path, solver path, model configs), run agent
 
 ## Key Design Decisions
 - **LLM Client**: `async-openai` crate with custom base URL (OpenRouter: `https://openrouter.ai/api/v1`)
