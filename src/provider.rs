@@ -27,27 +27,37 @@ pub struct AgentResult {
 }
 
 pub struct SequenceLlm {
-    responses: Arc<Mutex<Vec<String>>>,
+    primary: Arc<Mutex<Vec<String>>>,
+    judge: Arc<Mutex<Vec<String>>>,
 }
 
 impl SequenceLlm {
-    pub fn new(responses: Vec<String>) -> Self {
+    pub fn new(primary: Vec<String>, judge: Vec<String>) -> Self {
         Self {
-            responses: Arc::new(Mutex::new(responses)),
+            primary: Arc::new(Mutex::new(primary)),
+            judge: Arc::new(Mutex::new(judge)),
         }
     }
 
-    pub fn remaining(&self) -> usize {
-        self.responses.lock().expect("lock poisoned").len()
+    pub fn primary_remaining(&self) -> usize {
+        self.primary.lock().expect("lock poisoned").len()
+    }
+
+    pub fn judge_remaining(&self) -> usize {
+        self.judge.lock().expect("lock poisoned").len()
     }
 }
 
 #[async_trait]
 impl LlmProvider for SequenceLlm {
-    async fn chat(&self, _role: LlmRole, _messages: Vec<Message>) -> Result<String> {
-        let mut responses = self.responses.lock().expect("lock poisoned");
+    async fn chat(&self, role: LlmRole, _messages: Vec<Message>) -> Result<String> {
+        let queue = match role {
+            LlmRole::Primary => &self.primary,
+            LlmRole::Judge => &self.judge,
+        };
+        let mut responses = queue.lock().expect("lock poisoned");
         if responses.is_empty() {
-            anyhow::bail!("SequenceLlm: no more responses available");
+            anyhow::bail!("SequenceLlm: no more {:?} responses available", role);
         }
         Ok(responses.remove(0))
     }
@@ -93,46 +103,41 @@ mod tests {
 
     #[tokio::test]
     async fn test_happy_path_unsat() {
-        let responses = vec![
-            formula_response(),
-            "The formula is unsat, meaning the two functions are equivalent.".to_string(),
-            "YES".to_string(),
-        ];
-        let llm = SequenceLlm::new(responses);
-        let solver = FakeSolver {
-            outcome: SolverOutcome::Unsat,
-        };
-
-        let input = "Some refactoring description";
-        let result = crate::agent::run_with_providers(input, &llm, &solver)
-            .await
-            .expect("agent should succeed");
-
-        assert!(!result.analysis.is_empty());
-        assert!(!result.formula.is_empty());
-        assert!(result.formula.contains("(set-logic"));
-        assert_eq!(llm.remaining(), 0, "all responses should be consumed");
-    }
-
-    #[tokio::test]
-    async fn test_formula_not_found_then_found() {
-        let responses = vec![
-            "I don't have a formula yet.".to_string(),
-            formula_response(),
-            "The solver says unsat, which is correct.".to_string(),
-            "YES".to_string(),
-        ];
-        let llm = SequenceLlm::new(responses);
-        let solver = FakeSolver {
-            outcome: SolverOutcome::Unsat,
-        };
+        let llm = SequenceLlm::new(
+            vec![formula_response(), "The formula is unsat, meaning equivalence.".to_string()],
+            vec!["YES".to_string()],
+        );
+        let solver = FakeSolver { outcome: SolverOutcome::Unsat };
 
         let result = crate::agent::run_with_providers("refactoring desc", &llm, &solver)
             .await
             .expect("agent should succeed");
 
         assert!(!result.analysis.is_empty());
-        assert_eq!(llm.remaining(), 0, "all responses should be consumed");
+        assert!(result.formula.contains("(set-logic"));
+        assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
+        assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
+    }
+
+    #[tokio::test]
+    async fn test_formula_not_found_then_found() {
+        let llm = SequenceLlm::new(
+            vec![
+                "I don't have a formula yet.".to_string(),
+                formula_response(),
+                "The solver says unsat, which is correct.".to_string(),
+            ],
+            vec!["YES".to_string()],
+        );
+        let solver = FakeSolver { outcome: SolverOutcome::Unsat };
+
+        let result = crate::agent::run_with_providers("refactoring desc", &llm, &solver)
+            .await
+            .expect("agent should succeed");
+
+        assert!(!result.analysis.is_empty());
+        assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
+        assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
     }
 
     #[tokio::test]
@@ -163,48 +168,47 @@ mod tests {
             }
         }
 
-        let responses = vec![
-            formula_response(),
-            "The solver had an error, let me fix it.".to_string(),
-            formula_response(),
-            "Now the formula is correct and unsat.".to_string(),
-            "YES".to_string(),
-        ];
-        let llm = SequenceLlm::new(responses);
+        let llm = SequenceLlm::new(
+            vec![
+                formula_response(),
+                "The solver had an error, let me fix it.".to_string(),
+                formula_response(),
+                "Now the formula is correct and unsat.".to_string(),
+            ],
+            vec!["YES".to_string()],
+        );
         let call_count = Arc::new(Mutex::new(0usize));
-        let solver = ToggleSolver {
-            call_count: call_count.clone(),
-        };
+        let solver = ToggleSolver { call_count: call_count.clone() };
 
         let result = crate::agent::run_with_providers("refactoring desc", &llm, &solver)
             .await
             .expect("agent should succeed");
 
         assert!(!result.analysis.is_empty());
-        assert_eq!(llm.remaining(), 0, "all responses should be consumed");
+        assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
+        assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
         assert_eq!(*call_count.lock().unwrap(), 2, "solver should be called twice");
     }
 
     #[tokio::test]
     async fn test_judge_says_no_then_yes() {
-        let responses = vec![
-            formula_response(),
-            "Analysis says unsat is correct.".to_string(),
-            "NO".to_string(),
-            formula_response(),
-            "Revised analysis confirms equivalence.".to_string(),
-            "YES".to_string(),
-        ];
-        let llm = SequenceLlm::new(responses);
-        let solver = FakeSolver {
-            outcome: SolverOutcome::Unsat,
-        };
+        let llm = SequenceLlm::new(
+            vec![
+                formula_response(),
+                "Analysis says unsat is correct.".to_string(),
+                formula_response(),
+                "Revised analysis confirms equivalence.".to_string(),
+            ],
+            vec!["NO".to_string(), "YES".to_string()],
+        );
+        let solver = FakeSolver { outcome: SolverOutcome::Unsat };
 
         let result = crate::agent::run_with_providers("refactoring desc", &llm, &solver)
             .await
             .expect("agent should succeed");
 
         assert!(!result.analysis.is_empty());
-        assert_eq!(llm.remaining(), 0, "all responses should be consumed");
+        assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
+        assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
     }
 }
