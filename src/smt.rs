@@ -17,9 +17,8 @@ pub struct SolverResult {
 
 pub fn extract_smt_formula(response: &str) -> Option<String> {
     let formulas = collect_smt_formulas(response);
-    let valid: Vec<String> = formulas.into_iter().filter(|f| looks_like_smt(f)).collect();
-    if valid.len() == 1 {
-        Some(valid.into_iter().next().unwrap())
+    if formulas.len() == 1 {
+        Some(formulas.into_iter().next().unwrap())
     } else {
         None
     }
@@ -97,14 +96,11 @@ fn is_smt_line(line: &str) -> bool {
     let line = line.trim();
     line.starts_with("(set-logic")
         || line.starts_with("(declare-")
-        || line.starts_with("(declare-fun")
-        || line.starts_with("(declare-const")
         || line.starts_with("(assert")
         || line.starts_with("(check-sat")
         || line.starts_with("(get-model)")
         || line.starts_with("(get-value")
         || line.starts_with("(define-fun")
-        || line.starts_with("(define-const")
         || line.starts_with("(push)")
         || line.starts_with("(pop)")
         || line.starts_with("(exit)")
@@ -120,6 +116,41 @@ fn looks_like_smt(text: &str) -> bool {
         && text.contains("(check-sat")
         && (text.contains("(declare-") || text.contains("(define-fun"))
         && text.contains("(assert")
+}
+
+fn parse_solver_outcome(stdout: &str, stderr: &str) -> SolverOutcome {
+    if !stderr.trim().is_empty()
+        && (stderr.contains("error") || stderr.contains("Error") || stderr.contains("ERROR"))
+    {
+        return SolverOutcome::Error(stderr.trim().to_string());
+    }
+
+    let first_meaningful = stdout
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty());
+
+    match first_meaningful {
+        Some(line) if line.starts_with("unsat") => SolverOutcome::Unsat,
+        Some(line) if line.starts_with("sat") => SolverOutcome::Sat,
+        Some(line) if line.starts_with("unknown") => SolverOutcome::Unknown,
+        Some(_) => {
+            let trimmed = stdout.trim();
+            if trimmed.contains("error")
+                || trimmed.contains("Error")
+                || trimmed.contains("ERROR")
+            {
+                SolverOutcome::Error(trimmed.to_string())
+            } else {
+                SolverOutcome::Unknown
+            }
+        }
+        None => SolverOutcome::Unknown,
+    }
+}
+
+fn bytes_to_string(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 pub async fn run_solver(solver_path: &str, formula: &str) -> Result<SolverResult> {
@@ -147,28 +178,9 @@ pub async fn run_solver(solver_path: &str, formula: &str) -> Result<SolverResult
     .await
     .context("Solver task panicked")??;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    let outcome = if !stderr.trim().is_empty()
-        && (stderr.contains("error") || stderr.contains("Error") || stderr.contains("ERROR"))
-    {
-        SolverOutcome::Error(stderr.trim().to_string())
-    } else {
-        match stdout.trim() {
-            s if s.starts_with("sat") => SolverOutcome::Sat,
-            s if s.starts_with("unsat") => SolverOutcome::Unsat,
-            s if s.starts_with("unknown") => SolverOutcome::Unknown,
-            s => {
-                // Check if there are error-like messages in stdout too
-                if s.contains("error") || s.contains("Error") || s.contains("ERROR") {
-                    SolverOutcome::Error(s.to_string())
-                } else {
-                    SolverOutcome::Unknown
-                }
-            }
-        }
-    };
+    let stdout = bytes_to_string(output.stdout);
+    let stderr = bytes_to_string(output.stderr);
+    let outcome = parse_solver_outcome(&stdout, &stderr);
 
     Ok(SolverResult {
         outcome,

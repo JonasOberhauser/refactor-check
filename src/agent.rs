@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 
-use crate::llm::{LlmClient, LlmConfig, system_message, user_message};
+use crate::llm::{LlmClient, LlmConfig, Message, system_message, user_message};
 use crate::smt::{SolverResult, SolverOutcome, extract_smt_formula, run_solver};
 
-const MAX_ITERATIONS: u32 = 10;
+const MAX_ITERATIONS: usize = 10;
+const MAX_INSIST_ATTEMPTS: usize = 5;
+const MAX_JUDGE_ATTEMPTS: usize = 5;
 
 pub struct AgentConfig {
     pub llm_config: LlmConfig,
@@ -36,8 +38,7 @@ pub async fn run(input_file: &str, config: AgentConfig) -> Result<()> {
             Some(f) => f,
             None => {
                 eprintln!("No single SMT formula found, insisting...");
-                current_formula = Some(insist_on_formula(&client, &input_content, &response).await?);
-                continue;
+                insist_on_formula(&client, &input_content, &response).await?
             }
         };
 
@@ -103,7 +104,7 @@ fn build_generation_messages(
     input_content: &str,
     history: &[HistoryEntry],
     is_first: bool,
-) -> Vec<(String, String)> {
+) -> Vec<Message> {
     let mut messages = Vec::new();
 
     messages.push(system_message(
@@ -151,13 +152,12 @@ async fn insist_on_formula(
     previous_response: &str,
 ) -> Result<String> {
     let mut attempt = 0;
-    let max_insist = 5;
     let mut last_response = previous_response.to_string();
 
     loop {
         attempt += 1;
-        if attempt > max_insist {
-            anyhow::bail!("Failed to extract a single SMT formula after {max_insist} attempts");
+        if attempt > MAX_INSIST_ATTEMPTS {
+            anyhow::bail!("Failed to extract a single SMT formula after {MAX_INSIST_ATTEMPTS} attempts");
         }
 
         let messages = vec![
@@ -187,7 +187,7 @@ fn build_error_analysis_messages(
     history: &[HistoryEntry],
     current_formula: &str,
     solver_result: &SolverResult,
-) -> Vec<(String, String)> {
+) -> Vec<Message> {
     let mut content = format!("Here is the input file:\n\n{input_content}\n\n");
     content.push_str("Full history of prior attempts:\n\n");
     for (i, entry) in history.iter().enumerate() {
@@ -216,7 +216,7 @@ fn build_error_analysis_messages(
 fn build_success_analysis_messages(
     current_formula: &str,
     solver_result: &SolverResult,
-) -> Vec<(String, String)> {
+) -> Vec<Message> {
     vec![
         system_message(
             "You are an expert in formal verification and SMT-LIB2. \
@@ -237,13 +237,12 @@ fn build_success_analysis_messages(
 
 async fn judge_analysis(client: &LlmClient, analysis: &str) -> Result<String> {
     let mut attempts = 0;
-    let max_attempts = 5;
     let mut last_analysis = analysis.to_string();
 
     loop {
         attempts += 1;
-        if attempts > max_attempts {
-            anyhow::bail!("Judge failed to give a clear YES/NO after {max_attempts} attempts");
+        if attempts > MAX_JUDGE_ATTEMPTS {
+            anyhow::bail!("Judge failed to give a clear YES/NO after {MAX_JUDGE_ATTEMPTS} attempts");
         }
 
         let messages = vec![

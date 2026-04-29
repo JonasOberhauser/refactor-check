@@ -1,12 +1,34 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Role {
+    System,
+    User,
+}
+
+pub struct Message {
+    pub role: Role,
+    pub content: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     pub api_key: String,
     pub api_base: String,
     pub primary_model: String,
     pub judge_model: String,
+}
+
+impl fmt::Debug for LlmConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LlmConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("api_base", &self.api_base)
+            .field("primary_model", &self.primary_model)
+            .field("judge_model", &self.judge_model)
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -46,6 +68,8 @@ struct ApiErrorDetail {
     message: String,
 }
 
+const MAX_RETRIES: usize = 5;
+
 pub struct LlmClient {
     http: reqwest::Client,
     config: LlmConfig,
@@ -57,18 +81,24 @@ impl LlmClient {
         Self { http, config }
     }
 
-    pub async fn chat_primary(&self, messages: Vec<(String, String)>) -> Result<String> {
+    pub async fn chat_primary(&self, messages: Vec<Message>) -> Result<String> {
         self.chat(&self.config.primary_model, messages).await
     }
 
-    pub async fn chat_judge(&self, messages: Vec<(String, String)>) -> Result<String> {
+    pub async fn chat_judge(&self, messages: Vec<Message>) -> Result<String> {
         self.chat(&self.config.judge_model, messages).await
     }
 
-    async fn chat(&self, model: &str, messages: Vec<(String, String)>) -> Result<String> {
+    async fn chat(&self, model: &str, messages: Vec<Message>) -> Result<String> {
         let chat_messages: Vec<ChatMessage> = messages
             .into_iter()
-            .map(|(role, content)| ChatMessage { role, content })
+            .map(|msg| ChatMessage {
+                role: match msg.role {
+                    Role::System => "system".to_string(),
+                    Role::User => "user".to_string(),
+                },
+                content: msg.content,
+            })
             .collect();
 
         let request = ChatRequest {
@@ -78,8 +108,7 @@ impl LlmClient {
 
         let url = format!("{}/chat/completions", self.config.api_base.trim_end_matches('/'));
 
-        let max_retries = 5;
-        for attempt in 0..max_retries {
+        for attempt in 0..MAX_RETRIES {
             let response = self
                 .http
                 .post(&url)
@@ -113,9 +142,10 @@ impl LlmClient {
                 body.clone()
             };
 
-            if status.as_u16() == 429 && attempt < max_retries - 1 {
+            let is_retryable = status.as_u16() == 429 || status.is_server_error();
+            if is_retryable && attempt < MAX_RETRIES - 1 {
                 let wait = std::cmp::min(2u64.pow(attempt as u32 + 1), 30);
-                eprintln!("Rate limited, retrying in {wait}s: {error_msg}");
+                eprintln!("Retryable error ({status}), retrying in {wait}s: {error_msg}");
                 tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                 continue;
             }
@@ -123,14 +153,20 @@ impl LlmClient {
             anyhow::bail!("LLM API error ({}): {}", status, error_msg);
         }
 
-        anyhow::bail!("LLM API: exhausted retries")
+        anyhow::bail!("LLM API: exhausted {MAX_RETRIES} retries")
     }
 }
 
-pub fn system_message(content: &str) -> (String, String) {
-    ("system".to_string(), content.to_string())
+pub fn system_message(content: &str) -> Message {
+    Message {
+        role: Role::System,
+        content: content.to_string(),
+    }
 }
 
-pub fn user_message(content: &str) -> (String, String) {
-    ("user".to_string(), content.to_string())
+pub fn user_message(content: &str) -> Message {
+    Message {
+        role: Role::User,
+        content: content.to_string(),
+    }
 }
