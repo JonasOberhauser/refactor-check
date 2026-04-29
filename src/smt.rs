@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::process::Output;
+use tracing::{debug, info, instrument, trace};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SolverOutcome {
@@ -16,7 +17,9 @@ pub struct SolverResult {
 }
 
 pub fn extract_smt_formula(response: &str) -> Option<String> {
+    trace!("extracting SMT formula from LLM response");
     let formulas = collect_smt_formulas(response);
+    debug!(count = formulas.len(), "SMT formula candidates found");
     if formulas.len() == 1 {
         Some(formulas.into_iter().next().unwrap())
     } else {
@@ -27,7 +30,6 @@ pub fn extract_smt_formula(response: &str) -> Option<String> {
 fn collect_smt_formulas(text: &str) -> Vec<String> {
     let mut formulas = Vec::new();
 
-    // First try to extract from fenced code blocks
     let mut in_fence = false;
     let mut fence_len = 0;
     let mut fence_buf = String::new();
@@ -54,13 +56,10 @@ fn collect_smt_formulas(text: &str) -> Vec<String> {
         }
     }
 
-    // If we found formulas in fences, return those
     if !formulas.is_empty() {
         return formulas;
     }
 
-    // Otherwise, try to find bare SMT content
-    // Collect contiguous blocks of SMT-like lines
     let mut current_block = String::new();
     let mut in_block = false;
 
@@ -153,7 +152,11 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
+#[instrument(skip_all, fields(solver_path))]
 pub async fn run_solver(solver_path: &str, formula: &str) -> Result<SolverResult> {
+    info!(formula_bytes = formula.len(), "running SMT solver");
+    let start = std::time::Instant::now();
+
     let output = tokio::task::spawn_blocking({
         let solver_path = solver_path.to_string();
         let formula = formula.to_string();
@@ -178,9 +181,17 @@ pub async fn run_solver(solver_path: &str, formula: &str) -> Result<SolverResult
     .await
     .context("Solver task panicked")??;
 
+    let elapsed = start.elapsed();
     let stdout = bytes_to_string(output.stdout);
     let stderr = bytes_to_string(output.stderr);
     let outcome = parse_solver_outcome(&stdout, &stderr);
+    info!(
+        ?outcome,
+        elapsed_ms = elapsed.as_millis(),
+        stdout_bytes = stdout.len(),
+        stderr_bytes = stderr.len(),
+        "solver finished"
+    );
 
     Ok(SolverResult {
         outcome,

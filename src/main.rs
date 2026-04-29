@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use refactor_check::agent::{AgentConfig, run};
 use refactor_check::llm::LlmConfig;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "refactor-check", about = "Check refactoring equivalence via SMT solving")]
@@ -33,6 +34,13 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("refactor_check=info")),
+        )
+        .init();
+
     let cli = Cli::parse();
 
     let api_key = cli.api_key.ok_or_else(|| {

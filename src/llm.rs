@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use tracing::{debug, info, instrument, warn};
 
 pub enum Role {
     System,
@@ -81,15 +82,17 @@ impl LlmClient {
         Self { http, config }
     }
 
+    #[instrument(skip_all, fields(model = %self.config.primary_model))]
     pub async fn chat_primary(&self, messages: Vec<Message>) -> Result<String> {
-        self.chat(&self.config.primary_model, messages).await
+        self.chat("primary", &self.config.primary_model, messages).await
     }
 
+    #[instrument(skip_all, fields(model = %self.config.judge_model))]
     pub async fn chat_judge(&self, messages: Vec<Message>) -> Result<String> {
-        self.chat(&self.config.judge_model, messages).await
+        self.chat("judge", &self.config.judge_model, messages).await
     }
 
-    async fn chat(&self, model: &str, messages: Vec<Message>) -> Result<String> {
+    async fn chat(&self, label: &str, model: &str, messages: Vec<Message>) -> Result<String> {
         let chat_messages: Vec<ChatMessage> = messages
             .into_iter()
             .map(|msg| ChatMessage {
@@ -109,6 +112,8 @@ impl LlmClient {
         let url = format!("{}/chat/completions", self.config.api_base.trim_end_matches('/'));
 
         for attempt in 0..MAX_RETRIES {
+            debug!(%label, attempt, "sending LLM request");
+
             let response = self
                 .http
                 .post(&url)
@@ -130,7 +135,9 @@ impl LlmClient {
                     .into_iter()
                     .next()
                     .context("No response from LLM")?;
-                return Ok(choice.message.content.unwrap_or_default().trim().to_string());
+                let content = choice.message.content.unwrap_or_default().trim().to_string();
+                info!(%label, bytes = content.len(), "LLM response received");
+                return Ok(content);
             }
 
             let error_msg = if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
@@ -145,7 +152,7 @@ impl LlmClient {
             let is_retryable = status.as_u16() == 429 || status.is_server_error();
             if is_retryable && attempt < MAX_RETRIES - 1 {
                 let wait = std::cmp::min(2u64.pow(attempt as u32 + 1), 30);
-                eprintln!("Retryable error ({status}), retrying in {wait}s: {error_msg}");
+                warn!(%label, %status, wait_secs = wait, %error_msg, "retryable error, sleeping");
                 tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                 continue;
             }

@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
+use tracing::{debug, info, instrument, warn};
 
 use crate::llm::{LlmClient, LlmConfig, Message, system_message, user_message};
-use crate::smt::{SolverResult, SolverOutcome, extract_smt_formula, run_solver};
+use crate::smt::{SolverOutcome, extract_smt_formula, run_solver};
 
 const MAX_ITERATIONS: usize = 10;
 const MAX_INSIST_ATTEMPTS: usize = 5;
@@ -19,51 +20,52 @@ pub struct HistoryEntry {
     pub had_error: bool,
 }
 
+#[instrument(skip_all, fields(input_file = input_file))]
 pub async fn run(input_file: &str, config: AgentConfig) -> Result<()> {
     let input_content = std::fs::read_to_string(input_file)
         .with_context(|| format!("Failed to read input file: {input_file}"))?;
+    info!(bytes = input_content.len(), "input file loaded");
 
     let client = LlmClient::new(config.llm_config);
     let mut history: Vec<HistoryEntry> = Vec::new();
     let mut current_formula: Option<String> = None;
 
     for iteration in 0..MAX_ITERATIONS {
-        eprintln!("--- Iteration {} ---", iteration + 1);
+        info!(iteration = iteration + 1, "starting iteration");
 
         let messages = build_generation_messages(&input_content, &history, current_formula.is_none());
         let response = client.chat_primary(messages).await?;
-        eprintln!("LLM response received ({} bytes)", response.len());
 
         let formula = match extract_smt_formula(&response) {
             Some(f) => f,
             None => {
-                eprintln!("No single SMT formula found, insisting...");
+                warn!("no single SMT formula found, insisting");
                 insist_on_formula(&client, &input_content, &response).await?
             }
         };
 
-        eprintln!("Formula extracted ({} bytes)", formula.len());
+        debug!(formula_bytes = formula.len(), "formula extracted");
 
         let solver_result = run_solver(&config.solver_path, &formula).await?;
         let had_error = matches!(solver_result.outcome, SolverOutcome::Error(_));
 
-        eprintln!(
-            "Solver outcome: {}",
-            match &solver_result.outcome {
+        info!(
+            outcome = match &solver_result.outcome {
                 SolverOutcome::Sat => "sat",
                 SolverOutcome::Unsat => "unsat",
                 SolverOutcome::Unknown => "unknown",
                 SolverOutcome::Error(e) => e,
-            }
+            },
+            "solver outcome"
         );
 
         if had_error {
-            eprintln!("Solver error detected, skipping judge and looping back...");
+            warn!("solver error, looping back with error analysis");
             let analysis_messages = build_error_analysis_messages(
                 &input_content, &history, &formula, &solver_result,
             );
             let analysis = client.chat_primary(analysis_messages).await?;
-            eprintln!("Error analysis received ({} bytes)", analysis.len());
+            debug!(bytes = analysis.len(), "error analysis received");
 
             history.push(HistoryEntry {
                 formula: formula.clone(),
@@ -77,10 +79,10 @@ pub async fn run(input_file: &str, config: AgentConfig) -> Result<()> {
 
         let analysis_messages = build_success_analysis_messages(&formula, &solver_result);
         let analysis = client.chat_primary(analysis_messages).await?;
-        eprintln!("Analysis received ({} bytes)", analysis.len());
+        debug!(bytes = analysis.len(), "success analysis received");
 
         let verdict = judge_analysis(&client, &analysis).await?;
-        eprintln!("Judge verdict: {}", verdict);
+        info!(verdict = %verdict, "judge verdict");
 
         if verdict == "YES" {
             println!("=== LLM Analysis ===\n{analysis}\n");
@@ -146,6 +148,7 @@ fn build_generation_messages(
     messages
 }
 
+#[instrument(skip_all)]
 async fn insist_on_formula(
     client: &LlmClient,
     input_content: &str,
@@ -159,6 +162,8 @@ async fn insist_on_formula(
         if attempt > MAX_INSIST_ATTEMPTS {
             anyhow::bail!("Failed to extract a single SMT formula after {MAX_INSIST_ATTEMPTS} attempts");
         }
+
+        debug!(attempt, "insisting on single formula");
 
         let messages = vec![
             system_message(
@@ -176,6 +181,7 @@ async fn insist_on_formula(
 
         let response = client.chat_primary(messages).await?;
         if let Some(formula) = extract_smt_formula(&response) {
+            info!(attempt, "formula extracted after insistence");
             return Ok(formula);
         }
         last_response = response;
@@ -186,7 +192,7 @@ fn build_error_analysis_messages(
     input_content: &str,
     history: &[HistoryEntry],
     current_formula: &str,
-    solver_result: &SolverResult,
+    solver_result: &crate::smt::SolverResult,
 ) -> Vec<Message> {
     let mut content = format!("Here is the input file:\n\n{input_content}\n\n");
     content.push_str("Full history of prior attempts:\n\n");
@@ -215,7 +221,7 @@ fn build_error_analysis_messages(
 
 fn build_success_analysis_messages(
     current_formula: &str,
-    solver_result: &SolverResult,
+    solver_result: &crate::smt::SolverResult,
 ) -> Vec<Message> {
     vec![
         system_message(
@@ -235,6 +241,7 @@ fn build_success_analysis_messages(
     ]
 }
 
+#[instrument(skip_all)]
 async fn judge_analysis(client: &LlmClient, analysis: &str) -> Result<String> {
     let mut attempts = 0;
     let mut last_analysis = analysis.to_string();
@@ -244,6 +251,8 @@ async fn judge_analysis(client: &LlmClient, analysis: &str) -> Result<String> {
         if attempts > MAX_JUDGE_ATTEMPTS {
             anyhow::bail!("Judge failed to give a clear YES/NO after {MAX_JUDGE_ATTEMPTS} attempts");
         }
+
+        debug!(attempt = attempts, "asking judge for verdict");
 
         let messages = vec![
             system_message(
@@ -267,7 +276,7 @@ async fn judge_analysis(client: &LlmClient, analysis: &str) -> Result<String> {
         } else if trimmed.starts_with("NO") {
             return Ok("NO".to_string());
         } else {
-            eprintln!("Judge gave unclear answer: {}, insisting...", response);
+            warn!(response = %response, "judge gave unclear answer, insisting");
             last_analysis = format!(
                 "{analysis}\n\n\
                  Your previous answer was: '{response}'. \
