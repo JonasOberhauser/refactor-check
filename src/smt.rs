@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use std::process::Output;
 use tracing::{debug, info, instrument, trace};
+
+use crate::provider::SolverProvider;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SolverOutcome {
@@ -198,4 +201,21 @@ pub async fn run_solver(solver_path: &str, formula: &str) -> Result<SolverResult
         stdout,
         stderr,
     })
+}
+
+pub struct Z3Solver {
+    solver_path: String,
+}
+
+impl Z3Solver {
+    pub fn new(solver_path: String) -> Self {
+        Self { solver_path }
+    }
+}
+
+#[async_trait]
+impl SolverProvider for Z3Solver {
+    async fn run(&self, formula: &str) -> Result<SolverResult> {
+        run_solver(&self.solver_path, formula).await
+    }
 }
