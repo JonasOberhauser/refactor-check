@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use tracing::{debug, info, instrument, warn};
 
 use crate::llm::{LlmClient, LlmConfig, Message, system_message, user_message};
-use crate::smt::{SolverOutcome, extract_smt_formula, run_solver};
+use crate::provider::{AgentResult, LlmProvider, LlmRole, SolverProvider};
+use crate::smt::{SolverOutcome, Z3Solver, extract_smt_formula};
 
 const MAX_ITERATIONS: usize = 10;
 const MAX_INSIST_ATTEMPTS: usize = 5;
@@ -20,33 +21,47 @@ pub struct HistoryEntry {
     pub had_error: bool,
 }
 
-#[instrument(skip_all, fields(input_file = input_file))]
 pub async fn run(input_file: &str, config: AgentConfig) -> Result<()> {
     let input_content = std::fs::read_to_string(input_file)
         .with_context(|| format!("Failed to read input file: {input_file}"))?;
-    info!(bytes = input_content.len(), "input file loaded");
 
-    let client = LlmClient::new(config.llm_config);
+    let llm = LlmClient::new(config.llm_config);
+    let solver = Z3Solver::new(config.solver_path);
+
+    let result = run_with_providers(&input_content, &llm, &solver).await?;
+    println!("=== LLM Analysis ===\n{}\n", result.analysis);
+    println!("=== SMT Formula ===\n{}", result.formula);
+    Ok(())
+}
+
+#[instrument(skip_all, fields(input_bytes = input_content.len()))]
+pub async fn run_with_providers(
+    input_content: &str,
+    llm: &dyn LlmProvider,
+    solver: &dyn SolverProvider,
+) -> Result<AgentResult> {
+    info!(bytes = input_content.len(), "input loaded");
+
     let mut history: Vec<HistoryEntry> = Vec::new();
     let mut current_formula: Option<String> = None;
 
     for iteration in 0..MAX_ITERATIONS {
         info!(iteration = iteration + 1, "starting iteration");
 
-        let messages = build_generation_messages(&input_content, &history, current_formula.is_none());
-        let response = client.chat_primary(messages).await?;
+        let messages = build_generation_messages(input_content, &history, current_formula.is_none());
+        let response = llm.chat(LlmRole::Primary, messages).await?;
 
         let formula = match extract_smt_formula(&response) {
             Some(f) => f,
             None => {
                 warn!("no single SMT formula found, insisting");
-                insist_on_formula(&client, &input_content, &response).await?
+                insist_on_formula(llm, input_content, &response).await?
             }
         };
 
         debug!(formula_bytes = formula.len(), "formula extracted");
 
-        let solver_result = run_solver(&config.solver_path, &formula).await?;
+        let solver_result = solver.run(&formula).await?;
         let had_error = matches!(solver_result.outcome, SolverOutcome::Error(_));
 
         info!(
@@ -62,9 +77,9 @@ pub async fn run(input_file: &str, config: AgentConfig) -> Result<()> {
         if had_error {
             warn!("solver error, looping back with error analysis");
             let analysis_messages = build_error_analysis_messages(
-                &input_content, &history, &formula, &solver_result,
+                input_content, &history, &formula, &solver_result,
             );
-            let analysis = client.chat_primary(analysis_messages).await?;
+            let analysis = llm.chat(LlmRole::Primary, analysis_messages).await?;
             debug!(bytes = analysis.len(), "error analysis received");
 
             history.push(HistoryEntry {
@@ -78,16 +93,17 @@ pub async fn run(input_file: &str, config: AgentConfig) -> Result<()> {
         }
 
         let analysis_messages = build_success_analysis_messages(&formula, &solver_result);
-        let analysis = client.chat_primary(analysis_messages).await?;
+        let analysis = llm.chat(LlmRole::Primary, analysis_messages).await?;
         debug!(bytes = analysis.len(), "success analysis received");
 
-        let verdict = judge_analysis(&client, &analysis).await?;
+        let verdict = judge_analysis(llm, &analysis).await?;
         info!(verdict = %verdict, "judge verdict");
 
         if verdict == "YES" {
-            println!("=== LLM Analysis ===\n{analysis}\n");
-            println!("=== SMT Formula ===\n{formula}");
-            return Ok(());
+            return Ok(AgentResult {
+                analysis,
+                formula,
+            });
         }
 
         history.push(HistoryEntry {
@@ -150,7 +166,7 @@ fn build_generation_messages(
 
 #[instrument(skip_all)]
 async fn insist_on_formula(
-    client: &LlmClient,
+    llm: &dyn LlmProvider,
     input_content: &str,
     previous_response: &str,
 ) -> Result<String> {
@@ -179,7 +195,7 @@ async fn insist_on_formula(
             )),
         ];
 
-        let response = client.chat_primary(messages).await?;
+        let response = llm.chat(LlmRole::Primary, messages).await?;
         if let Some(formula) = extract_smt_formula(&response) {
             info!(attempt, "formula extracted after insistence");
             return Ok(formula);
@@ -242,7 +258,7 @@ fn build_success_analysis_messages(
 }
 
 #[instrument(skip_all)]
-async fn judge_analysis(client: &LlmClient, analysis: &str) -> Result<String> {
+async fn judge_analysis(llm: &dyn LlmProvider, analysis: &str) -> Result<String> {
     let mut attempts = 0;
     let mut last_analysis = analysis.to_string();
 
@@ -267,7 +283,7 @@ async fn judge_analysis(client: &LlmClient, analysis: &str) -> Result<String> {
             user_message(&last_analysis),
         ];
 
-        let response = client.chat_judge(messages).await?;
+        let response = llm.chat(LlmRole::Judge, messages).await?;
         let upper = response.trim().to_uppercase();
         let trimmed = upper.trim_start_matches(|c: char| !c.is_alphabetic());
 

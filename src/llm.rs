@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use tracing::{debug, info, instrument, warn};
+
+use crate::provider::{LlmProvider, LlmRole};
 
 pub enum Role {
     System,
@@ -195,5 +198,15 @@ pub fn user_message(content: &str) -> Message {
     Message {
         role: Role::User,
         content: content.to_string(),
+    }
+}
+
+#[async_trait]
+impl LlmProvider for LlmClient {
+    async fn chat(&self, role: LlmRole, messages: Vec<Message>) -> Result<String> {
+        match role {
+            LlmRole::Primary => self.chat_primary(messages).await,
+            LlmRole::Judge => self.chat_judge(messages).await,
+        }
     }
 }
