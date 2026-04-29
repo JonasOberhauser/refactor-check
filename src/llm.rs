@@ -52,6 +52,7 @@ struct ChatResponse {
 #[derive(Debug, Deserialize)]
 struct ChatChoice {
     message: ChatChoiceMessage,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,13 +129,28 @@ impl LlmClient {
             let body = response.text().await.context("Failed to read LLM response body")?;
 
             if status.is_success() {
-                let chat_response: ChatResponse =
-                    serde_json::from_str(&body).context("Failed to parse LLM response")?;
+                let chat_response: ChatResponse = match serde_json::from_str(&body) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let snippet: String = body.chars().take(500).collect();
+                        warn!(%label, error = %e, body_len = body.len(), %snippet, "failed to parse LLM response JSON");
+                        if attempt < MAX_RETRIES - 1 {
+                            let wait = std::cmp::min(2u64.pow(attempt as u32 + 1), 30);
+                            info!(%label, wait_secs = wait, "retrying after parse failure");
+                            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                            continue;
+                        }
+                        anyhow::bail!("Failed to parse LLM response JSON after {MAX_RETRIES} attempts: {e}\nResponse snippet: {snippet}");
+                    }
+                };
                 let choice = chat_response
                     .choices
                     .into_iter()
                     .next()
                     .context("No response from LLM")?;
+                if choice.finish_reason.as_deref() == Some("length") {
+                    warn!(%label, bytes = choice.message.content.as_ref().map_or(0, |c| c.len()), "LLM response truncated (finish_reason=length)");
+                }
                 let content = choice.message.content.unwrap_or_default().trim().to_string();
                 info!(%label, bytes = content.len(), "LLM response received");
                 return Ok(content);
