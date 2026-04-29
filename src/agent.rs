@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use async_openai::types::ChatCompletionRequestMessage;
 
 use crate::llm::{LlmClient, LlmConfig, system_message, user_message};
 use crate::smt::{SolverResult, SolverOutcome, extract_smt_formula, run_solver};
@@ -24,18 +23,15 @@ pub async fn run(input_file: &str, config: AgentConfig) -> Result<()> {
 
     let client = LlmClient::new(config.llm_config);
     let mut history: Vec<HistoryEntry> = Vec::new();
-
     let mut current_formula: Option<String> = None;
 
     for iteration in 0..MAX_ITERATIONS {
         eprintln!("--- Iteration {} ---", iteration + 1);
 
-        // Step 1: Get formula from LLM
         let messages = build_generation_messages(&input_content, &history, current_formula.is_none());
         let response = client.chat_primary(messages).await?;
         eprintln!("LLM response received ({} bytes)", response.len());
 
-        // Step 2: Extract exactly one SMT formula
         let formula = match extract_smt_formula(&response) {
             Some(f) => f,
             None => {
@@ -47,10 +43,8 @@ pub async fn run(input_file: &str, config: AgentConfig) -> Result<()> {
 
         eprintln!("Formula extracted ({} bytes)", formula.len());
 
-        // Step 3: Run solver
         let solver_result = run_solver(&config.solver_path, &formula).await?;
-        let had_error = solver_result.outcome == SolverOutcome::Error(String::new())
-            || matches!(solver_result.outcome, SolverOutcome::Error(_));
+        let had_error = matches!(solver_result.outcome, SolverOutcome::Error(_));
 
         eprintln!(
             "Solver outcome: {}",
@@ -62,17 +56,28 @@ pub async fn run(input_file: &str, config: AgentConfig) -> Result<()> {
             }
         );
 
-        // Step 4: Handle solver error vs success
-        let analysis_messages = if had_error {
-            build_error_analysis_messages(&input_content, &history, &formula, &solver_result)
-        } else {
-            build_success_analysis_messages(&formula, &solver_result)
-        };
+        if had_error {
+            eprintln!("Solver error detected, skipping judge and looping back...");
+            let analysis_messages = build_error_analysis_messages(
+                &input_content, &history, &formula, &solver_result,
+            );
+            let analysis = client.chat_primary(analysis_messages).await?;
+            eprintln!("Error analysis received ({} bytes)", analysis.len());
 
+            history.push(HistoryEntry {
+                formula: formula.clone(),
+                solver_stdout: solver_result.stdout.clone(),
+                solver_stderr: solver_result.stderr.clone(),
+                had_error,
+            });
+            current_formula = Some(formula);
+            continue;
+        }
+
+        let analysis_messages = build_success_analysis_messages(&formula, &solver_result);
         let analysis = client.chat_primary(analysis_messages).await?;
         eprintln!("Analysis received ({} bytes)", analysis.len());
 
-        // Step 5: Judge the analysis with cheaper LLM
         let verdict = judge_analysis(&client, &analysis).await?;
         eprintln!("Judge verdict: {}", verdict);
 
@@ -82,7 +87,6 @@ pub async fn run(input_file: &str, config: AgentConfig) -> Result<()> {
             return Ok(());
         }
 
-        // NO — record history and loop
         history.push(HistoryEntry {
             formula: formula.clone(),
             solver_stdout: solver_result.stdout.clone(),
@@ -99,7 +103,7 @@ fn build_generation_messages(
     input_content: &str,
     history: &[HistoryEntry],
     is_first: bool,
-) -> Vec<ChatCompletionRequestMessage> {
+) -> Vec<(String, String)> {
     let mut messages = Vec::new();
 
     messages.push(system_message(
@@ -122,7 +126,6 @@ fn build_generation_messages(
              Generate a single complete SMT-LIB2 formula checking equivalence of the before and after functions."
         )));
     } else {
-        // Build a message with full history
         let mut content = format!("Here is the refactoring description:\n\n{input_content}\n\n");
         content.push_str("Previous attempts failed. Here is the full history:\n\n");
         for (i, entry) in history.iter().enumerate() {
@@ -184,7 +187,7 @@ fn build_error_analysis_messages(
     history: &[HistoryEntry],
     current_formula: &str,
     solver_result: &SolverResult,
-) -> Vec<ChatCompletionRequestMessage> {
+) -> Vec<(String, String)> {
     let mut content = format!("Here is the input file:\n\n{input_content}\n\n");
     content.push_str("Full history of prior attempts:\n\n");
     for (i, entry) in history.iter().enumerate() {
@@ -213,7 +216,7 @@ fn build_error_analysis_messages(
 fn build_success_analysis_messages(
     current_formula: &str,
     solver_result: &SolverResult,
-) -> Vec<ChatCompletionRequestMessage> {
+) -> Vec<(String, String)> {
     vec![
         system_message(
             "You are an expert in formal verification and SMT-LIB2. \
@@ -245,8 +248,12 @@ async fn judge_analysis(client: &LlmClient, analysis: &str) -> Result<String> {
 
         let messages = vec![
             system_message(
-                "You are a judge. Read the analysis below and determine: \
-                 does the analysis indicate that the solver response is REASONABLE? \
+                "You are a judge evaluating an SMT-based equivalence check. \
+                 The SMT solver ran SUCCESSFULLY (no errors). \
+                 Read the analysis below and determine: \
+                 does the analysis confirm that the solver result is CORRECT and REASONABLE, \
+                 meaning the formula properly encodes the equivalence check \
+                 and the solver's answer (sat/unsat/unknown) is a valid conclusion? \
                  \n\nAnswer ONLY with YES or NO. Nothing else."
             ),
             user_message(&last_analysis),
@@ -265,7 +272,7 @@ async fn judge_analysis(client: &LlmClient, analysis: &str) -> Result<String> {
             last_analysis = format!(
                 "{analysis}\n\n\
                  Your previous answer was: '{response}'. \
-                 You MUST answer ONLY with YES or NO. Does the analysis indicate the solver response is reasonable?"
+                 You MUST answer ONLY with YES or NO. Does the analysis confirm the solver result is correct and reasonable?"
             );
         }
     }

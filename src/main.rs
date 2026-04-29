@@ -15,11 +15,11 @@ struct Cli {
     solver_path: String,
 
     /// Primary LLM model identifier
-    #[arg(long, default_value = "openrouter/z-ai/glm-5.1")]
+    #[arg(long, default_value = "qwen/qwen3-coder:free")]
     primary_model: String,
 
     /// Judge (cheaper) LLM model identifier
-    #[arg(long, default_value = "openrouter/meta-llama/llama-3.1-8b-instruct")]
+    #[arg(long, default_value = "google/gemma-3-4b-it:free")]
     judge_model: String,
 
     /// API base URL

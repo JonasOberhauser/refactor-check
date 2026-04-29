@@ -17,8 +17,9 @@ pub struct SolverResult {
 
 pub fn extract_smt_formula(response: &str) -> Option<String> {
     let formulas = collect_smt_formulas(response);
-    if formulas.len() == 1 {
-        Some(formulas.into_iter().next().unwrap())
+    let valid: Vec<String> = formulas.into_iter().filter(|f| looks_like_smt(f)).collect();
+    if valid.len() == 1 {
+        Some(valid.into_iter().next().unwrap())
     } else {
         None
     }
@@ -116,7 +117,9 @@ fn is_smt_line(line: &str) -> bool {
 fn looks_like_smt(text: &str) -> bool {
     let text = text.trim();
     text.contains("(set-logic")
-        || (text.contains("(declare-") && text.contains("(assert"))
+        && text.contains("(check-sat")
+        && (text.contains("(declare-") || text.contains("(define-fun"))
+        && text.contains("(assert")
 }
 
 pub async fn run_solver(solver_path: &str, formula: &str) -> Result<SolverResult> {
@@ -126,6 +129,7 @@ pub async fn run_solver(solver_path: &str, formula: &str) -> Result<SolverResult
         move || -> Result<Output> {
             use std::process::{Command, Stdio};
             let mut child = Command::new(&solver_path)
+                .arg("-in")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
