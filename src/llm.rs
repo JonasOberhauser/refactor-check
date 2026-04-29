@@ -71,6 +71,7 @@ struct ApiErrorDetail {
 }
 
 const MAX_RETRIES: usize = 5;
+const REQUEST_TIMEOUT_SECS: u64 = 180;
 
 pub struct LlmClient {
     http: reqwest::Client,
@@ -79,7 +80,10 @@ pub struct LlmClient {
 
 impl LlmClient {
     pub fn new(config: LlmConfig) -> Self {
-        let http = reqwest::Client::new();
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .build()
+            .expect("failed to build reqwest client");
         Self { http, config }
     }
 
