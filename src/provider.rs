@@ -101,7 +101,7 @@ mod tests {
         format!("Here is the formula:\n\n```smt2\n{}\n```", smt_formula())
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_happy_path_unsat() {
         let llm = SequenceLlm::new(
             vec![formula_response(), "The formula is unsat, meaning equivalence.".to_string()],
@@ -119,7 +119,7 @@ mod tests {
         assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_formula_not_found_then_found() {
         let llm = SequenceLlm::new(
             vec![
@@ -140,7 +140,7 @@ mod tests {
         assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_solver_error_then_success() {
         struct ToggleSolver {
             call_count: Arc<Mutex<usize>>,
@@ -190,7 +190,7 @@ mod tests {
         assert_eq!(*call_count.lock().unwrap(), 2, "solver should be called twice");
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_judge_says_no_then_yes() {
         let llm = SequenceLlm::new(
             vec![
@@ -211,4 +211,10 @@ mod tests {
         assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
         assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
     }
-}
+
+
+
+
+
+
+    }
