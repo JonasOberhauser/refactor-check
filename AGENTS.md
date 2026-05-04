@@ -25,6 +25,11 @@ For merge into `feature/<name>` branch:
 For `feature/<name>/<wip>` branch:
 - no checklist, just commit.
 
+
+## Important!
+
+Every new feature branch must be based off of main, and previous feature branches either explicitly abandoned by the user (you can ask them whether a feature branch should be abandoned when they ask for a new feature) or merged into main.
+
 ## Commands
 
 - Build: `cargo build`

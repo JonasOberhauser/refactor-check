@@ -5,9 +5,12 @@ use crate::llm::{LlmClient, LlmConfig, Message, system_message, user_message};
 use crate::provider::{AgentResult, LlmProvider, LlmRole, SolverProvider};
 use crate::smt::{SolverOutcome, Z3Solver, extract_smt_formula};
 
-const MAX_ITERATIONS: usize = 10;
-const MAX_INSIST_ATTEMPTS: usize = 5;
-const MAX_JUDGE_ATTEMPTS: usize = 5;
+pub const MAX_ITERATIONS: usize = 10;
+pub const MAX_INSIST_ATTEMPTS: usize = 5;
+pub const MAX_JUDGE_ATTEMPTS: usize = 5;
+
+pub const JUDGE_REASONABLE: &str = "REASONABLE";
+pub const JUDGE_RETRY: &str = "RETRY";
 
 pub struct AgentConfig {
     pub llm_config: LlmConfig,
@@ -99,7 +102,7 @@ pub async fn run_with_providers(
         let verdict = judge_analysis(llm, &analysis).await?;
         info!(verdict = %verdict, "judge verdict");
 
-        if verdict == "YES" {
+        if verdict == JUDGE_REASONABLE {
             return Ok(AgentResult {
                 analysis,
                 formula,
@@ -265,7 +268,7 @@ async fn judge_analysis(llm: &dyn LlmProvider, analysis: &str) -> Result<String>
     loop {
         attempts += 1;
         if attempts > MAX_JUDGE_ATTEMPTS {
-            anyhow::bail!("Judge failed to give a clear YES/NO after {MAX_JUDGE_ATTEMPTS} attempts");
+            anyhow::bail!("Judge failed to give a clear {JUDGE_REASONABLE}/{JUDGE_RETRY} after {MAX_JUDGE_ATTEMPTS} attempts");
         }
 
         debug!(attempt = attempts, "asking judge for verdict");
@@ -278,7 +281,7 @@ async fn judge_analysis(llm: &dyn LlmProvider, analysis: &str) -> Result<String>
                  does the analysis confirm that the solver result is CORRECT and REASONABLE, \
                  meaning the formula properly encodes the equivalence check \
                  and the solver's answer (sat/unsat/unknown) is a valid conclusion? \
-                 \n\nAnswer ONLY with YES or NO. Nothing else."
+                 \n\nAnswer ONLY with REASONABLE or RETRY. Nothing else."
             ),
             user_message(&last_analysis),
         ];
@@ -287,17 +290,17 @@ async fn judge_analysis(llm: &dyn LlmProvider, analysis: &str) -> Result<String>
         let upper = response.trim().to_uppercase();
         let trimmed = upper.trim_start_matches(|c: char| !c.is_alphabetic());
 
-        if trimmed.starts_with("YES") {
-            return Ok("YES".to_string());
-        } else if trimmed.starts_with("NO") {
-            return Ok("NO".to_string());
-        } else {
-            warn!(response = %response, "judge gave unclear answer, insisting");
-            last_analysis = format!(
-                "{analysis}\n\n\
-                 Your previous answer was: '{response}'. \
-                 You MUST answer ONLY with YES or NO. Does the analysis confirm the solver result is correct and reasonable?"
-            );
+        if trimmed.starts_with(JUDGE_REASONABLE) {
+            return Ok(JUDGE_REASONABLE.to_string());
         }
+        if trimmed.starts_with(JUDGE_RETRY) {
+            return Ok(JUDGE_RETRY.to_string());
+        }
+        warn!(response = %response, "judge gave unclear answer, insisting");
+        last_analysis = format!(
+            "{analysis}\n\n\
+             Your previous answer was: '{response}'. \
+             You MUST answer ONLY with {JUDGE_REASONABLE} or {JUDGE_RETRY}. Does the analysis confirm the solver result is correct and reasonable?"
+        );
     }
 }

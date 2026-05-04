@@ -105,7 +105,7 @@ mod tests {
     async fn test_happy_path_unsat() {
         let llm = SequenceLlm::new(
             vec![formula_response(), "The formula is unsat, meaning equivalence.".to_string()],
-            vec!["YES".to_string()],
+            vec![crate::agent::JUDGE_REASONABLE.to_string()],
         );
         let solver = FakeSolver { outcome: SolverOutcome::Unsat };
 
@@ -127,7 +127,7 @@ mod tests {
                 formula_response(),
                 "The solver says unsat, which is correct.".to_string(),
             ],
-            vec!["YES".to_string()],
+            vec![crate::agent::JUDGE_REASONABLE.to_string()],
         );
         let solver = FakeSolver { outcome: SolverOutcome::Unsat };
 
@@ -175,7 +175,7 @@ mod tests {
                 formula_response(),
                 "Now the formula is correct and unsat.".to_string(),
             ],
-            vec!["YES".to_string()],
+            vec![crate::agent::JUDGE_REASONABLE.to_string()],
         );
         let call_count = Arc::new(Mutex::new(0usize));
         let solver = ToggleSolver { call_count: call_count.clone() };
@@ -199,7 +199,29 @@ mod tests {
                 formula_response(),
                 "Revised analysis confirms equivalence.".to_string(),
             ],
-            vec!["NO".to_string(), "YES".to_string()],
+            vec![crate::agent::JUDGE_RETRY.to_string(), crate::agent::JUDGE_REASONABLE.to_string()],
+        );
+        let solver = FakeSolver { outcome: SolverOutcome::Unsat };
+
+        let result = crate::agent::run_with_providers("refactoring desc", &llm, &solver)
+            .await
+            .expect("agent should succeed");
+        assert!(!result.analysis.is_empty());
+        assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
+        assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_judge_gives_unclear_answer_then_clear() {
+        let llm = SequenceLlm::new(
+            vec![
+                formula_response(),
+                "The solver says unsat, confirming equivalence.".to_string(),
+            ],
+            vec![
+                "The solver response is not reasonable, a new formula should be generated.".to_string(),
+                crate::agent::JUDGE_REASONABLE.to_string(),
+            ],
         );
         let solver = FakeSolver { outcome: SolverOutcome::Unsat };
 
@@ -211,10 +233,4 @@ mod tests {
         assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
         assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
     }
-
-
-
-
-
-
-    }
+}
