@@ -1,5 +1,11 @@
+use async_openai::types::chat::{
+    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestUserMessage,
+    ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest, FinishReason,
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use tracing::{debug, info, instrument, warn};
@@ -35,59 +41,21 @@ impl fmt::Debug for LlmConfig {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-struct ChatMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatResponse {
-    choices: Vec<ChatChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatChoice {
-    message: ChatChoiceMessage,
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatChoiceMessage {
-    content: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApiError {
-    error: Option<ApiErrorDetail>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApiErrorDetail {
-    message: String,
-}
-
-const MAX_RETRIES: usize = 5;
-const REQUEST_TIMEOUT_SECS: u64 = 180;
-
 pub struct LlmClient {
-    http: reqwest::Client,
+    client: async_openai::Client<async_openai::config::OpenAIConfig>,
     config: LlmConfig,
 }
 
 impl LlmClient {
+    #[must_use]
     pub fn new(config: LlmConfig) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .build()
-            .expect("failed to build reqwest client");
-        Self { http, config }
+        let openai_config = async_openai::config::OpenAIConfig::new()
+            .with_api_key(&config.api_key)
+            .with_api_base(&config.api_base);
+
+        let client = async_openai::Client::with_config(openai_config);
+
+        Self { client, config }
     }
 
     #[instrument(skip_all, fields(model = %self.config.primary_model))]
@@ -101,92 +69,83 @@ impl LlmClient {
     }
 
     async fn chat(&self, label: &str, model: &str, messages: Vec<Message>) -> Result<String> {
-        let chat_messages: Vec<ChatMessage> = messages
-            .into_iter()
-            .map(|msg| ChatMessage {
-                role: match msg.role {
-                    Role::System => "system".to_string(),
-                    Role::User => "user".to_string(),
-                },
-                content: msg.content,
-            })
-            .collect();
-
-        let request = ChatRequest {
+        let request = CreateChatCompletionRequest {
             model: model.to_string(),
-            messages: chat_messages,
+            messages: messages
+                .into_iter()
+                .map(|msg| match msg.role {
+                    Role::System => {
+                        ChatCompletionRequestMessage::System(
+                            ChatCompletionRequestSystemMessage {
+                                content: ChatCompletionRequestSystemMessageContent::Text(msg.content),
+                                name: None,
+                            },
+                        )
+                    }
+                    Role::User => {
+                        ChatCompletionRequestMessage::User(
+                            ChatCompletionRequestUserMessage {
+                                content: ChatCompletionRequestUserMessageContent::Text(msg.content),
+                                name: None,
+                            },
+                        )
+                    }
+                })
+                .collect(),
+            stream: Some(true),
+            ..Default::default()
         };
 
-        let url = format!("{}/chat/completions", self.config.api_base.trim_end_matches('/'));
+        debug!(%label, "sending LLM streaming request");
 
-        for attempt in 0..MAX_RETRIES {
-            debug!(%label, attempt, "sending LLM request");
+        let mut stream = self
+            .client
+            .chat()
+            .create_stream(request)
+            .await
+            .context("LLM streaming request failed")?;
 
-            let response = self
-                .http
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", self.config.api_key))
-                .header("Content-Type", "application/json")
-                .json(&request)
-                .send()
-                .await
-                .context("HTTP request to LLM failed")?;
+        let mut content = String::new();
+        let mut finish_reason: Option<FinishReason> = None;
 
-            let status = response.status();
-            let body = response.text().await.context("Failed to read LLM response body")?;
-
-            if status.is_success() {
-                let chat_response: ChatResponse = match serde_json::from_str(&body) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let snippet: String = body.chars().take(500).collect();
-                        warn!(%label, error = %e, body_len = body.len(), %snippet, "failed to parse LLM response JSON");
-                        if attempt < MAX_RETRIES - 1 {
-                            let wait = std::cmp::min(2u64.pow(attempt as u32 + 1), 30);
-                            info!(%label, wait_secs = wait, "retrying after parse failure");
-                            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                            continue;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(response) => {
+                    if let Some(choice) = response.choices.first() {
+                        if let Some(delta_content) = &choice.delta.content {
+                            content.push_str(delta_content);
                         }
-                        anyhow::bail!("Failed to parse LLM response JSON after {MAX_RETRIES} attempts: {e}\nResponse snippet: {snippet}");
+                        if let Some(fr) = &choice.finish_reason {
+                            finish_reason = Some(*fr);
+                        }
                     }
-                };
-                let choice = chat_response
-                    .choices
-                    .into_iter()
-                    .next()
-                    .context("No response from LLM")?;
-                if choice.finish_reason.as_deref() == Some("length") {
-                    warn!(%label, bytes = choice.message.content.as_ref().map_or(0, |c| c.len()), "LLM response truncated (finish_reason=length)");
                 }
-                let content = choice.message.content.unwrap_or_default().trim().to_string();
-                info!(%label, bytes = content.len(), "LLM response received");
-                return Ok(content);
+                Err(async_openai::error::OpenAIError::StreamError(e)) => {
+                    if content.is_empty() {
+                        anyhow::bail!("LLM stream error with no content received: {e}");
+                    }
+                    warn!(%label, error = %e, bytes = content.len(), "LLM stream ended prematurely, returning partial content");
+                    break;
+                }
+                Err(e) => {
+                    return Err(e).context("LLM stream chunk error");
+                }
             }
-
-            let error_msg = if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
-                api_err
-                    .error
-                    .map(|e| e.message)
-                    .unwrap_or_else(|| body.clone())
-            } else {
-                body.clone()
-            };
-
-            let is_retryable = status.as_u16() == 429 || status.is_server_error();
-            if is_retryable && attempt < MAX_RETRIES - 1 {
-                let wait = std::cmp::min(2u64.pow(attempt as u32 + 1), 30);
-                warn!(%label, %status, wait_secs = wait, %error_msg, "retryable error, sleeping");
-                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                continue;
-            }
-
-            anyhow::bail!("LLM API error ({}): {}", status, error_msg);
         }
 
-        anyhow::bail!("LLM API: exhausted {MAX_RETRIES} retries")
+        if matches!(finish_reason, Some(FinishReason::Length)) {
+            warn!(%label, bytes = content.len(), "LLM response truncated (finish_reason=length)");
+        }
+
+        let content = content.trim().to_string();
+        info!(%label, bytes = content.len(), "LLM response received");
+        debug!(%label, %content, "full LLM response");
+
+        Ok(content)
     }
 }
 
+#[must_use]
 pub fn system_message(content: &str) -> Message {
     Message {
         role: Role::System,
@@ -194,6 +153,7 @@ pub fn system_message(content: &str) -> Message {
     }
 }
 
+#[must_use]
 pub fn user_message(content: &str) -> Message {
     Message {
         role: Role::User,

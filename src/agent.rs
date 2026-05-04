@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 use anyhow::{Context, Result};
 use tracing::{debug, info, instrument, warn};
 
@@ -5,8 +7,8 @@ use crate::llm::{LlmClient, LlmConfig, Message, system_message, user_message};
 use crate::provider::{AgentResult, LlmProvider, LlmRole, SolverProvider};
 use crate::smt::{SolverOutcome, Z3Solver, extract_smt_formula};
 
-pub const MAX_ITERATIONS: usize = 10;
-pub const MAX_INSIST_ATTEMPTS: usize = 5;
+pub const MAX_ITERATIONS: usize = 30;
+pub const MAX_INSIST_ATTEMPTS: usize = 50;
 pub const MAX_JUDGE_ATTEMPTS: usize = 5;
 
 pub const JUDGE_REASONABLE: &str = "REASONABLE";
@@ -54,15 +56,17 @@ pub async fn run_with_providers(
         let messages = build_generation_messages(input_content, &history, current_formula.is_none());
         let response = llm.chat(LlmRole::Primary, messages).await?;
 
-        let formula = match extract_smt_formula(&response) {
-            Some(f) => f,
-            None => {
-                warn!("no single SMT formula found, insisting");
-                insist_on_formula(llm, input_content, &response).await?
-            }
+        debug!(response, "formula received");
+
+        let formula = if let Some(f) = extract_smt_formula(&response) {
+            f
+        } else {
+            warn!("no single SMT formula found, insisting");
+            insist_on_formula(llm, input_content, &response).await?
         };
 
         debug!(formula_bytes = formula.len(), "formula extracted");
+        debug!(%formula, "extracted formula content");
 
         let solver_result = solver.run(&formula).await?;
         let had_error = matches!(solver_result.outcome, SolverOutcome::Error(_));
@@ -151,12 +155,12 @@ fn build_generation_messages(
         let mut content = format!("Here is the refactoring description:\n\n{input_content}\n\n");
         content.push_str("Previous attempts failed. Here is the full history:\n\n");
         for (i, entry) in history.iter().enumerate() {
-            content.push_str(&format!("--- Attempt {} ---\n", i + 1));
-            content.push_str(&format!("Formula:\n{}\n", entry.formula));
+            let _ = writeln!(content, "--- Attempt {} ---", i + 1);
+            let _ = write!(content, "Formula:\n{}\n", entry.formula);
             if entry.had_error {
-                content.push_str(&format!("Solver ERROR:\n{}\n{}\n", entry.solver_stdout, entry.solver_stderr));
+                let _ = write!(content, "Solver ERROR:\n{}\n{}\n", entry.solver_stdout, entry.solver_stderr);
             } else {
-                content.push_str(&format!("Solver output:\n{}\n", entry.solver_stdout));
+                let _ = write!(content, "Solver output:\n{}\n", entry.solver_stdout);
             }
             content.push('\n');
         }
@@ -216,17 +220,18 @@ fn build_error_analysis_messages(
     let mut content = format!("Here is the input file:\n\n{input_content}\n\n");
     content.push_str("Full history of prior attempts:\n\n");
     for (i, entry) in history.iter().enumerate() {
-        content.push_str(&format!("--- Attempt {} ---\n", i + 1));
-        content.push_str(&format!("Formula:\n{}\n", entry.formula));
-        content.push_str(&format!("Solver output:\n{}\n{}\n\n", entry.solver_stdout, entry.solver_stderr));
+        let _ = writeln!(content, "--- Attempt {} ---", i + 1);
+        let _ = write!(content, "Formula:\n{}\n", entry.formula);
+        let _ = write!(content, "Solver output:\n{}\n{}\n\n", entry.solver_stdout, entry.solver_stderr);
     }
-    content.push_str(&format!("Current formula:\n{current_formula}\n\n"));
-    content.push_str(&format!(
+    let _ = write!(content, "Current formula:\n{current_formula}\n\n");
+    let _ = write!(
+        content,
         "Current solver response:\nstdout:\n{}\nstderr:\n{}\n\n\
          The solver returned an error. Analyze what went wrong and whether a new formula should be generated. \
          Explain your reasoning.",
         solver_result.stdout, solver_result.stderr
-    ));
+    );
 
     vec![
         system_message(
