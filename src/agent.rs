@@ -5,7 +5,7 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::llm::{LlmClient, LlmConfig, Message, system_message, user_message};
 use crate::provider::{AgentResult, LlmProvider, LlmRole, SolverProvider};
-use crate::smt::{SolverOutcome, Z3Solver, extract_smt_formula};
+use crate::smt::{SolverOutcome, SolverResult, Z3Solver, extract_smt_formula};
 
 pub const MAX_ITERATIONS: usize = 30;
 pub const MAX_INSIST_ATTEMPTS: usize = 50;
@@ -103,7 +103,7 @@ pub async fn run_with_providers(
         let analysis = llm.chat(LlmRole::Primary, analysis_messages).await?;
         debug!(bytes = analysis.len(), "success analysis received");
 
-        let verdict = judge_analysis(llm, &analysis).await?;
+        let verdict = judge_analysis(llm, &formula, &solver_result).await?;
         info!(verdict = %verdict, "judge verdict");
 
         if verdict == JUDGE_REASONABLE {
@@ -266,9 +266,9 @@ fn build_success_analysis_messages(
 }
 
 #[instrument(skip_all)]
-async fn judge_analysis(llm: &dyn LlmProvider, analysis: &str) -> Result<String> {
+async fn judge_analysis(llm: &dyn LlmProvider, formula: &str, solver_result: &SolverResult) -> Result<String> {
     let mut attempts = 0;
-    let mut last_analysis = analysis.to_string();
+    let mut last_response = String::new();
 
     loop {
         attempts += 1;
@@ -278,17 +278,36 @@ async fn judge_analysis(llm: &dyn LlmProvider, analysis: &str) -> Result<String>
 
         debug!(attempt = attempts, "asking judge for verdict");
 
+        let prompt = if attempts == 1 {
+            format!(
+                "Formula:\n{formula}\n\n\
+                 Solver output:\n{}\n\n\
+                 Is this solver response reasonable, or should a new formula be generated?",
+                solver_result.stdout
+            )
+        } else {
+            format!(
+                "Formula:\n{formula}\n\n\
+                 Solver output:\n{}\n\n\
+                 Your previous answer was: '{last_response}'. \
+                 You MUST answer ONLY with {JUDGE_REASONABLE} or {JUDGE_RETRY}. \
+                 Is the solver response reasonable, or should a new formula be generated?",
+                solver_result.stdout
+            )
+        };
+
         let messages = vec![
             system_message(
                 "You are a judge evaluating an SMT-based equivalence check. \
                  The SMT solver ran SUCCESSFULLY (no errors). \
-                 Read the analysis below and determine: \
-                 does the analysis confirm that the solver result is CORRECT and REASONABLE, \
-                 meaning the formula properly encodes the equivalence check \
-                 and the solver's answer (sat/unsat/unknown) is a valid conclusion? \
+                 You are given the SMT formula and the solver's output. \
+                 Determine: does the solver result correctly and reasonably \
+                 prove or disprove the equivalence of the 'before' and 'after' functions? \
+                 Consider whether the formula properly encodes the equivalence check \
+                 and whether the solver's answer (sat/unsat/unknown) is a valid conclusion. \
                  \n\nAnswer ONLY with REASONABLE or RETRY. Nothing else."
             ),
-            user_message(&last_analysis),
+            user_message(&prompt),
         ];
 
         let response = llm.chat(LlmRole::Judge, messages).await?;
@@ -302,10 +321,6 @@ async fn judge_analysis(llm: &dyn LlmProvider, analysis: &str) -> Result<String>
             return Ok(JUDGE_RETRY.to_string());
         }
         warn!(response = %response, "judge gave unclear answer, insisting");
-        last_analysis = format!(
-            "{analysis}\n\n\
-             Your previous answer was: '{response}'. \
-             You MUST answer ONLY with {JUDGE_REASONABLE} or {JUDGE_RETRY}. Does the analysis confirm the solver result is correct and reasonable?"
-        );
+        last_response = response;
     }
 }
