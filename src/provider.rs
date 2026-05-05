@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::llm::Message;
-use crate::smt::SolverResult;
+use crate::smt::{SolverOutcome, SolverResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmRole {
@@ -21,6 +21,7 @@ pub trait SolverProvider: Send + Sync {
 }
 
 pub struct AgentResult {
-    pub analysis: String,
     pub formula: String,
+    pub solver_outcome: SolverOutcome,
+    pub solver_stdout: String,
 }

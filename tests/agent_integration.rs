@@ -32,7 +32,7 @@ fn two_formula_response() -> String {
 #[test_log::test(tokio::test)]
 async fn test_happy_path_unsat() {
     let llm = SequenceLlm::new(
-        vec![formula_response(), "The formula is unsat, meaning equivalence.".to_string()],
+        vec![formula_response()],
         vec![JUDGE_REASONABLE.to_string()],
     );
     let solver = FakeSolver { outcome: SolverOutcome::Unsat };
@@ -41,8 +41,9 @@ async fn test_happy_path_unsat() {
         .await
         .expect("agent should succeed");
 
-    assert!(!result.analysis.is_empty());
     assert!(result.formula.contains("(set-logic"));
+    assert_eq!(result.solver_outcome, SolverOutcome::Unsat);
+    assert!(result.solver_stdout.contains("unsat"));
     assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
     assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
 }
@@ -53,7 +54,6 @@ async fn test_formula_not_found_then_found() {
         vec![
             "I don't have a formula yet.".to_string(),
             formula_response(),
-            "The solver says unsat, which is correct.".to_string(),
         ],
         vec![JUDGE_REASONABLE.to_string()],
     );
@@ -63,7 +63,8 @@ async fn test_formula_not_found_then_found() {
         .await
         .expect("agent should succeed");
 
-    assert!(!result.analysis.is_empty());
+    assert!(result.formula.contains("(set-logic"));
+    assert_eq!(result.solver_outcome, SolverOutcome::Unsat);
     assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
     assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
 }
@@ -102,7 +103,6 @@ async fn test_solver_error_then_success() {
             formula_response(),
             "The solver had an error, let me fix it.".to_string(),
             formula_response(),
-            "Now the formula is correct and unsat.".to_string(),
         ],
         vec![JUDGE_REASONABLE.to_string()],
     );
@@ -113,7 +113,7 @@ async fn test_solver_error_then_success() {
         .await
         .expect("agent should succeed");
 
-    assert!(!result.analysis.is_empty());
+    assert_eq!(result.solver_outcome, SolverOutcome::Unsat);
     assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
     assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
     assert_eq!(*call_count.lock().unwrap(), 2, "solver should be called twice");
@@ -124,9 +124,7 @@ async fn test_judge_says_retry_when_analysis_rejects_formula() {
     let llm = SequenceLlm::new(
         vec![
             formula_response(),
-            "The solver response is **not reasonable**, and a **new formula should be generated**.".to_string(),
             formula_response(),
-            "Now the formula is correct and proves equivalence.".to_string(),
         ],
         vec![JUDGE_RETRY.to_string(), JUDGE_REASONABLE.to_string()],
     );
@@ -136,7 +134,7 @@ async fn test_judge_says_retry_when_analysis_rejects_formula() {
         .await
         .expect("agent should succeed");
 
-    assert!(!result.analysis.is_empty());
+    assert_eq!(result.solver_outcome, SolverOutcome::Unsat);
     assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
     assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
 }
@@ -146,9 +144,7 @@ async fn test_judge_says_no_then_yes() {
     let llm = SequenceLlm::new(
         vec![
             formula_response(),
-            "Analysis says unsat is correct.".to_string(),
             formula_response(),
-            "Revised analysis confirms equivalence.".to_string(),
         ],
         vec![JUDGE_RETRY.to_string(), JUDGE_REASONABLE.to_string()],
     );
@@ -158,7 +154,7 @@ async fn test_judge_says_no_then_yes() {
         .await
         .expect("agent should succeed");
 
-    assert!(!result.analysis.is_empty());
+    assert_eq!(result.solver_outcome, SolverOutcome::Unsat);
     assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
     assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
 }
@@ -168,7 +164,6 @@ async fn test_judge_gives_unclear_answer_then_clear() {
     let llm = SequenceLlm::new(
         vec![
             formula_response(),
-            "The solver says unsat, confirming equivalence.".to_string(),
         ],
         vec![
             "The solver response is not reasonable, a new formula should be generated.".to_string(),
@@ -181,7 +176,7 @@ async fn test_judge_gives_unclear_answer_then_clear() {
         .await
         .expect("agent should succeed");
 
-    assert!(!result.analysis.is_empty());
+    assert_eq!(result.solver_outcome, SolverOutcome::Unsat);
     assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
     assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
 }
@@ -322,10 +317,7 @@ fn jemalloc_formula_response() -> String {
 #[test_log::test(tokio::test)]
 async fn test_jemalloc_refactoring_unsat() {
     let llm = SequenceLlm::new(
-        vec![
-            jemalloc_formula_response(),
-            "The formula is unsat, confirming the refactoring preserves semantics.".to_string(),
-        ],
+        vec![jemalloc_formula_response()],
         vec![JUDGE_REASONABLE.to_string()],
     );
     let solver = FakeSolver { outcome: SolverOutcome::Unsat };
@@ -338,10 +330,10 @@ async fn test_jemalloc_refactoring_unsat() {
         .await
         .expect("agent should succeed");
 
-    assert!(!result.analysis.is_empty());
     assert!(result.formula.contains("(set-logic UF)"));
     assert!(result.formula.contains("(declare-sort Emitter 0)"));
     assert!(result.formula.contains("(check-sat)"));
+    assert_eq!(result.solver_outcome, SolverOutcome::Unsat);
     assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
     assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
 }
@@ -357,9 +349,7 @@ async fn test_solver_multi_round_multi_formula() {
             formula_response(),
             "The solver errored again, retrying.".to_string(),
             formula_response(),
-            "The formula is correct and proves equivalence.".to_string(),
             formula_response(),
-            "Revised analysis confirms equivalence.".to_string(),
         ],
         vec![JUDGE_RETRY.to_string(), JUDGE_REASONABLE.to_string()],
     );
@@ -370,8 +360,8 @@ async fn test_solver_multi_round_multi_formula() {
         .await
         .expect("agent should succeed");
 
-    assert!(!result.analysis.is_empty());
     assert!(result.formula.contains("(set-logic"));
+    assert_eq!(result.solver_outcome, SolverOutcome::Unsat);
     assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
     assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
     assert_eq!(*call_count.lock().unwrap(), 4, "solver should be called four times");

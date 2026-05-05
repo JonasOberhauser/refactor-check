@@ -34,7 +34,8 @@ pub async fn run(input_file: &str, config: AgentConfig) -> Result<()> {
     let solver = Z3Solver::new(config.solver_path);
 
     let result = run_with_providers(&input_content, &llm, &solver).await?;
-    println!("=== LLM Analysis ===\n{}\n", result.analysis);
+    println!("=== Solver Outcome ===\n{:?}\n", result.solver_outcome);
+    println!("=== Solver Output ===\n{}\n", result.solver_stdout);
     println!("=== SMT Formula ===\n{}", result.formula);
     Ok(())
 }
@@ -99,17 +100,14 @@ pub async fn run_with_providers(
             continue;
         }
 
-        let analysis_messages = build_success_analysis_messages(&formula, &solver_result);
-        let analysis = llm.chat(LlmRole::Primary, analysis_messages).await?;
-        debug!(bytes = analysis.len(), "success analysis received");
-
         let verdict = judge_analysis(llm, &formula, &solver_result).await?;
         info!(verdict = %verdict, "judge verdict");
 
         if verdict == JUDGE_REASONABLE {
             return Ok(AgentResult {
-                analysis,
                 formula,
+                solver_outcome: solver_result.outcome,
+                solver_stdout: solver_result.stdout,
             });
         }
 
@@ -122,7 +120,8 @@ pub async fn run_with_providers(
         current_formula = Some(formula);
     }
 
-    anyhow::bail!("Exceeded maximum iterations ({MAX_ITERATIONS}) without convergence");
+    let summary = summarize_failure(llm, input_content, &history).await?;
+    anyhow::bail!("Exceeded maximum iterations ({MAX_ITERATIONS}) without convergence.\n\n{summary}");
 }
 
 fn build_generation_messages(
@@ -243,26 +242,36 @@ fn build_error_analysis_messages(
     ]
 }
 
-fn build_success_analysis_messages(
-    current_formula: &str,
-    solver_result: &crate::smt::SolverResult,
-) -> Vec<Message> {
-    vec![
+#[instrument(skip_all)]
+async fn summarize_failure(
+    llm: &dyn LlmProvider,
+    input_content: &str,
+    history: &[HistoryEntry],
+) -> Result<String> {
+    let mut content = format!("Here is the input file:\n\n{input_content}\n\n");
+    content.push_str("After multiple attempts, the agent failed to converge. Here is the full history:\n\n");
+    for (i, entry) in history.iter().enumerate() {
+        let _ = writeln!(content, "--- Attempt {} ---", i + 1);
+        let _ = write!(content, "Formula:\n{}\n", entry.formula);
+        if entry.had_error {
+            let _ = write!(content, "Solver ERROR:\n{}\n{}\n", entry.solver_stdout, entry.solver_stderr);
+        } else {
+            let _ = write!(content, "Solver output:\n{}\n", entry.solver_stdout);
+        }
+        content.push('\n');
+    }
+    content.push_str("Please summarize why the agent failed to converge and what could be done differently.");
+
+    let messages = vec![
         system_message(
             "You are an expert in formal verification and SMT-LIB2. \
-             Analyze the solver output for the given SMT formula and determine if the result is reasonable. \
-             A reasonable result means the formula correctly encodes the equivalence check \
-             and the solver's answer (sat/unsat/unknown) makes sense. \
-             If the result is NOT reasonable (e.g., the formula is wrong, or the solver result \
-             doesn't actually prove equivalence), say a new formula should be generated."
+             Summarize concisely why the equivalence check failed to converge \
+             and suggest what could be improved."
         ),
-        user_message(&format!(
-            "Current formula:\n{current_formula}\n\n\
-             Solver output:\n{}\n\n\
-             Is this solver response reasonable, or should a new formula be generated? Explain your reasoning.",
-            solver_result.stdout
-        )),
-    ]
+        user_message(&content),
+    ];
+
+    llm.chat(LlmRole::Primary, messages).await
 }
 
 #[instrument(skip_all)]
