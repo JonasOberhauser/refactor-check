@@ -19,7 +19,13 @@ impl SequenceLlm {
         }
     }
 
+    pub fn primary_remaining(&self) -> usize {
+        self.primary.lock().expect("lock poisoned").len()
+    }
 
+    pub fn judge_remaining(&self) -> usize {
+        self.judge.lock().expect("lock poisoned").len()
+    }
 }
 
 #[async_trait]
