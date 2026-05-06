@@ -169,10 +169,17 @@ impl LlmClient {
             let mut content = String::new();
             let mut finish_reason: Option<FinishReason> = None;
             let mut stream_ended = false;
+            let mut got_first_chunk = false;
 
             loop {
-                match tokio::time::timeout(timeout, stream.next()).await {
+                let current_timeout = if got_first_chunk {
+                    timeout
+                } else {
+                    timeout * 4
+                };
+                match tokio::time::timeout(current_timeout, stream.next()).await {
                     Ok(Some(Ok(response))) => {
+                        got_first_chunk = true;
                         if let Some(choice) = response.choices.first() {
                             if let Some(delta_content) = &choice.delta.content {
                                 content.push_str(delta_content);
