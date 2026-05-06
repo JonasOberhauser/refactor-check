@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use refactor_check::agent::{AgentConfig, run};
+use refactor_check::agent::{AgentConfig, DEFAULT_SOLVER_TIMEOUT_SECS, run};
 use refactor_check::llm::LlmConfig;
 use tracing_subscriber::EnvFilter;
 
@@ -14,6 +14,14 @@ struct Cli {
     /// Path to the SMT solver binary
     #[arg(long, default_value = "z3")]
     solver_path: String,
+
+    /// Arguments to pass to the solver (default: -in for z3)
+    #[arg(long, default_value = "-in", num_args = 0.., value_delimiter = ' ')]
+    solver_args: Vec<String>,
+
+    /// Solver timeout in seconds
+    #[arg(long, default_value_t = DEFAULT_SOLVER_TIMEOUT_SECS)]
+    solver_timeout_secs: u64,
 
     /// Primary LLM model identifier
     #[arg(long, default_value = "qwen/qwen3-coder:free")]
@@ -65,6 +73,8 @@ async fn main() -> Result<()> {
             max_stream_retries: cli.max_stream_retries,
         },
         solver_path: cli.solver_path,
+        solver_args: cli.solver_args,
+        solver_timeout_secs: cli.solver_timeout_secs,
     };
 
     run(&cli.input, config).await

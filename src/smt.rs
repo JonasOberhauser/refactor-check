@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::io::Write;
 use std::process::Output;
-use tracing::{debug, info, instrument, trace};
+use std::time::Duration;
+use tracing::{debug, info, instrument, trace, warn};
 
 use crate::provider::SolverProvider;
 
@@ -135,11 +136,21 @@ fn looks_like_smt(text: &str) -> bool {
         && text.contains("(assert")
 }
 
-fn parse_solver_outcome(stdout: &str, stderr: &str) -> SolverOutcome {
-    if !stderr.trim().is_empty()
-        && (stderr.contains("error") || stderr.contains("Error") || stderr.contains("ERROR"))
-    {
-        return SolverOutcome::Error(stderr.trim().to_string());
+fn parse_solver_outcome(exit_code: Option<i32>, stdout: &str, stderr: &str) -> SolverOutcome {
+    if let Some(code) = exit_code {
+        if code != 0 {
+            return SolverOutcome::Error(
+                if stderr.trim().is_empty() {
+                    format!("solver exited with code {code}\n{}", stdout.trim())
+                } else {
+                    format!("solver exited with code {code}\n{}", stderr.trim())
+                },
+            );
+        }
+    }
+
+    if stdout.lines().any(|l| l.trim().starts_with("(error")) {
+        return SolverOutcome::Error(stdout.trim().to_string());
     }
 
     let first_meaningful = stdout
@@ -151,18 +162,8 @@ fn parse_solver_outcome(stdout: &str, stderr: &str) -> SolverOutcome {
         Some(line) if line.starts_with("unsat") => SolverOutcome::Unsat,
         Some(line) if line.starts_with("sat") => SolverOutcome::Sat,
         Some(line) if line.starts_with("unknown") => SolverOutcome::Unknown,
-        Some(_) => {
-            let trimmed = stdout.trim();
-            if trimmed.contains("error")
-                || trimmed.contains("Error")
-                || trimmed.contains("ERROR")
-            {
-                SolverOutcome::Error(trimmed.to_string())
-            } else {
-                SolverOutcome::Unknown
-            }
-        }
         None => SolverOutcome::Unknown,
+        Some(_) => SolverOutcome::Unknown,
     }
 }
 
@@ -170,18 +171,27 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
+pub const DEFAULT_SOLVER_TIMEOUT_SECS: u64 = 60;
+
 #[instrument(skip_all, fields(solver_path))]
-pub async fn run_solver(solver_path: &str, formula: &str) -> Result<SolverResult> {
-    info!(formula_bytes = formula.len(), "running SMT solver");
+pub async fn run_solver(
+    solver_path: &str,
+    solver_args: &[String],
+    timeout: Duration,
+    formula: &str,
+) -> Result<SolverResult> {
+    info!(formula_bytes = formula.len(), ?timeout, "running SMT solver");
     let start = std::time::Instant::now();
 
     let output = tokio::task::spawn_blocking({
         let solver_path = solver_path.to_string();
+        let solver_args = solver_args.to_vec();
         let formula = formula.to_string();
-        move || -> Result<Output> {
+        let timeout = timeout;
+        move || -> Result<Option<Output>> {
             use std::process::{Command, Stdio};
             let mut child = Command::new(&solver_path)
-                .arg("-in")
+                .args(&solver_args)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -191,17 +201,48 @@ pub async fn run_solver(solver_path: &str, formula: &str) -> Result<SolverResult
                 let stdin = child.stdin.as_mut().context("Failed to open stdin")?;
                 stdin.write_all(formula.as_bytes())?;
             }
+            let timed_out = match child.try_wait() {
+                Ok(Some(_)) => false,
+                Ok(None) => {
+                    std::thread::sleep(timeout);
+                    match child.try_wait() {
+                        Ok(Some(_)) => false,
+                        Ok(None) => {
+                            let _ = child.kill();
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                }
+                Err(_) => false,
+            };
+            if timed_out {
+                return Ok(None);
+            }
             let output = child.wait_with_output()?;
-            Ok(output)
+            Ok(Some(output))
         }
     })
     .await
     .context("Solver task panicked")??;
 
     let elapsed = start.elapsed();
+
+    let Some(output) = output else {
+        warn!(elapsed_ms = elapsed.as_millis(), "solver timed out");
+        return Ok(SolverResult {
+            outcome: SolverOutcome::Error(format!(
+                "solver timed out after {}s",
+                timeout.as_secs()
+            )),
+            stdout: String::new(),
+            stderr: String::new(),
+        });
+    };
+
     let stdout = bytes_to_string(output.stdout);
     let stderr = bytes_to_string(output.stderr);
-    let outcome = parse_solver_outcome(&stdout, &stderr);
+    let outcome = parse_solver_outcome(output.status.code(), &stdout, &stderr);
     debug!(%stdout, %stderr, "solver raw output");
     info!(
         ?outcome,
@@ -220,21 +261,28 @@ pub async fn run_solver(solver_path: &str, formula: &str) -> Result<SolverResult
 
 pub struct Z3Solver {
     solver_path: String,
+    solver_args: Vec<String>,
+    timeout: Duration,
 }
 
 impl Z3Solver {
     #[must_use]
     pub fn new(solver_path: String) -> Self {
-        Self { solver_path }
+        Self::with_config(solver_path, vec!["-in".to_string()], Duration::from_secs(DEFAULT_SOLVER_TIMEOUT_SECS))
+    }
+
+    #[must_use]
+    pub fn with_config(solver_path: String, solver_args: Vec<String>, timeout: Duration) -> Self {
+        Self { solver_path, solver_args, timeout }
     }
 }
 
 #[async_trait]
 impl SolverProvider for Z3Solver {
     async fn run(&self, formula: &str) -> Result<SolverResult> {
-        run_solver(&self.solver_path, formula).await
+        run_solver(&self.solver_path, &self.solver_args, self.timeout, formula).await
     }
- }
+}
 
 #[cfg(test)]
 mod tests {

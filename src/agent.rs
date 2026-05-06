@@ -1,4 +1,5 @@
 use std::fmt::Write;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tracing::{debug, info, instrument, warn};
@@ -6,6 +7,8 @@ use tracing::{debug, info, instrument, warn};
 use crate::llm::{LlmClient, LlmConfig, Message, system_message, user_message};
 use crate::provider::{AgentResult, LlmProvider, LlmRole, SolverProvider};
 use crate::smt::{SolverOutcome, SolverResult, Z3Solver, extract_smt_formula};
+
+pub use crate::smt::DEFAULT_SOLVER_TIMEOUT_SECS;
 
 pub const MAX_ITERATIONS: usize = 30;
 pub const MAX_INSIST_ATTEMPTS: usize = 50;
@@ -17,6 +20,8 @@ pub const JUDGE_RETRY: &str = "RETRY";
 pub struct AgentConfig {
     pub llm_config: LlmConfig,
     pub solver_path: String,
+    pub solver_args: Vec<String>,
+    pub solver_timeout_secs: u64,
 }
 
 pub struct HistoryEntry {
@@ -26,12 +31,31 @@ pub struct HistoryEntry {
     pub had_error: bool,
 }
 
+fn format_history(history: &[HistoryEntry]) -> String {
+    let mut content = String::new();
+    for (i, entry) in history.iter().enumerate() {
+        let _ = writeln!(content, "--- Attempt {} ---", i + 1);
+        let _ = write!(content, "Formula:\n{}\n", entry.formula);
+        if entry.had_error {
+            let _ = write!(content, "Solver ERROR:\n{}\n{}\n", entry.solver_stdout, entry.solver_stderr);
+        } else {
+            let _ = write!(content, "Solver output:\n{}\n", entry.solver_stdout);
+        }
+        content.push('\n');
+    }
+    content
+}
+
 pub async fn run(input_file: &str, config: AgentConfig) -> Result<()> {
     let input_content = std::fs::read_to_string(input_file)
         .with_context(|| format!("Failed to read input file: {input_file}"))?;
 
     let llm = LlmClient::new(config.llm_config);
-    let solver = Z3Solver::new(config.solver_path);
+    let solver = Z3Solver::with_config(
+        config.solver_path,
+        config.solver_args,
+        Duration::from_secs(config.solver_timeout_secs),
+    );
 
     let result = run_with_providers(&input_content, &llm, &solver).await?;
     println!("=== Solver Outcome ===\n{:?}\n", result.solver_outcome);
@@ -153,16 +177,7 @@ fn build_generation_messages(
     } else {
         let mut content = format!("Here is the refactoring description:\n\n{input_content}\n\n");
         content.push_str("Previous attempts failed. Here is the full history:\n\n");
-        for (i, entry) in history.iter().enumerate() {
-            let _ = writeln!(content, "--- Attempt {} ---", i + 1);
-            let _ = write!(content, "Formula:\n{}\n", entry.formula);
-            if entry.had_error {
-                let _ = write!(content, "Solver ERROR:\n{}\n{}\n", entry.solver_stdout, entry.solver_stderr);
-            } else {
-                let _ = write!(content, "Solver output:\n{}\n", entry.solver_stdout);
-            }
-            content.push('\n');
-        }
+        content.push_str(&format_history(history));
         content.push_str("Generate a new single complete SMT-LIB2 formula that fixes the issues above.");
         messages.push(user_message(&content));
     }
@@ -218,11 +233,7 @@ fn build_error_analysis_messages(
 ) -> Vec<Message> {
     let mut content = format!("Here is the input file:\n\n{input_content}\n\n");
     content.push_str("Full history of prior attempts:\n\n");
-    for (i, entry) in history.iter().enumerate() {
-        let _ = writeln!(content, "--- Attempt {} ---", i + 1);
-        let _ = write!(content, "Formula:\n{}\n", entry.formula);
-        let _ = write!(content, "Solver output:\n{}\n{}\n\n", entry.solver_stdout, entry.solver_stderr);
-    }
+    content.push_str(&format_history(history));
     let _ = write!(content, "Current formula:\n{current_formula}\n\n");
     let _ = write!(
         content,
@@ -250,16 +261,7 @@ async fn summarize_failure(
 ) -> Result<String> {
     let mut content = format!("Here is the input file:\n\n{input_content}\n\n");
     content.push_str("After multiple attempts, the agent failed to converge. Here is the full history:\n\n");
-    for (i, entry) in history.iter().enumerate() {
-        let _ = writeln!(content, "--- Attempt {} ---", i + 1);
-        let _ = write!(content, "Formula:\n{}\n", entry.formula);
-        if entry.had_error {
-            let _ = write!(content, "Solver ERROR:\n{}\n{}\n", entry.solver_stdout, entry.solver_stderr);
-        } else {
-            let _ = write!(content, "Solver output:\n{}\n", entry.solver_stdout);
-        }
-        content.push('\n');
-    }
+    content.push_str(&format_history(history));
     content.push_str("Please summarize why the agent failed to converge and what could be done differently.");
 
     let messages = vec![

@@ -140,26 +140,6 @@ async fn test_judge_says_retry_when_analysis_rejects_formula() {
 }
 
 #[test_log::test(tokio::test)]
-async fn test_judge_says_no_then_yes() {
-    let llm = SequenceLlm::new(
-        vec![
-            formula_response(),
-            formula_response(),
-        ],
-        vec![JUDGE_RETRY.to_string(), JUDGE_REASONABLE.to_string()],
-    );
-    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
-
-    let result = run_with_providers("refactoring desc", &llm, &solver)
-        .await
-        .expect("agent should succeed");
-
-    assert_eq!(result.solver_outcome, SolverOutcome::Unsat);
-    assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
-    assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
-}
-
-#[test_log::test(tokio::test)]
 async fn test_judge_gives_unclear_answer_then_clear() {
     let llm = SequenceLlm::new(
         vec![

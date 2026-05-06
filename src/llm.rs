@@ -15,6 +15,7 @@ use crate::provider::{LlmProvider, LlmRole};
 pub enum Role {
     System,
     User,
+    Assistant,
 }
 
 pub struct Message {
@@ -87,15 +88,29 @@ impl LlmClient {
 
     #[instrument(skip_all, fields(model = %self.config.primary_model))]
     pub async fn chat_primary(&self, messages: Vec<Message>) -> Result<String> {
-        self.chat("primary", &self.config.primary_model, messages).await
+        self.chat("primary", &self.config.primary_model, messages, |content| {
+            crate::smt::extract_smt_formula(content).is_some()
+        }).await
     }
 
     #[instrument(skip_all, fields(model = %self.config.judge_model))]
     pub async fn chat_judge(&self, messages: Vec<Message>) -> Result<String> {
-        self.chat("judge", &self.config.judge_model, messages).await
+        self.chat("judge", &self.config.judge_model, messages, |content| {
+            let upper = content.trim().to_uppercase();
+            let trimmed = upper.trim_start_matches(|c: char| !c.is_alphabetic());
+            trimmed.starts_with("REASONABLE") || trimmed.starts_with("RETRY")
+        }).await
     }
 
-    async fn chat(&self, label: &str, model: &str, messages: Vec<Message>) -> Result<String> {
+    async fn chat(
+        &self,
+        label: &str,
+        model: &str,
+        messages: Vec<Message>,
+        is_partial_valid: impl Fn(&str) -> bool,
+    ) -> Result<String> {
+        // TODO: Instead of discarding unusable partial content on retry, we could
+        // feed it back to the LLM and ask it to complete the response.
         let request_messages: Vec<ChatCompletionRequestMessage> = messages
             .into_iter()
             .map(|msg| match msg.role {
@@ -112,6 +127,15 @@ impl LlmClient {
                         ChatCompletionRequestUserMessage {
                             content: ChatCompletionRequestUserMessageContent::Text(msg.content),
                             name: None,
+                        },
+                    )
+                }
+                Role::Assistant => {
+                    ChatCompletionRequestMessage::Assistant(
+                        async_openai::types::chat::ChatCompletionRequestAssistantMessage {
+                            content: Some(async_openai::types::chat::ChatCompletionRequestAssistantMessageContent::Text(msg.content)),
+                            name: None,
+                            ..Default::default()
                         },
                     )
                 }
@@ -159,20 +183,28 @@ impl LlmClient {
                         }
                     }
                     Ok(Some(Err(async_openai::error::OpenAIError::StreamError(e)))) => {
+                        if !content.is_empty() && is_partial_valid(&content) {
+                            warn!(%label, error = %e, bytes = content.len(), "LLM stream error, but partial content is valid, returning it");
+                            stream_ended = true;
+                            break;
+                        }
                         if attempt < max_retries {
-                            warn!(%label, attempt, error = %e, bytes = content.len(), "LLM stream error, retrying");
+                            warn!(%label, attempt, error = %e, bytes = content.len(), "LLM stream error, partial content not usable, retrying");
                             break;
                         }
                         if content.is_empty() {
                             anyhow::bail!("LLM stream error with no content received after all retries: {e}");
                         }
-                        warn!(%label, error = %e, bytes = content.len(), "LLM stream ended prematurely, returning partial content");
-                        stream_ended = true;
-                        break;
+                        anyhow::bail!("LLM stream error after all retries, partial content not usable: {e}");
                     }
                     Ok(Some(Err(e))) => {
+                        if !content.is_empty() && is_partial_valid(&content) {
+                            warn!(%label, error = %e, bytes = content.len(), "LLM chunk error, but partial content is valid, returning it");
+                            stream_ended = true;
+                            break;
+                        }
                         if attempt < max_retries {
-                            warn!(%label, attempt, error = %e, "LLM stream chunk error, retrying");
+                            warn!(%label, attempt, error = %e, bytes = content.len(), "LLM chunk error, partial content not usable, retrying");
                             break;
                         }
                         return Err(e).context("LLM stream chunk error after all retries");
@@ -182,8 +214,13 @@ impl LlmClient {
                         break;
                     }
                     Err(_) => {
+                        if !content.is_empty() && is_partial_valid(&content) {
+                            warn!(%label, bytes = content.len(), "stream timed out, but partial content is valid, returning it");
+                            stream_ended = true;
+                            break;
+                        }
                         if attempt < max_retries {
-                            warn!(%label, attempt, "stream timeout ({}ms), retrying", self.config.stream_timeout_ms);
+                            warn!(%label, attempt, bytes = content.len(), "stream timeout ({}ms), partial content not usable, retrying", self.config.stream_timeout_ms);
                             break;
                         }
                         if content.is_empty() {
@@ -192,9 +229,10 @@ impl LlmClient {
                                 self.config.stream_timeout_ms
                             );
                         }
-                        warn!(%label, bytes = content.len(), "stream timed out, returning partial content");
-                        stream_ended = true;
-                        break;
+                        anyhow::bail!(
+                            "LLM stream timed out ({}ms) after all retries, partial content not usable",
+                            self.config.stream_timeout_ms
+                        );
                     }
                 }
             }
@@ -227,6 +265,14 @@ pub fn system_message(content: &str) -> Message {
 pub fn user_message(content: &str) -> Message {
     Message {
         role: Role::User,
+        content: content.to_string(),
+    }
+}
+
+#[must_use]
+pub fn assistant_message(content: &str) -> Message {
+    Message {
+        role: Role::Assistant,
         content: content.to_string(),
     }
 }
