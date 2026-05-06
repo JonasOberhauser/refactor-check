@@ -30,6 +30,14 @@ struct Cli {
     /// API key (defaults to OPENROUTER_API_KEY env var)
     #[arg(long, env = "OPENROUTER_API_KEY")]
     api_key: Option<String>,
+
+    /// Per-chunk stream timeout in milliseconds
+    #[arg(long, default_value = "3000")]
+    stream_timeout_ms: u64,
+
+    /// Maximum stream retry attempts on timeout or connection error
+    #[arg(long, default_value = "5")]
+    max_stream_retries: u32,
 }
 
 #[tokio::main]
@@ -53,6 +61,8 @@ async fn main() -> Result<()> {
             api_base: cli.api_base,
             primary_model: cli.primary_model,
             judge_model: cli.judge_model,
+            stream_timeout_ms: cli.stream_timeout_ms,
+            max_stream_retries: cli.max_stream_retries,
         },
         solver_path: cli.solver_path,
     };

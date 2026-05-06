@@ -28,6 +28,31 @@ pub struct LlmConfig {
     pub api_base: String,
     pub primary_model: String,
     pub judge_model: String,
+    #[serde(default = "default_stream_timeout_ms")]
+    pub stream_timeout_ms: u64,
+    #[serde(default = "default_max_stream_retries")]
+    pub max_stream_retries: u32,
+}
+
+fn default_stream_timeout_ms() -> u64 {
+    3000
+}
+
+fn default_max_stream_retries() -> u32 {
+    5
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            api_base: String::new(),
+            primary_model: String::new(),
+            judge_model: String::new(),
+            stream_timeout_ms: default_stream_timeout_ms(),
+            max_stream_retries: default_max_stream_retries(),
+        }
+    }
 }
 
 impl fmt::Debug for LlmConfig {
@@ -37,6 +62,8 @@ impl fmt::Debug for LlmConfig {
             .field("api_base", &self.api_base)
             .field("primary_model", &self.primary_model)
             .field("judge_model", &self.judge_model)
+            .field("stream_timeout_ms", &self.stream_timeout_ms)
+            .field("max_stream_retries", &self.max_stream_retries)
             .finish()
     }
 }
@@ -69,79 +96,122 @@ impl LlmClient {
     }
 
     async fn chat(&self, label: &str, model: &str, messages: Vec<Message>) -> Result<String> {
-        let request = CreateChatCompletionRequest {
-            model: model.to_string(),
-            messages: messages
-                .into_iter()
-                .map(|msg| match msg.role {
-                    Role::System => {
-                        ChatCompletionRequestMessage::System(
-                            ChatCompletionRequestSystemMessage {
-                                content: ChatCompletionRequestSystemMessageContent::Text(msg.content),
-                                name: None,
-                            },
-                        )
-                    }
-                    Role::User => {
-                        ChatCompletionRequestMessage::User(
-                            ChatCompletionRequestUserMessage {
-                                content: ChatCompletionRequestUserMessageContent::Text(msg.content),
-                                name: None,
-                            },
-                        )
-                    }
-                })
-                .collect(),
-            stream: Some(true),
-            ..Default::default()
-        };
-
-        debug!(%label, "sending LLM streaming request");
-
-        let mut stream = self
-            .client
-            .chat()
-            .create_stream(request)
-            .await
-            .context("LLM streaming request failed")?;
-
-        let mut content = String::new();
-        let mut finish_reason: Option<FinishReason> = None;
-
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(response) => {
-                    if let Some(choice) = response.choices.first() {
-                        if let Some(delta_content) = &choice.delta.content {
-                            content.push_str(delta_content);
-                        }
-                        if let Some(fr) = &choice.finish_reason {
-                            finish_reason = Some(*fr);
-                        }
-                    }
+        let request_messages: Vec<ChatCompletionRequestMessage> = messages
+            .into_iter()
+            .map(|msg| match msg.role {
+                Role::System => {
+                    ChatCompletionRequestMessage::System(
+                        ChatCompletionRequestSystemMessage {
+                            content: ChatCompletionRequestSystemMessageContent::Text(msg.content),
+                            name: None,
+                        },
+                    )
                 }
-                Err(async_openai::error::OpenAIError::StreamError(e)) => {
-                    if content.is_empty() {
-                        anyhow::bail!("LLM stream error with no content received: {e}");
-                    }
-                    warn!(%label, error = %e, bytes = content.len(), "LLM stream ended prematurely, returning partial content");
-                    break;
+                Role::User => {
+                    ChatCompletionRequestMessage::User(
+                        ChatCompletionRequestUserMessage {
+                            content: ChatCompletionRequestUserMessageContent::Text(msg.content),
+                            name: None,
+                        },
+                    )
                 }
+            })
+            .collect();
+
+        let timeout = std::time::Duration::from_millis(self.config.stream_timeout_ms);
+        let max_retries = self.config.max_stream_retries;
+
+        for attempt in 0..=max_retries {
+            let request = CreateChatCompletionRequest {
+                model: model.to_string(),
+                messages: request_messages.clone(),
+                stream: Some(true),
+                ..Default::default()
+            };
+
+            debug!(%label, attempt, "sending LLM streaming request");
+
+            let mut stream = match self.client.chat().create_stream(request).await {
+                Ok(s) => s,
                 Err(e) => {
-                    return Err(e).context("LLM stream chunk error");
+                    if attempt < max_retries {
+                        warn!(%label, attempt, error = %e, "LLM stream creation failed, retrying");
+                        continue;
+                    }
+                    return Err(e).context("LLM streaming request failed after all retries");
                 }
+            };
+
+            let mut content = String::new();
+            let mut finish_reason: Option<FinishReason> = None;
+            let mut stream_ended = false;
+
+            loop {
+                match tokio::time::timeout(timeout, stream.next()).await {
+                    Ok(Some(Ok(response))) => {
+                        if let Some(choice) = response.choices.first() {
+                            if let Some(delta_content) = &choice.delta.content {
+                                content.push_str(delta_content);
+                            }
+                            if let Some(fr) = &choice.finish_reason {
+                                finish_reason = Some(*fr);
+                            }
+                        }
+                    }
+                    Ok(Some(Err(async_openai::error::OpenAIError::StreamError(e)))) => {
+                        if attempt < max_retries {
+                            warn!(%label, attempt, error = %e, bytes = content.len(), "LLM stream error, retrying");
+                            break;
+                        }
+                        if content.is_empty() {
+                            anyhow::bail!("LLM stream error with no content received after all retries: {e}");
+                        }
+                        warn!(%label, error = %e, bytes = content.len(), "LLM stream ended prematurely, returning partial content");
+                        stream_ended = true;
+                        break;
+                    }
+                    Ok(Some(Err(e))) => {
+                        if attempt < max_retries {
+                            warn!(%label, attempt, error = %e, "LLM stream chunk error, retrying");
+                            break;
+                        }
+                        return Err(e).context("LLM stream chunk error after all retries");
+                    }
+                    Ok(None) => {
+                        stream_ended = true;
+                        break;
+                    }
+                    Err(_) => {
+                        if attempt < max_retries {
+                            warn!(%label, attempt, "stream timeout ({}ms), retrying", self.config.stream_timeout_ms);
+                            break;
+                        }
+                        if content.is_empty() {
+                            anyhow::bail!(
+                                "LLM stream timed out ({}ms) with no content after all retries",
+                                self.config.stream_timeout_ms
+                            );
+                        }
+                        warn!(%label, bytes = content.len(), "stream timed out, returning partial content");
+                        stream_ended = true;
+                        break;
+                    }
+                }
+            }
+
+            if stream_ended {
+                if matches!(finish_reason, Some(FinishReason::Length)) {
+                    warn!(%label, bytes = content.len(), "LLM response truncated (finish_reason=length)");
+                }
+
+                let content = content.trim().to_string();
+                info!(%label, bytes = content.len(), "LLM response received");
+                debug!(%label, %content, "full LLM response");
+                return Ok(content);
             }
         }
 
-        if matches!(finish_reason, Some(FinishReason::Length)) {
-            warn!(%label, bytes = content.len(), "LLM response truncated (finish_reason=length)");
-        }
-
-        let content = content.trim().to_string();
-        info!(%label, bytes = content.len(), "LLM response received");
-        debug!(%label, %content, "full LLM response");
-
-        Ok(content)
+        anyhow::bail!("LLM stream exhausted all {max_retries} retries without completing");
     }
 }
 
