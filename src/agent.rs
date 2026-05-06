@@ -107,12 +107,7 @@ pub async fn run_with_providers(
         );
 
         if had_error {
-            warn!("solver error, looping back with error analysis");
-            let analysis_messages = build_error_analysis_messages(
-                input_content, &history, &formula, &solver_result,
-            );
-            let analysis = llm.chat(LlmRole::Primary, analysis_messages).await?;
-            debug!(bytes = analysis.len(), "error analysis received");
+            warn!("solver error, looping back to generate new formula");
 
             history.push(HistoryEntry {
                 formula: formula.clone(),
@@ -223,34 +218,6 @@ async fn insist_on_formula(
         }
         last_response = response;
     }
-}
-
-fn build_error_analysis_messages(
-    input_content: &str,
-    history: &[HistoryEntry],
-    current_formula: &str,
-    solver_result: &crate::smt::SolverResult,
-) -> Vec<Message> {
-    let mut content = format!("Here is the input file:\n\n{input_content}\n\n");
-    content.push_str("Full history of prior attempts:\n\n");
-    content.push_str(&format_history(history));
-    let _ = write!(content, "Current formula:\n{current_formula}\n\n");
-    let _ = write!(
-        content,
-        "Current solver response:\nstdout:\n{}\nstderr:\n{}\n\n\
-         The solver returned an error. Analyze what went wrong and whether a new formula should be generated. \
-         Explain your reasoning.",
-        solver_result.stdout, solver_result.stderr
-    );
-
-    vec![
-        system_message(
-            "You are an expert in formal verification and SMT-LIB2. \
-             Analyze the solver error and determine what went wrong with the SMT formula. \
-             Should a new formula be generated, or is the solver response reasonable despite the error?"
-        ),
-        user_message(&content),
-    ]
 }
 
 #[instrument(skip_all)]
