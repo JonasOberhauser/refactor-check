@@ -42,8 +42,8 @@ async fn test_happy_path_unsat() {
         .expect("agent should succeed");
 
     assert_eq!(result.formulas.len(), 1);
-    assert!(result.formulas[0].0.contains("(set-logic"));
-    assert_eq!(result.formulas[0].1, SolverOutcome::Unsat);
+    assert!(result.formulas[0].formula.contains("(set-logic"));
+    assert_eq!(result.formulas[0].outcome, SolverOutcome::Unsat);
     assert!(result.overall_equivalent);
     assert_eq!(result.reasonable_unsat, 1);
     assert_eq!(llm.primary_remaining(), 0);
@@ -66,8 +66,8 @@ async fn test_formula_not_found_then_found() {
         .expect("agent should succeed");
 
     assert_eq!(result.formulas.len(), 1);
-    assert!(result.formulas[0].0.contains("(set-logic"));
-    assert_eq!(result.formulas[0].1, SolverOutcome::Unsat);
+    assert!(result.formulas[0].formula.contains("(set-logic"));
+    assert_eq!(result.formulas[0].outcome, SolverOutcome::Unsat);
     assert!(result.overall_equivalent);
     assert_eq!(llm.primary_remaining(), 0);
     assert_eq!(llm.judge_remaining(), 0);
@@ -167,7 +167,7 @@ async fn test_judge_gives_unclear_answer_then_clear() {
         .expect("agent should succeed");
 
     assert_eq!(result.formulas.len(), 1);
-    assert_eq!(result.formulas[0].1, SolverOutcome::Unsat);
+    assert_eq!(result.formulas[0].outcome, SolverOutcome::Unsat);
     assert!(result.overall_equivalent);
     assert_eq!(llm.primary_remaining(), 0);
     assert_eq!(llm.judge_remaining(), 0);
@@ -315,10 +315,10 @@ async fn test_jemalloc_refactoring_unsat() {
         .expect("agent should succeed");
 
     assert_eq!(result.formulas.len(), 1);
-    assert!(result.formulas[0].0.contains("(set-logic UF)"));
-    assert!(result.formulas[0].0.contains("(declare-sort Emitter 0)"));
-    assert!(result.formulas[0].0.contains("(check-sat)"));
-    assert_eq!(result.formulas[0].1, SolverOutcome::Unsat);
+    assert!(result.formulas[0].formula.contains("(set-logic UF)"));
+    assert!(result.formulas[0].formula.contains("(declare-sort Emitter 0)"));
+    assert!(result.formulas[0].formula.contains("(check-sat)"));
+    assert_eq!(result.formulas[0].outcome, SolverOutcome::Unsat);
     assert!(result.overall_equivalent);
     assert_eq!(llm.primary_remaining(), 0);
     assert_eq!(llm.judge_remaining(), 0);

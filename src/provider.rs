@@ -20,8 +20,15 @@ pub trait SolverProvider: Send + Sync {
     async fn run(&self, formula: &str) -> Result<SolverResult>;
 }
 
+pub struct FormulaResult {
+    pub formula: String,
+    pub outcome: SolverOutcome,
+    pub verdict: String,
+    pub explanation: Option<String>,
+}
+
 pub struct AgentResult {
-    pub formulas: Vec<(String, SolverOutcome, String)>, // (formula, outcome, verdict)
+    pub formulas: Vec<FormulaResult>,
     pub overall_equivalent: bool,
     pub open_count: usize,
     pub reasonable_sat: usize,

@@ -76,8 +76,8 @@ async fn test_sat_judge_overrules() {
         .expect("agent should succeed (bug: judge overruled)");
 
     assert_eq!(result.formulas.len(), 1);
-    assert_eq!(result.formulas[0].1, SolverOutcome::Sat);
-    assert!(result.formulas[0].0.contains("(set-logic ALL)"));
+    assert_eq!(result.formulas[0].outcome, SolverOutcome::Sat);
+    assert!(result.formulas[0].formula.contains("(set-logic ALL)"));
     assert!(!result.overall_equivalent);
     assert_eq!(result.reasonable_sat, 1);
 }

@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use tracing::{debug, info, instrument, warn};
 
 use crate::llm::{LlmClient, LlmConfig, Message, system_message, user_message};
-use crate::provider::{AgentResult, LlmProvider, LlmRole, SolverProvider};
+use crate::provider::{AgentResult, FormulaResult, LlmProvider, LlmRole, SolverProvider};
 use crate::smt::{SolverOutcome, SolverResult, Z3Solver, extract_all_formulas};
 
 pub use crate::smt::DEFAULT_SOLVER_TIMEOUT_SECS;
@@ -57,8 +57,12 @@ pub async fn run(input_file: &str, config: AgentConfig) -> Result<()> {
         result.reasonable_unknown
     );
     println!("=== Open Pieces ===\n{}\n", result.open_count);
-    for (formula, outcome, _verdict) in &result.formulas {
-        println!("--- Formula ---\n{formula}\nOutcome: {outcome:?}\n");
+    for f in &result.formulas {
+        println!("--- Formula ---\n{}\nOutcome: {:?}, Verdict: {}\n",
+            f.formula, f.outcome, f.verdict);
+        if let Some(ref explanation) = f.explanation {
+            println!("--- Explanation ---\n{explanation}\n");
+        }
     }
     Ok(())
 }
@@ -154,7 +158,8 @@ pub async fn run_with_providers(
         // 5. Stopping condition
         if open.is_empty() {
             info!("all pieces verified, converged");
-            return Ok(build_result(verified, 0));
+            let result = build_result(verified, 0);
+            return Ok(explain_formulas(input_content, llm, result).await);
         }
 
         info!(open = open.len(), verified = verified.len(), "iteration complete, items remain open");
@@ -169,7 +174,7 @@ pub async fn run_with_providers(
         unknown = result.reasonable_unknown,
         "max iterations reached, partial result"
     );
-    Ok(result)
+    Ok(explain_formulas(input_content, llm, result).await)
 }
 
 fn build_result(verified: Vec<VerifiedPiece>, open_count: usize) -> AgentResult {
@@ -179,13 +184,89 @@ fn build_result(verified: Vec<VerifiedPiece>, open_count: usize) -> AgentResult 
     let overall_equivalent = open_count == 0 && reasonable_sat == 0 && reasonable_unknown == 0;
 
     AgentResult {
-        formulas: verified.into_iter().map(|v| (v.formula, v.outcome, JUDGE_REASONABLE.to_string())).collect(),
+        formulas: verified.into_iter().map(|v| FormulaResult {
+            formula: v.formula,
+            outcome: v.outcome.clone(),
+            verdict: JUDGE_REASONABLE.to_string(),
+            explanation: None,
+        }).collect(),
         overall_equivalent,
         open_count,
         reasonable_sat,
         reasonable_unsat,
         reasonable_unknown,
     }
+}
+
+#[instrument(skip_all)]
+async fn explain_formulas(input_content: &str, llm: &dyn LlmProvider, mut result: AgentResult) -> AgentResult {
+    let needs_explanation: Vec<usize> = result.formulas.iter().enumerate()
+        .filter(|(_, f)| matches!(f.outcome, SolverOutcome::Sat | SolverOutcome::Unknown))
+        .map(|(i, _)| i)
+        .collect();
+
+    if needs_explanation.is_empty() {
+        return result;
+    }
+
+    info!(count = needs_explanation.len(), "generating bug explanations");
+
+    let futures = needs_explanation.iter().map(|&i| {
+        let formula = result.formulas[i].formula.clone();
+        let outcome = result.formulas[i].outcome.clone();
+        async move {
+            let messages = build_explanation_messages(input_content, &formula, &outcome);
+            let response = llm.chat(LlmRole::Primary, messages).await;
+            (i, response)
+        }
+    });
+
+    let explanations = futures::future::join_all(futures).await;
+
+    for (i, response) in explanations {
+        match response {
+            Ok(text) => {
+                info!("explanation received for formula {}", i);
+                result.formulas[i].explanation = Some(text);
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to get explanation for formula {}", i);
+                result.formulas[i].explanation = None;
+            }
+        }
+    }
+
+    result
+}
+
+fn build_explanation_messages(input_content: &str, formula: &str, outcome: &SolverOutcome) -> Vec<Message> {
+    let system = if matches!(outcome, SolverOutcome::Sat) {
+        "You are an expert in program analysis and formal verification. \
+         The SMT solver found a counterexample (SAT) for an equivalence formula. \
+         Explain the source of the bug: what behavioral difference between \
+         the 'before' and 'after' code does the counterexample represent?"
+    } else {
+        "You are an expert in program analysis and formal verification. \
+         The SMT solver could not decide (UNKNOWN) for an equivalence formula. \
+         Evaluate whether there is likely a real bug, or whether the formula \
+         is simply too complex for the solver. Highlight that the solver's result is INCONCLUSIVE."
+    };
+
+    let prompt = format!(
+        "Original refactoring:\n\n{}\n\n\
+         SMT formula:\n\n{}\n\n\
+         Solver outcome: {}\n\n\
+         Please provide your analysis.",
+        input_content,
+        formula,
+        match outcome {
+            SolverOutcome::Sat => "SAT (counterexample found)",
+            SolverOutcome::Unknown => "UNKNOWN (solver could not decide)",
+            _ => unreachable!(),
+        }
+    );
+
+    vec![system_message(system), user_message(&prompt)]
 }
 
 fn build_generation_messages(
