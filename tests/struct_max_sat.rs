@@ -60,12 +60,7 @@ fn struct_max_formula_response() -> String {
 ```"#.to_string()
 }
 
-/// Reproduces the real-world bug from conversation.log: the primary LLM generates
-/// a formula using (set-logic ALL) with uninterpreted sorts, Z3 returns SAT with a
-/// spurious finite model, and the judge LLM returns REASONABLE despite the result
-/// being invalid. The judge now receives the formula + solver output directly (not
-/// the primary's analysis), so this test documents the scenario where the judge
-/// independently evaluates the raw SAT result and incorrectly deems it reasonable.
+/// Bug reproduction: judge overrules a spurious SAT result.
 #[test_log::test(tokio::test)]
 async fn test_sat_judge_overrules() {
     let llm = SequenceLlm::new(
@@ -80,6 +75,9 @@ async fn test_sat_judge_overrules() {
         .await
         .expect("agent should succeed (bug: judge overruled)");
 
-    assert_eq!(result.solver_outcome, SolverOutcome::Sat);
-    assert!(result.formula.contains("(set-logic ALL)"));
+    assert_eq!(result.formulas.len(), 1);
+    assert_eq!(result.formulas[0].1, SolverOutcome::Sat);
+    assert!(result.formulas[0].0.contains("(set-logic ALL)"));
+    assert!(!result.overall_equivalent);
+    assert_eq!(result.reasonable_sat, 1);
 }

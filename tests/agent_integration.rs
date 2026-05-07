@@ -41,11 +41,13 @@ async fn test_happy_path_unsat() {
         .await
         .expect("agent should succeed");
 
-    assert!(result.formula.contains("(set-logic"));
-    assert_eq!(result.solver_outcome, SolverOutcome::Unsat);
-    assert!(result.solver_stdout.contains("unsat"));
-    assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
-    assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
+    assert_eq!(result.formulas.len(), 1);
+    assert!(result.formulas[0].0.contains("(set-logic"));
+    assert_eq!(result.formulas[0].1, SolverOutcome::Unsat);
+    assert!(result.overall_equivalent);
+    assert_eq!(result.reasonable_unsat, 1);
+    assert_eq!(llm.primary_remaining(), 0);
+    assert_eq!(llm.judge_remaining(), 0);
 }
 
 #[test_log::test(tokio::test)]
@@ -63,10 +65,12 @@ async fn test_formula_not_found_then_found() {
         .await
         .expect("agent should succeed");
 
-    assert!(result.formula.contains("(set-logic"));
-    assert_eq!(result.solver_outcome, SolverOutcome::Unsat);
-    assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
-    assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
+    assert_eq!(result.formulas.len(), 1);
+    assert!(result.formulas[0].0.contains("(set-logic"));
+    assert_eq!(result.formulas[0].1, SolverOutcome::Unsat);
+    assert!(result.overall_equivalent);
+    assert_eq!(llm.primary_remaining(), 0);
+    assert_eq!(llm.judge_remaining(), 0);
 }
 
 struct ToggleSolver {
@@ -83,7 +87,7 @@ impl SolverProvider for ToggleSolver {
         if n <= self.error_until {
             Ok(SolverResult {
                 outcome: SolverOutcome::Error("parse error".to_string()),
-                stdout: "sat".to_string(),
+                stdout: "parse error".to_string(),
                 stderr: "error".to_string(),
             })
         } else {
@@ -97,46 +101,52 @@ impl SolverProvider for ToggleSolver {
 }
 
 #[test_log::test(tokio::test)]
-async fn test_solver_error_then_success() {
-    let llm = SequenceLlm::new(
-        vec![
-            formula_response(),
-            "The solver had an error, let me fix it.".to_string(),
-            formula_response(),
-        ],
-        vec![JUDGE_REASONABLE.to_string()],
-    );
+async fn test_solver_error_in_batch_then_partial_result() {
+    // In the compositional flow, an errored formula stays open until explicitly replaced.
+    // With fixed LLM responses, the agent never generates a replacement for the specific
+    // errored item, so it reaches MAX_ITERATIONS with a partial result.
+    let primary: Vec<String> = std::iter::once(two_formula_response())
+        .chain((0..29).map(|_| formula_response()))
+        .collect();
+    let judge: Vec<String> = (0..30).map(|_| JUDGE_REASONABLE.to_string()).collect();
+    let llm = SequenceLlm::new(primary, judge);
+
     let call_count = Arc::new(Mutex::new(0usize));
     let solver = ToggleSolver { call_count: call_count.clone(), error_until: 1 };
 
+    // After MAX_ITERATIONS the agent returns Ok with a partial result
     let result = run_with_providers("refactoring desc", &llm, &solver)
         .await
-        .expect("agent should succeed");
+        .expect("agent should return partial result after max iterations");
 
-    assert_eq!(result.solver_outcome, SolverOutcome::Unsat);
-    assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
-    assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
-    assert_eq!(*call_count.lock().unwrap(), 2, "solver should be called twice");
+    // 1 errored formula never resolved, 30 others verified (1 in iter 1 + 29 rest)
+    assert_eq!(result.open_count, 1);
+    assert_eq!(result.formulas.len(), 30);
+    assert_eq!(*call_count.lock().unwrap(), 31, "solver called 31 times (2 in iter 1 + 29 rest)");
 }
 
 #[test_log::test(tokio::test)]
-async fn test_judge_says_retry_when_analysis_rejects_formula() {
-    let llm = SequenceLlm::new(
-        vec![
-            formula_response(),
-            formula_response(),
-        ],
-        vec![JUDGE_RETRY.to_string(), JUDGE_REASONABLE.to_string()],
-    );
+async fn test_judge_retry_in_batch_then_partial_result() {
+    // A RETRY verdict moves the formula to open items, where it persists until
+    // explicitly replaced. With fixed LLM responses the agent never generates
+    // a targeted replacement, so it reaches MAX_ITERATIONS with a partial result.
+    let primary: Vec<String> = std::iter::once(two_formula_response())
+        .chain((0..29).map(|_| formula_response()))
+        .collect();
+    // 2 judge calls in iteration 1 (RETRY + REASONABLE) + 29 more in iterations 2..30
+    let judge: Vec<String> = std::iter::once(JUDGE_RETRY.to_string())
+        .chain((0..30).map(|_| JUDGE_REASONABLE.to_string()))
+        .collect();
+    let llm = SequenceLlm::new(primary, judge);
     let solver = FakeSolver { outcome: SolverOutcome::Unsat };
 
     let result = run_with_providers("refactoring desc", &llm, &solver)
         .await
-        .expect("agent should succeed");
+        .expect("agent should return partial result after max iterations");
 
-    assert_eq!(result.solver_outcome, SolverOutcome::Unsat);
-    assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
-    assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
+    assert_eq!(result.open_count, 1);
+    assert_eq!(result.formulas.len(), 30);
+    assert_eq!(result.reasonable_unsat, 30);
 }
 
 #[test_log::test(tokio::test)]
@@ -156,9 +166,11 @@ async fn test_judge_gives_unclear_answer_then_clear() {
         .await
         .expect("agent should succeed");
 
-    assert_eq!(result.solver_outcome, SolverOutcome::Unsat);
-    assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
-    assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
+    assert_eq!(result.formulas.len(), 1);
+    assert_eq!(result.formulas[0].1, SolverOutcome::Unsat);
+    assert!(result.overall_equivalent);
+    assert_eq!(llm.primary_remaining(), 0);
+    assert_eq!(llm.judge_remaining(), 0);
 }
 
 fn jemalloc_refactoring_formula() -> String {
@@ -280,16 +292,8 @@ fn jemalloc_formula_response() -> String {
         "Looking at this refactoring, the \"before\" version is a monolithic \
          `stats_general_print` function that performs all operations inline, while the \
          \"after\" version decomposes it into helper functions called in the same order.\n\n\
-         ```smt2\n{}\n```\n\n\
-         **Expected result: UNSAT** — The formula is unsatisfiable because:\n\n\
-         1. **Same operation sequence**: Both versions call `f_version` first, then the \
-         same five sections in the same order.\n\
-         2. **Helper functions match inline sections**: Each extracted helper function \
-         performs exactly the same emitter API calls as its corresponding inline code.\n\
-         3. **No cross-section variable dependencies**: All local variables are written \
-         before being read within each section.\n\
-         4. **Same conditional behavior**: All conditions are evaluated the same way in \
-         both versions.",
+          ```smt2\n{}\n```\n\n\
+          **Expected result: UNSAT**",
         jemalloc_refactoring_formula()
     )
 }
@@ -310,39 +314,33 @@ async fn test_jemalloc_refactoring_unsat() {
         .await
         .expect("agent should succeed");
 
-    assert!(result.formula.contains("(set-logic UF)"));
-    assert!(result.formula.contains("(declare-sort Emitter 0)"));
-    assert!(result.formula.contains("(check-sat)"));
-    assert_eq!(result.solver_outcome, SolverOutcome::Unsat);
-    assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
-    assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
+    assert_eq!(result.formulas.len(), 1);
+    assert!(result.formulas[0].0.contains("(set-logic UF)"));
+    assert!(result.formulas[0].0.contains("(declare-sort Emitter 0)"));
+    assert!(result.formulas[0].0.contains("(check-sat)"));
+    assert_eq!(result.formulas[0].1, SolverOutcome::Unsat);
+    assert!(result.overall_equivalent);
+    assert_eq!(llm.primary_remaining(), 0);
+    assert_eq!(llm.judge_remaining(), 0);
 }
 
 #[test_log::test(tokio::test)]
-async fn test_solver_multi_round_multi_formula() {
+async fn test_multi_formula_batch() {
     let llm = SequenceLlm::new(
-        vec![
-            "Seems like a fun problem, good luck!.".to_string(),
-            two_formula_response(),
-            formula_response(),
-            "The solver had an error, I'll regenerate.".to_string(),
-            formula_response(),
-            "The solver errored again, retrying.".to_string(),
-            formula_response(),
-            formula_response(),
-        ],
-        vec![JUDGE_RETRY.to_string(), JUDGE_REASONABLE.to_string()],
+        vec![two_formula_response()],
+        vec![JUDGE_REASONABLE.to_string(), JUDGE_REASONABLE.to_string()],
     );
     let call_count = Arc::new(Mutex::new(0usize));
-    let solver = ToggleSolver { call_count: call_count.clone(), error_until: 2 };
+    let solver = ToggleSolver { call_count: call_count.clone(), error_until: 0 };
 
     let result = run_with_providers("refactoring desc", &llm, &solver)
         .await
         .expect("agent should succeed");
 
-    assert!(result.formula.contains("(set-logic"));
-    assert_eq!(result.solver_outcome, SolverOutcome::Unsat);
-    assert_eq!(llm.primary_remaining(), 0, "all primary responses consumed");
-    assert_eq!(llm.judge_remaining(), 0, "all judge responses consumed");
-    assert_eq!(*call_count.lock().unwrap(), 4, "solver should be called four times");
+    assert_eq!(result.formulas.len(), 2);
+    assert_eq!(*call_count.lock().unwrap(), 2, "both formulas should be solved in parallel");
+    assert!(result.overall_equivalent);
+    assert_eq!(result.reasonable_unsat, 2);
+    assert_eq!(llm.primary_remaining(), 0);
+    assert_eq!(llm.judge_remaining(), 0);
 }

@@ -34,6 +34,13 @@ pub fn extract_smt_formula(response: &str) -> Option<String> {
     }
 }
 
+pub fn extract_all_formulas(response: &str) -> Vec<String> {
+    trace!("extracting all SMT formulas from LLM response");
+    let formulas = collect_smt_formulas(response);
+    debug!(count = formulas.len(), "SMT formula candidates found");
+    formulas
+}
+
 fn backtick_count(line: &str) -> usize {
     let trimmed = line.trim();
     let mut count = 0;

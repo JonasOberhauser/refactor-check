@@ -6,7 +6,7 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::llm::{LlmClient, LlmConfig, Message, system_message, user_message};
 use crate::provider::{AgentResult, LlmProvider, LlmRole, SolverProvider};
-use crate::smt::{SolverOutcome, SolverResult, Z3Solver, extract_smt_formula};
+use crate::smt::{SolverOutcome, SolverResult, Z3Solver, extract_all_formulas};
 
 pub use crate::smt::DEFAULT_SOLVER_TIMEOUT_SECS;
 
@@ -24,40 +24,16 @@ pub struct AgentConfig {
     pub solver_timeout_secs: u64,
 }
 
-pub struct HistoryEntry {
-    pub formula: String,
-    pub solver_stdout: String,
-    pub solver_stderr: String,
-    pub had_error: bool,
+struct VerifiedPiece {
+    formula: String,
+    outcome: SolverOutcome,
 }
 
-fn format_history(history: &[HistoryEntry]) -> String {
-    let mut content = String::new();
-    for (i, entry) in history.iter().enumerate() {
-        let _ = writeln!(content, "--- Attempt {} ---", i + 1);
-        let _ = write!(content, "Formula:\n{}\n", entry.formula);
-        if entry.had_error {
-            let is_timeout = entry.solver_stdout.contains("timed out")
-                || entry.solver_stderr.contains("timed out");
-            if is_timeout {
-                let _ = write!(
-                    content,
-                    "Solver TIMEOUT:\n{}\n{}\n\n\
-                     The solver timed out. You MUST simplify the formula. \
-                     Try reducing the number of variables, using simpler logic (e.g., QF_LIA instead of QF_NIA), \
-                     limiting assertions to only the most critical part of the equivalence check, \
-                     or reducing bit-vector widths.\n",
-                    entry.solver_stdout, entry.solver_stderr
-                );
-            } else {
-                let _ = write!(content, "Solver ERROR:\n{}\n{}\n", entry.solver_stdout, entry.solver_stderr);
-            }
-        } else {
-            let _ = write!(content, "Solver output:\n{}\n", entry.solver_stdout);
-        }
-        content.push('\n');
-    }
-    content
+struct OpenItem {
+    formula: String,
+    reason: String,
+    solver_stdout: String,
+    solver_stderr: String,
 }
 
 pub async fn run(input_file: &str, config: AgentConfig) -> Result<()> {
@@ -72,9 +48,18 @@ pub async fn run(input_file: &str, config: AgentConfig) -> Result<()> {
     );
 
     let result = run_with_providers(&input_content, &llm, &solver).await?;
-    println!("=== Solver Outcome ===\n{:?}\n", result.solver_outcome);
-    println!("=== Solver Output ===\n{}\n", result.solver_stdout);
-    println!("=== SMT Formula ===\n{}", result.formula);
+    println!("=== Overall Equivalent ===\n{}\n", result.overall_equivalent);
+    println!("=== Verified Formulas ===\n{}/{} reasonable (SAT: {}, UNSAT: {}, UNKNOWN: {})\n",
+        result.formulas.len(),
+        result.formulas.len() + result.open_count,
+        result.reasonable_sat,
+        result.reasonable_unsat,
+        result.reasonable_unknown
+    );
+    println!("=== Open Pieces ===\n{}\n", result.open_count);
+    for (formula, outcome, _verdict) in &result.formulas {
+        println!("--- Formula ---\n{formula}\nOutcome: {outcome:?}\n");
+    }
     Ok(())
 }
 
@@ -86,116 +71,195 @@ pub async fn run_with_providers(
 ) -> Result<AgentResult> {
     info!(bytes = input_content.len(), "input loaded");
 
-    let mut history: Vec<HistoryEntry> = Vec::new();
-    let mut current_formula: Option<String> = None;
+    let mut verified: Vec<VerifiedPiece> = Vec::new();
+    let mut open: Vec<OpenItem> = Vec::new();
 
     for iteration in 0..MAX_ITERATIONS {
         info!(iteration = iteration + 1, "starting iteration");
 
-        let messages = build_generation_messages(input_content, &history, current_formula.is_none());
+        // 1. Generate batch
+        let messages = build_generation_messages(input_content, &verified, &open);
         let response = llm.chat(LlmRole::Primary, messages).await?;
 
-        debug!(response, "formula received");
+        debug!(response, "formula batch received");
 
-        let formula = if let Some(f) = extract_smt_formula(&response) {
-            f
-        } else {
-            warn!("no single SMT formula found, insisting");
-            insist_on_formula(llm, input_content, &response).await?
-        };
-
-        debug!(formula_bytes = formula.len(), "formula extracted");
-        debug!(%formula, "extracted formula content");
-
-        let solver_result = solver.run(&formula).await?;
-        let had_error = matches!(solver_result.outcome, SolverOutcome::Error(_));
-
-        info!(
-            outcome = match &solver_result.outcome {
-                SolverOutcome::Sat => "sat",
-                SolverOutcome::Unsat => "unsat",
-                SolverOutcome::Unknown => "unknown",
-                SolverOutcome::Error(e) => e,
-            },
-            "solver outcome"
-        );
-
-        if had_error {
-            warn!("solver error, looping back to generate new formula");
-
-            history.push(HistoryEntry {
-                formula: formula.clone(),
-                solver_stdout: solver_result.stdout.clone(),
-                solver_stderr: solver_result.stderr.clone(),
-                had_error,
-            });
-            current_formula = Some(formula);
-            continue;
+        let mut formulas = extract_all_formulas(&response);
+        if formulas.is_empty() {
+            warn!("no formulas found in response, insisting");
+            let one = insist_on_at_least_one_formula(llm, input_content, &response).await?;
+            formulas = vec![one];
         }
 
-        let verdict = judge_analysis(llm, &formula, &solver_result).await?;
-        info!(verdict = %verdict, "judge verdict");
+        info!(count = formulas.len(), "formula batch extracted");
 
-        if verdict == JUDGE_REASONABLE {
-            return Ok(AgentResult {
-                formula,
-                solver_outcome: solver_result.outcome,
-                solver_stdout: solver_result.stdout,
-            });
+        // 2. Run solvers in parallel
+        let solver_futures = formulas.iter().map(|f| solver.run(f));
+        let solver_results = futures::future::join_all(solver_futures).await;
+
+        // 3. Partition into errors vs ok
+        let mut to_judge: Vec<(String, SolverResult)> = Vec::new();
+        for (formula, result) in formulas.iter().zip(solver_results) {
+            let result = result?; // propagate spawn errors
+            let is_error = matches!(result.outcome, SolverOutcome::Error(_));
+            if is_error {
+                warn!(formula = %formula, error = %result.stdout, "solver error");
+                open.push(OpenItem {
+                    formula: formula.clone(),
+                    reason: format!("Solver error: {}", result.stdout),
+                    solver_stdout: result.stdout,
+                    solver_stderr: result.stderr,
+                });
+            } else {
+                info!(
+                    outcome = match &result.outcome {
+                        SolverOutcome::Sat => "sat",
+                        SolverOutcome::Unsat => "unsat",
+                        SolverOutcome::Unknown => "unknown",
+                        SolverOutcome::Error(_) => unreachable!(),
+                    },
+                    "solver outcome"
+                );
+                to_judge.push((formula.clone(), result));
+            }
         }
 
-        history.push(HistoryEntry {
-            formula: formula.clone(),
-            solver_stdout: solver_result.stdout.clone(),
-            solver_stderr: solver_result.stderr.clone(),
-            had_error,
-        });
-        current_formula = Some(formula);
+        // 4. Judge all non-error formulas in parallel
+        if !to_judge.is_empty() {
+            let judge_futures = to_judge.iter().map(|(f, r)| judge_analysis(llm, input_content, f, r));
+            let judge_results = futures::future::join_all(judge_futures).await;
+
+            for ((formula, solver_result), verdict) in to_judge.iter().zip(judge_results) {
+                let verdict = verdict?;
+                if verdict == JUDGE_REASONABLE {
+                    if matches!(solver_result.outcome, SolverOutcome::Sat) {
+                        info!(formula = %formula, "NOT EQUIVALENT: found SAT in verified piece");
+                    }
+                    info!(outcome = ?solver_result.outcome, "piece verified (judge REASONABLE)");
+                    verified.push(VerifiedPiece {
+                        formula: formula.clone(),
+                        outcome: solver_result.outcome.clone(),
+                    });
+                } else {
+                    warn!(formula = %formula, "judge RETRY, moving to open items");
+                    open.push(OpenItem {
+                        formula: formula.clone(),
+                        reason: "Our verification engineer does not think that the formula can correctly verify the equivalence. Please try to improve the formula to make it more obvious that it is matching the original problem.".to_string(),
+                        solver_stdout: solver_result.stdout.clone(),
+                        solver_stderr: solver_result.stderr.clone(),
+                    });
+                }
+            }
+        }
+
+        // 5. Stopping condition
+        if open.is_empty() {
+            info!("all pieces verified, converged");
+            return Ok(build_result(verified, 0));
+        }
+
+        info!(open = open.len(), verified = verified.len(), "iteration complete, items remain open");
     }
 
-    let summary = summarize_failure(llm, input_content, &history).await?;
-    anyhow::bail!("Exceeded maximum iterations ({MAX_ITERATIONS}) without convergence.\n\n{summary}");
+    // Max iterations reached
+    let result = build_result(verified, open.len());
+    info!(
+        open = result.open_count,
+        sat = result.reasonable_sat,
+        unsat = result.reasonable_unsat,
+        unknown = result.reasonable_unknown,
+        "max iterations reached, partial result"
+    );
+    Ok(result)
+}
+
+fn build_result(verified: Vec<VerifiedPiece>, open_count: usize) -> AgentResult {
+    let reasonable_sat = verified.iter().filter(|v| matches!(v.outcome, SolverOutcome::Sat)).count();
+    let reasonable_unsat = verified.iter().filter(|v| matches!(v.outcome, SolverOutcome::Unsat)).count();
+    let reasonable_unknown = verified.iter().filter(|v| matches!(v.outcome, SolverOutcome::Unknown)).count();
+    let overall_equivalent = open_count == 0 && reasonable_sat == 0 && reasonable_unknown == 0;
+
+    AgentResult {
+        formulas: verified.into_iter().map(|v| (v.formula, v.outcome, JUDGE_REASONABLE.to_string())).collect(),
+        overall_equivalent,
+        open_count,
+        reasonable_sat,
+        reasonable_unsat,
+        reasonable_unknown,
+    }
 }
 
 fn build_generation_messages(
     input_content: &str,
-    history: &[HistoryEntry],
-    is_first: bool,
+    verified: &[VerifiedPiece],
+    open: &[OpenItem],
 ) -> Vec<Message> {
     let mut messages = Vec::new();
 
     messages.push(system_message(
-        "You are an expert in formal verification and SMT-LIB2. \
-         Your task is to generate a SINGLE, COMPLETE, STANDALONE SMT-LIB2 formula \
-         that checks whether the 'before' and 'after' functions described in the input \
-         are semantically equivalent. \
+        "You are an expert in formal verification. Check whether the 'before' and 'after' code are equivalent. \
+         You may generate ONE OR MORE complete SMT-LIB2 formulas, each checking equivalence of a specific \
+         sub-piece (e.g., a loop body, a helper function, a conditional branch). You can also generate one \
+         formula for the entire code. \
          \n\nRules:\n\
-         - Output exactly ONE SMT-LIB2 formula.\n\
-         - The formula must be complete and standalone (include set-logic, declarations, assertions, check-sat).\n\
+         - Output one or more complete standalone SMT-LIB2 formulas.\n\
+         - Each formula must be complete (include set-logic, declarations, assertions, check-sat).\n\
          - Use (check-sat) and optionally (get-model).\n\
-         - Do NOT output multiple formulas.\n\
-         - Put the formula in a ```smt2 code block for easy extraction.\n\
-         - If the functions are equivalent, the formula should be unsatisfiable (the negation of equivalence is unsat)."
+         - Put each formula in a separate ```smt2 code block.\n\
+         - If the functions are equivalent, each formula should be unsatisfiable.\n\
+         - If any formula is satisfiable, the overall refactoring is NOT equivalent."
     ));
 
-    if is_first {
-        messages.push(user_message(&format!(
-            "Here is the refactoring description:\n\n{input_content}\n\n\
-             Generate a single complete SMT-LIB2 formula checking equivalence of the before and after functions."
-        )));
-    } else {
-        let mut content = format!("Here is the refactoring description:\n\n{input_content}\n\n");
-        content.push_str("Previous attempts failed. Here is the full history:\n\n");
-        content.push_str(&format_history(history));
-        content.push_str("Generate a new single complete SMT-LIB2 formula that fixes the issues above.");
-        messages.push(user_message(&content));
+    let mut content = format!("Here is the refactoring description:\n\n{input_content}\n\n");
+
+    if !verified.is_empty() {
+        content.push_str("Pieces that have already been verified — you do NOT need to recheck these:\n\n");
+        for (i, piece) in verified.iter().enumerate() {
+            let _ = write!(content, "Piece {} ({}):\n{piece}\n",
+                i + 1,
+                match &piece.outcome {
+                    SolverOutcome::Sat => "SAT — NOT EQUIVALENT",
+                    SolverOutcome::Unsat => "UNSAT — equivalent",
+                    SolverOutcome::Unknown => "UNKNOWN — inconclusive",
+                    SolverOutcome::Error(_) => unreachable!(),
+                },
+                piece = piece.formula
+            );
+        }
+        content.push('\n');
     }
 
+    if !open.is_empty() {
+        content.push_str("Pieces that still need work:\n\n");
+        for (i, item) in open.iter().enumerate() {
+            let _ = write!(
+                content,
+                "Open piece {}:\nFormula:\n{}\nIssue: {}\n",
+                i + 1,
+                item.formula,
+                item.reason
+            );
+            if !item.solver_stdout.is_empty() {
+                let _ = write!(content, "Solver output:\n{}\n", item.solver_stdout);
+            }
+            if !item.solver_stderr.is_empty() {
+                let _ = write!(content, "Standard error:\n{}\n", item.solver_stderr);
+            }
+            content.push('\n');
+        }
+    }
+
+    if verified.is_empty() && open.is_empty() {
+        content.push_str("Generate SMT-LIB2 formula(s) checking equivalence. Start with one formula covering the whole refactoring. If the solver times out, split the code into smaller analogous pieces (e.g., loop bodies, helper functions, conditionals) and generate one formula per piece.\n");
+    } else {
+        content.push_str("Please generate new or improved formulas for the unverified pieces above. You can also add new pieces if you think some behavior has not been checked yet.\n");
+    }
+
+    messages.push(user_message(&content));
     messages
 }
 
 #[instrument(skip_all)]
-async fn insist_on_formula(
+async fn insist_on_at_least_one_formula(
     llm: &dyn LlmProvider,
     input_content: &str,
     previous_response: &str,
@@ -206,59 +270,48 @@ async fn insist_on_formula(
     loop {
         attempt += 1;
         if attempt > MAX_INSIST_ATTEMPTS {
-            anyhow::bail!("Failed to extract a single SMT formula after {MAX_INSIST_ATTEMPTS} attempts");
+            anyhow::bail!("Failed to extract any SMT formula after {MAX_INSIST_ATTEMPTS} attempts");
         }
 
-        debug!(attempt, "insisting on single formula");
+        debug!(attempt, "insisting on at least one formula");
 
         let messages = vec![
             system_message(
-                "You MUST output exactly ONE SMT-LIB2 formula. Not zero, not multiple. \
-                 Put it in a single ```smt2 code block. \
-                 The formula must be complete with set-logic, declarations, assertions, and check-sat."
+                "You MUST output at least ONE SMT-LIB2 formula. \
+                 Put each formula in a separate ```smt2 code block. \
+                 Each formula must be complete with set-logic, declarations, assertions, and check-sat."
             ),
             user_message(&format!(
-                "Your previous response did not contain exactly one SMT formula. \
+                "Your previous response did not contain any valid SMT formula. \
                  Here was your previous response:\n\n{last_response}\n\n\
                  Here is the input file:\n\n{input_content}\n\n\
-                 Please try again. Output exactly ONE SMT-LIB2 formula in a ```smt2 code block."
+                 Please try again. Output at least ONE valid SMT-LIB2 formula in a ```smt2 code block."
             )),
         ];
 
         let response = llm.chat(LlmRole::Primary, messages).await?;
-        if let Some(formula) = extract_smt_formula(&response) {
-            info!(attempt, "formula extracted after insistence");
-            return Ok(formula);
+        let formulas = extract_all_formulas(&response);
+        if formulas.is_empty() {
+            last_response = response;
+            continue;
         }
-        last_response = response;
+        // If multiple, just take the first one
+        if formulas.len() > 1 {
+            info!(attempt, count = formulas.len(), "multiple formulas found after insistence, using first");
+        } else {
+            info!(attempt, "formula extracted after insistence");
+        }
+        return Ok(formulas.into_iter().next().unwrap());
     }
 }
 
 #[instrument(skip_all)]
-async fn summarize_failure(
+async fn judge_analysis(
     llm: &dyn LlmProvider,
     input_content: &str,
-    history: &[HistoryEntry],
+    formula: &str,
+    solver_result: &SolverResult,
 ) -> Result<String> {
-    let mut content = format!("Here is the input file:\n\n{input_content}\n\n");
-    content.push_str("After multiple attempts, the agent failed to converge. Here is the full history:\n\n");
-    content.push_str(&format_history(history));
-    content.push_str("Please summarize why the agent failed to converge and what could be done differently.");
-
-    let messages = vec![
-        system_message(
-            "You are an expert in formal verification and SMT-LIB2. \
-             Summarize concisely why the equivalence check failed to converge \
-             and suggest what could be improved."
-        ),
-        user_message(&content),
-    ];
-
-    llm.chat(LlmRole::Primary, messages).await
-}
-
-#[instrument(skip_all)]
-async fn judge_analysis(llm: &dyn LlmProvider, formula: &str, solver_result: &SolverResult) -> Result<String> {
     let mut attempts = 0;
     let mut last_response = String::new();
 
@@ -272,18 +325,28 @@ async fn judge_analysis(llm: &dyn LlmProvider, formula: &str, solver_result: &So
 
         let prompt = if attempts == 1 {
             format!(
-                "Formula:\n{formula}\n\n\
-                 Solver output:\n{}\n\n\
-                 Is this solver response reasonable, or should a new formula be generated?",
-                solver_result.stdout
+                "Original refactoring:\n\n{input_content}\n\n\
+                 This formula checks one piece:\n\n{formula}\n\n\
+                 Solver result:\n{}\n\n\
+                 Is this formula and its granularity reasonable for equivalence checking? \
+                 In particular, if the solver said {outcome}, could this be a false positive? \
+                 Answer ONLY with REASONABLE or RETRY.",
+                solver_result.stdout,
+                outcome = match &solver_result.outcome {
+                    SolverOutcome::Sat => "SAT",
+                    SolverOutcome::Unsat => "UNSAT",
+                    SolverOutcome::Unknown => "UNKNOWN",
+                    SolverOutcome::Error(_) => unreachable!(),
+                }
             )
         } else {
             format!(
-                "Formula:\n{formula}\n\n\
-                 Solver output:\n{}\n\n\
+                "Original refactoring:\n\n{input_content}\n\n\
+                 This formula checks one piece:\n\n{formula}\n\n\
+                 Solver result:\n{}\n\n\
                  Your previous answer was: '{last_response}'. \
                  You MUST answer ONLY with {JUDGE_REASONABLE} or {JUDGE_RETRY}. \
-                 Is the solver response reasonable, or should a new formula be generated?",
+                 Is this formula reasonable for equivalence checking?",
                 solver_result.stdout
             )
         };
@@ -291,12 +354,10 @@ async fn judge_analysis(llm: &dyn LlmProvider, formula: &str, solver_result: &So
         let messages = vec![
             system_message(
                 "You are a judge evaluating an SMT-based equivalence check. \
-                 The SMT solver ran SUCCESSFULLY (no errors). \
-                 You are given the SMT formula and the solver's output. \
-                 Determine: does the solver result correctly and reasonably \
-                 prove or disprove the equivalence of the 'before' and 'after' functions? \
-                 Consider whether the formula properly encodes the equivalence check \
-                 and whether the solver's answer (sat/unsat/unknown) is a valid conclusion. \
+                 The SMT solver ran successfully (no errors). \
+                 You are given the original refactoring, one SMT formula, and the solver's output. \
+                 Determine: is this formula and its granularity reasonable for checking equivalence? \
+                 Consider whether a SAT or UNKNOWN result might be a false positive. \
                  \n\nAnswer ONLY with REASONABLE or RETRY. Nothing else."
             ),
             user_message(&prompt),

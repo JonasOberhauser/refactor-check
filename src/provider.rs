@@ -21,7 +21,10 @@ pub trait SolverProvider: Send + Sync {
 }
 
 pub struct AgentResult {
-    pub formula: String,
-    pub solver_outcome: SolverOutcome,
-    pub solver_stdout: String,
+    pub formulas: Vec<(String, SolverOutcome, String)>, // (formula, outcome, verdict)
+    pub overall_equivalent: bool,
+    pub open_count: usize,
+    pub reasonable_sat: usize,
+    pub reasonable_unsat: usize,
+    pub reasonable_unknown: usize,
 }
