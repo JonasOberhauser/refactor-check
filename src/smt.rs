@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use std::io::Write;
-use std::process::Output;
+use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, trace, warn};
 
 use crate::provider::SolverProvider;
@@ -183,53 +185,53 @@ pub async fn run_solver(
     info!(formula_bytes = formula.len(), ?timeout, "running SMT solver");
     let start = std::time::Instant::now();
 
-    let output = tokio::task::spawn_blocking({
-        let solver_path = solver_path.to_string();
-        let solver_args = solver_args.to_vec();
-        let formula = formula.to_string();
-        let timeout = timeout;
-        move || -> Result<Option<Output>> {
-            use std::process::{Command, Stdio};
-            let mut child = Command::new(&solver_path)
-                .args(&solver_args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .with_context(|| format!("Failed to spawn solver: {solver_path}"))?;
-            {
-                let stdin = child.stdin.as_mut().context("Failed to open stdin")?;
-                stdin.write_all(formula.as_bytes())?;
-            }
-            let timed_out = match child.try_wait() {
-                Ok(Some(_)) => false,
-                Ok(None) => {
-                    std::thread::sleep(timeout);
-                    match child.try_wait() {
-                        Ok(Some(_)) => false,
-                        Ok(None) => {
-                            let _ = child.kill();
-                            true
-                        }
-                        Err(_) => false,
-                    }
-                }
-                Err(_) => false,
-            };
-            if timed_out {
-                return Ok(None);
-            }
-            let output = child.wait_with_output()?;
-            Ok(Some(output))
+    let mut child = tokio::process::Command::new(solver_path)
+        .args(solver_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed to spawn solver: {solver_path}"))?;
+
+    {
+        let mut stdin = child.stdin.take().context("Failed to open stdin")?;
+        stdin.write_all(formula.as_bytes()).await
+            .context("Failed to write formula to solver stdin")?;
+    }
+
+    let mut stdout_pipe = child.stdout.take().context("Failed to open stdout")?;
+    let mut stderr_pipe = child.stderr.take().context("Failed to open stderr")?;
+
+    let read_stdout = tokio::task::spawn(async move {
+        let mut buf = Vec::new();
+        stdout_pipe.read_to_end(&mut buf).await?;
+        Ok::<_, std::io::Error>(buf)
+    });
+    let read_stderr = tokio::task::spawn(async move {
+        let mut buf = Vec::new();
+        stderr_pipe.read_to_end(&mut buf).await?;
+        Ok::<_, std::io::Error>(buf)
+    });
+
+    let child = Arc::new(Mutex::new(child));
+    let child_for_wait = child.clone();
+
+    let status = tokio::select! {
+        status = async move { child_for_wait.lock().await.wait().await } => Some(status),
+        _ = tokio::time::sleep(timeout) => {
+            warn!(elapsed_ms = start.elapsed().as_millis(), "solver timed out, killing process");
+            let mut guard = child.lock().await;
+            let _ = guard.kill().await;
+            let _ = guard.wait().await;
+            None
         }
-    })
-    .await
-    .context("Solver task panicked")??;
+    };
 
     let elapsed = start.elapsed();
 
-    let Some(output) = output else {
-        warn!(elapsed_ms = elapsed.as_millis(), "solver timed out");
+    let Some(status) = status else {
+        let _ = read_stdout.await;
+        let _ = read_stderr.await;
         let timeout_msg = format!("solver timed out after {}s", timeout.as_secs());
         return Ok(SolverResult {
             outcome: SolverOutcome::Error(timeout_msg.clone()),
@@ -238,9 +240,17 @@ pub async fn run_solver(
         });
     };
 
-    let stdout = bytes_to_string(output.stdout);
-    let stderr = bytes_to_string(output.stderr);
-    let outcome = parse_solver_outcome(output.status.code(), &stdout, &stderr);
+    let status = status.context("Failed to wait for solver process")?;
+    let stdout = read_stdout.await
+        .context("stdout reader task panicked")?
+        .context("Failed to read solver stdout")?;
+    let stderr = read_stderr.await
+        .context("stderr reader task panicked")?
+        .context("Failed to read solver stderr")?;
+
+    let stdout = bytes_to_string(stdout);
+    let stderr = bytes_to_string(stderr);
+    let outcome = parse_solver_outcome(status.code(), &stdout, &stderr);
     debug!(%stdout, %stderr, "solver raw output");
     info!(
         ?outcome,
