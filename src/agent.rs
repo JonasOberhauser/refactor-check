@@ -37,7 +37,21 @@ fn format_history(history: &[HistoryEntry]) -> String {
         let _ = writeln!(content, "--- Attempt {} ---", i + 1);
         let _ = write!(content, "Formula:\n{}\n", entry.formula);
         if entry.had_error {
-            let _ = write!(content, "Solver ERROR:\n{}\n{}\n", entry.solver_stdout, entry.solver_stderr);
+            let is_timeout = entry.solver_stdout.contains("timed out")
+                || entry.solver_stderr.contains("timed out");
+            if is_timeout {
+                let _ = write!(
+                    content,
+                    "Solver TIMEOUT:\n{}\n{}\n\n\
+                     The solver timed out. You MUST simplify the formula. \
+                     Try reducing the number of variables, using simpler logic (e.g., QF_LIA instead of QF_NIA), \
+                     limiting assertions to only the most critical part of the equivalence check, \
+                     or reducing bit-vector widths.\n",
+                    entry.solver_stdout, entry.solver_stderr
+                );
+            } else {
+                let _ = write!(content, "Solver ERROR:\n{}\n{}\n", entry.solver_stdout, entry.solver_stderr);
+            }
         } else {
             let _ = write!(content, "Solver output:\n{}\n", entry.solver_stdout);
         }

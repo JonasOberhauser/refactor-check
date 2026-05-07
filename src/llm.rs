@@ -26,6 +26,8 @@ pub struct Message {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     pub api_key: String,
+    #[serde(default)]
+    pub judge_api_key: Option<String>,
     pub api_base: String,
     pub primary_model: String,
     pub judge_model: String,
@@ -47,6 +49,7 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             api_key: String::new(),
+            judge_api_key: None,
             api_base: String::new(),
             primary_model: String::new(),
             judge_model: String::new(),
@@ -60,6 +63,7 @@ impl fmt::Debug for LlmConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LlmConfig")
             .field("api_key", &"[REDACTED]")
+            .field("judge_api_key", &self.judge_api_key.as_ref().map(|_| "[REDACTED]"))
             .field("api_base", &self.api_base)
             .field("primary_model", &self.primary_model)
             .field("judge_model", &self.judge_model)
@@ -70,41 +74,49 @@ impl fmt::Debug for LlmConfig {
 }
 
 pub struct LlmClient {
-    client: async_openai::Client<async_openai::config::OpenAIConfig>,
+    primary_client: async_openai::Client<async_openai::config::OpenAIConfig>,
+    judge_client: async_openai::Client<async_openai::config::OpenAIConfig>,
     config: LlmConfig,
 }
 
 impl LlmClient {
     #[must_use]
     pub fn new(config: LlmConfig) -> Self {
-        let openai_config = async_openai::config::OpenAIConfig::new()
+        let primary_config = async_openai::config::OpenAIConfig::new()
             .with_api_key(&config.api_key)
             .with_api_base(&config.api_base);
 
-        let client = async_openai::Client::with_config(openai_config);
+        let judge_key = config.judge_api_key.as_deref().unwrap_or(&config.api_key);
+        let judge_config = async_openai::config::OpenAIConfig::new()
+            .with_api_key(judge_key)
+            .with_api_base(&config.api_base);
 
-        Self { client, config }
+        let primary_client = async_openai::Client::with_config(primary_config);
+        let judge_client = async_openai::Client::with_config(judge_config);
+
+        Self { primary_client, judge_client, config }
     }
 
     #[instrument(skip_all, fields(model = %self.config.primary_model))]
     pub async fn chat_primary(&self, messages: Vec<Message>) -> Result<String> {
-        self.chat("primary", &self.config.primary_model, messages, |content| {
+        self.chat_inner("primary", &self.primary_client, &self.config.primary_model, messages, |content| {
             crate::smt::extract_smt_formula(content).is_some()
         }).await
     }
 
     #[instrument(skip_all, fields(model = %self.config.judge_model))]
     pub async fn chat_judge(&self, messages: Vec<Message>) -> Result<String> {
-        self.chat("judge", &self.config.judge_model, messages, |content| {
+        self.chat_inner("judge", &self.judge_client, &self.config.judge_model, messages, |content| {
             let upper = content.trim().to_uppercase();
             let trimmed = upper.trim_start_matches(|c: char| !c.is_alphabetic());
             trimmed.starts_with("REASONABLE") || trimmed.starts_with("RETRY")
         }).await
     }
 
-    async fn chat(
+    async fn chat_inner(
         &self,
         label: &str,
+        client: &async_openai::Client<async_openai::config::OpenAIConfig>,
         model: &str,
         messages: Vec<Message>,
         is_partial_valid: impl Fn(&str) -> bool,
@@ -155,7 +167,7 @@ impl LlmClient {
 
             debug!(%label, attempt, "sending LLM streaming request");
 
-            let mut stream = match self.client.chat().create_stream(request).await {
+            let mut stream = match client.chat().create_stream(request).await {
                 Ok(s) => s,
                 Err(e) => {
                     if attempt < max_retries {

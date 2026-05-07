@@ -230,12 +230,10 @@ pub async fn run_solver(
 
     let Some(output) = output else {
         warn!(elapsed_ms = elapsed.as_millis(), "solver timed out");
+        let timeout_msg = format!("solver timed out after {}s", timeout.as_secs());
         return Ok(SolverResult {
-            outcome: SolverOutcome::Error(format!(
-                "solver timed out after {}s",
-                timeout.as_secs()
-            )),
-            stdout: String::new(),
+            outcome: SolverOutcome::Error(timeout_msg.clone()),
+            stdout: timeout_msg,
             stderr: String::new(),
         });
     };

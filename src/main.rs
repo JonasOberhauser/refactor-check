@@ -39,6 +39,10 @@ struct Cli {
     #[arg(long, env = "OPENROUTER_API_KEY")]
     api_key: Option<String>,
 
+    /// Separate API key for the judge model (falls back to --api-key if not set)
+    #[arg(long, env = "JUDGE_API_KEY")]
+    judge_api_key: Option<String>,
+
     /// Per-chunk stream timeout in milliseconds
     #[arg(long, default_value = "3000")]
     stream_timeout_ms: u64,
@@ -66,6 +70,7 @@ async fn main() -> Result<()> {
     let config = AgentConfig {
         llm_config: LlmConfig {
             api_key,
+            judge_api_key: cli.judge_api_key,
             api_base: cli.api_base,
             primary_model: cli.primary_model,
             judge_model: cli.judge_model,
