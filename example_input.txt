@@ -1,0 +1,16 @@
+Function: absolute_value
+
+--- BEFORE ---
+
+int abs(int x) {
+    if (x < 0) {
+        return -x;
+    }
+    return x;
+}
+
+--- AFTER ---
+
+int abs(int x) {
+    return (x < 0) ? -x : x;
+}
