@@ -26,6 +26,10 @@ For `feature/<name>/<wip>` branch:
 - no checklist, just commit.
 
 
+## Release branches (`release`, `release/x.y.z`)
+
+- The user creates and manages release branches. **Never merge into `release` or create release tags without the user's explicit command.** Only push to `main` and stop there.
+
 ## Important!
 
 Every new feature branch must be based off of main, and previous feature branches either explicitly abandoned by the user (you can ask them whether a feature branch should be abandoned when they ask for a new feature) or merged into main.
