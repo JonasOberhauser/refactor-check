@@ -1,0 +1,42 @@
+========================================================================
+Function: max_entry
+Source: src/max.c:10-35
+========================================================================
+
+--- BEFORE ---
+
+struct Entry {
+    int key;
+    char data[64];
+};
+
+struct Entry max_entry(struct Entry entries[], int count) {
+    struct Entry best = entries[0];
+    for (int i = 1; i < count; i++) {
+        if (best.key < entries[i].key) {
+            best = entries[i];
+        }
+    }
+    return best;
+}
+
+--- AFTER ---
+
+struct Entry {
+    int key;
+    char data[64];
+};
+
+struct Entry max_entry(struct Entry entries[], int count) {
+    struct Entry best = entries[0];
+    for (int i = 1; i < count; i++) {
+        best = (best.key <= entries[i].key) ? entries[i] : best;
+    }
+    return best;
+}
+
+========================================================================
+REFERENCED SYMBOLS (recursive)
+========================================================================
+
+(none)
