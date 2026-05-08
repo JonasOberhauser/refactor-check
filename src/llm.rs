@@ -193,8 +193,8 @@ impl LlmClient {
                     Ok(Some(Ok(response))) => {
                         got_first_chunk = true;
                         if let Some(choice) = response.choices.first() {
-                            let has_content = choice.delta.content.as_ref().map_or(false, |s| !s.is_empty());
-                            let has_tool_calls = choice.delta.tool_calls.as_ref().map_or(false, |v| !v.is_empty());
+let has_content = choice.delta.content.as_ref().is_some_and(|s| !s.is_empty());
+                        let has_tool_calls = choice.delta.tool_calls.as_ref().is_some_and(|v| !v.is_empty());
                             #[allow(deprecated)]
                             let has_function_call = choice.delta.function_call.is_some();
 

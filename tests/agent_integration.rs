@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use common::{FakeSolver, SequenceLlm};
-use refactor_check::agent::{JUDGE_REASONABLE, JUDGE_RETRY, run_with_providers};
+use refactor_check::agent::{JUDGE_REASONABLE, run_with_providers};
 use refactor_check::provider::SolverProvider;
 use refactor_check::smt::{SolverOutcome, SolverResult};
 
@@ -24,7 +24,7 @@ fn formula_response() -> String {
 
 fn two_formula_response() -> String {
     format!(
-        "One way:\n\n```smt2\n{0}\n```\n\nAnother way:\n\n```smt2\n{0}\n```",
+        "Formula for part A:\n\n```smt2\n{}\n```\n\nFormula for part B:\n\n```smt2\n(set-logic QF_LIA)\n(declare-fun z () Int)\n(declare-fun w () Int)\n(assert (= z w))\n(check-sat)\n```",
         smt_formula()
     )
 }
@@ -100,13 +100,21 @@ impl SolverProvider for ToggleSolver {
     }
 }
 
+/// Generates a unique formula with distinct variable names to avoid accidental matching.
+fn unique_formula_response(i: usize) -> String {
+    format!(
+        "Formula {}:\n\n```smt2\n(set-logic QF_LIA)\n(declare-fun v{i} () Int)\n(declare-fun u{i} () Int)\n(assert (= v{i} u{i}))\n(check-sat)\n```",
+        i + 1
+    )
+}
+
 #[test_log::test(tokio::test)]
 async fn test_solver_error_in_batch_then_partial_result() {
     // In the compositional flow, an errored formula stays open until explicitly replaced.
     // With fixed LLM responses, the agent never generates a replacement for the specific
     // errored item, so it reaches MAX_ITERATIONS with a partial result.
     let primary: Vec<String> = std::iter::once(two_formula_response())
-        .chain((0..29).map(|_| formula_response()))
+        .chain((0..29).map(unique_formula_response))
         .collect();
     let judge: Vec<String> = (0..30).map(|_| JUDGE_REASONABLE.to_string()).collect();
     let llm = SequenceLlm::new(primary, judge);
@@ -131,10 +139,10 @@ async fn test_judge_retry_in_batch_then_partial_result() {
     // explicitly replaced. With fixed LLM responses the agent never generates
     // a targeted replacement, so it reaches MAX_ITERATIONS with a partial result.
     let primary: Vec<String> = std::iter::once(two_formula_response())
-        .chain((0..29).map(|_| formula_response()))
+        .chain((0..29).map(unique_formula_response))
         .collect();
     // 2 judge calls in iteration 1 (RETRY + REASONABLE) + 29 more in iterations 2..30
-    let judge: Vec<String> = std::iter::once(JUDGE_RETRY.to_string())
+    let judge: Vec<String> = std::iter::once("The formula does not capture the loop invariant properly".to_string())
         .chain((0..30).map(|_| JUDGE_REASONABLE.to_string()))
         .collect();
     let llm = SequenceLlm::new(primary, judge);
@@ -154,9 +162,10 @@ async fn test_judge_gives_unclear_answer_then_clear() {
     let llm = SequenceLlm::new(
         vec![
             formula_response(),
+            formula_response(),
         ],
         vec![
-            "The solver response is not reasonable, a new formula should be generated.".to_string(),
+            "The formula doesn't capture the loop invariant correctly".to_string(),
             JUDGE_REASONABLE.to_string(),
         ],
     );

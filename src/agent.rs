@@ -15,7 +15,11 @@ pub const MAX_INSIST_ATTEMPTS: usize = 50;
 pub const MAX_JUDGE_ATTEMPTS: usize = 5;
 
 pub const JUDGE_REASONABLE: &str = "REASONABLE";
-pub const JUDGE_RETRY: &str = "RETRY";
+
+pub enum JudgeVerdict {
+    Reasonable,
+    Retry(String), // explanation of what is wrong with the formula
+}
 
 pub struct AgentConfig {
     pub llm_config: LlmConfig,
@@ -132,27 +136,36 @@ pub async fn run_with_providers(
             let judge_futures = to_judge.iter().map(|(f, r)| judge_analysis(llm, input_content, f, r));
             let judge_results = futures::future::join_all(judge_futures).await;
 
+            let mut freshly_verified = Vec::new();
+
             for ((formula, solver_result), verdict) in to_judge.iter().zip(judge_results) {
                 let verdict = verdict?;
-                if verdict == JUDGE_REASONABLE {
-                    if matches!(solver_result.outcome, SolverOutcome::Sat) {
-                        info!(formula = %formula, "NOT EQUIVALENT: found SAT in verified piece");
+                match verdict {
+                    JudgeVerdict::Reasonable => {
+                        if matches!(solver_result.outcome, SolverOutcome::Sat) {
+                            info!(formula = %formula, "NOT EQUIVALENT: found SAT in verified piece");
+                        }
+                        info!(outcome = ?solver_result.outcome, "piece verified (judge REASONABLE)");
+                        freshly_verified.push(formula.clone());
+                        verified.push(VerifiedPiece {
+                            formula: formula.clone(),
+                            outcome: solver_result.outcome.clone(),
+                        });
                     }
-                    info!(outcome = ?solver_result.outcome, "piece verified (judge REASONABLE)");
-                    verified.push(VerifiedPiece {
-                        formula: formula.clone(),
-                        outcome: solver_result.outcome.clone(),
-                    });
-                } else {
-                    warn!(formula = %formula, "judge RETRY, moving to open items");
-                    open.push(OpenItem {
-                        formula: formula.clone(),
-                        reason: "Our verification engineer does not think that the formula can correctly verify the equivalence. Please try to improve the formula to make it more obvious that it is matching the original problem.".to_string(),
-                        solver_stdout: solver_result.stdout.clone(),
-                        solver_stderr: solver_result.stderr.clone(),
-                    });
+                    JudgeVerdict::Retry(feedback) => {
+                        warn!(formula = %formula, feedback, "judge RETRY, moving to open items");
+                        open.push(OpenItem {
+                            formula: formula.clone(),
+                            reason: "Our verification engineer did not think the formula can correctly verify the equivalence. ".to_string() + &feedback,
+                            solver_stdout: solver_result.stdout.clone(),
+                            solver_stderr: solver_result.stderr.clone(),
+                        });
+                    }
                 }
             }
+
+            // Remove open items that were just successfully re-verified in this batch
+            open.retain(|item| !freshly_verified.iter().any(|f| f == &item.formula));
         }
 
         // 5. Stopping condition
@@ -392,14 +405,14 @@ async fn judge_analysis(
     input_content: &str,
     formula: &str,
     solver_result: &SolverResult,
-) -> Result<String> {
+) -> Result<JudgeVerdict> {
     let mut attempts = 0;
     let mut last_response = String::new();
 
     loop {
         attempts += 1;
         if attempts > MAX_JUDGE_ATTEMPTS {
-            anyhow::bail!("Judge failed to give a clear {JUDGE_REASONABLE}/{JUDGE_RETRY} after {MAX_JUDGE_ATTEMPTS} attempts");
+            anyhow::bail!("Judge failed to give a clear verdict after {MAX_JUDGE_ATTEMPTS} attempts");
         }
 
         debug!(attempt = attempts, "asking judge for verdict");
@@ -407,27 +420,20 @@ async fn judge_analysis(
         let prompt = if attempts == 1 {
             format!(
                 "Original refactoring:\n\n{input_content}\n\n\
-                 This formula checks one piece:\n\n{formula}\n\n\
+                 Formula checking one piece:\n\n{formula}\n\n\
                  Solver result:\n{}\n\n\
-                 Is this formula and its granularity reasonable for equivalence checking? \
-                 In particular, if the solver said {outcome}, could this be a false positive? \
-                 Answer ONLY with REASONABLE or RETRY.",
-                solver_result.stdout,
-                outcome = match &solver_result.outcome {
-                    SolverOutcome::Sat => "SAT",
-                    SolverOutcome::Unsat => "UNSAT",
-                    SolverOutcome::Unknown => "UNKNOWN",
-                    SolverOutcome::Error(_) => unreachable!(),
-                }
+                 Is this formula correctly checking equivalence? \
+                 Answer ONLY with the single word REASONABLE if yes. \
+                 Otherwise explain what is wrong with the formula.",
+                solver_result.stdout
             )
         } else {
             format!(
                 "Original refactoring:\n\n{input_content}\n\n\
-                 This formula checks one piece:\n\n{formula}\n\n\
+                 Formula checking one piece:\n\n{formula}\n\n\
                  Solver result:\n{}\n\n\
                  Your previous answer was: '{last_response}'. \
-                 You MUST answer ONLY with {JUDGE_REASONABLE} or {JUDGE_RETRY}. \
-                 Is this formula reasonable for equivalence checking?",
+                 You MUST answer ONLY with REASONABLE or explain what is wrong.",
                 solver_result.stdout
             )
         };
@@ -435,25 +441,33 @@ async fn judge_analysis(
         let messages = vec![
             system_message(
                 "You are a judge evaluating an SMT-based equivalence check. \
-                 The SMT solver ran successfully (no errors). \
-                 You are given the original refactoring, one SMT formula, and the solver's output. \
-                 Determine: is this formula and its granularity reasonable for checking equivalence? \
-                 Consider whether a SAT or UNKNOWN result might be a false positive. \
-                 \n\nAnswer ONLY with REASONABLE or RETRY. Nothing else."
+                 If the formula correctly and completely checks equivalence, answer ONLY with the single word REASONABLE. \
+                 If the formula does NOT correctly check equivalence, explain what is wrong: \
+                 Does it fail to represent some behavior? Is the abstraction too coarse or too fine? \
+                 Are assertions missing important cases? Provide your explanation concisely."
             ),
             user_message(&prompt),
         ];
 
         let response = llm.chat(LlmRole::Judge, messages).await?;
-        let upper = response.trim().to_uppercase();
-        let trimmed = upper.trim_start_matches(|c: char| !c.is_alphabetic());
+        let trimmed = response.trim();
+        let upper = trimmed.to_uppercase();
 
-        if trimmed.starts_with(JUDGE_REASONABLE) {
-            return Ok(JUDGE_REASONABLE.to_string());
+        if upper.starts_with(JUDGE_REASONABLE) {
+            return Ok(JudgeVerdict::Reasonable);
         }
-        if trimmed.starts_with(JUDGE_RETRY) {
-            return Ok(JUDGE_RETRY.to_string());
+
+        // Extract explanation: strip leading "RETRY" if present, otherwise use full text
+        let explanation = if upper.len() > 4 && upper[..5] == *"RETRY" {
+            trimmed[5..].trim().to_string()
+        } else {
+            trimmed.to_string()
+        };
+
+        if !explanation.is_empty() {
+            return Ok(JudgeVerdict::Retry(explanation));
         }
+
         warn!(response = %response, "judge gave unclear answer, insisting");
         last_response = response;
     }
