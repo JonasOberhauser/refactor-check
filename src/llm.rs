@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 use crate::provider::{LlmProvider, LlmRole};
 
@@ -171,7 +171,7 @@ impl LlmClient {
                 Ok(s) => s,
                 Err(e) => {
                     if attempt < max_retries {
-                        warn!(%label, attempt, error = %e, "LLM stream creation failed, retrying");
+                        warn!(%label, attempt, max_retries, error = %e, bytes = 0, reason = "stream creation failed", "LLM retry");
                         continue;
                     }
                     return Err(e).context("LLM streaming request failed after all retries");
@@ -193,8 +193,17 @@ impl LlmClient {
                     Ok(Some(Ok(response))) => {
                         got_first_chunk = true;
                         if let Some(choice) = response.choices.first() {
-                            if let Some(delta_content) = &choice.delta.content {
-                                content.push_str(delta_content);
+                            let has_content = choice.delta.content.as_ref().map_or(false, |s| !s.is_empty());
+                            let has_tool_calls = choice.delta.tool_calls.as_ref().map_or(false, |v| !v.is_empty());
+                            #[allow(deprecated)]
+                            let has_function_call = choice.delta.function_call.is_some();
+
+                            if has_content {
+                                let text = choice.delta.content.as_ref().unwrap();
+                                trace!(%label, content_len = text.len(), content = %text, tool_calls = has_tool_calls, function_call = has_function_call, "SSE content chunk");
+                                content.push_str(text);
+                            } else {
+                                trace!(%label, response_id = %response.id, model = %response.model, content_len = 0, tool_calls = has_tool_calls, function_call = has_function_call, "SSE alive chunk");
                             }
                             if let Some(fr) = &choice.finish_reason {
                                 finish_reason = Some(*fr);
@@ -208,7 +217,7 @@ impl LlmClient {
                             break;
                         }
                         if attempt < max_retries {
-                            warn!(%label, attempt, error = %e, bytes = content.len(), "LLM stream error, partial content not usable, retrying");
+                            warn!(%label, attempt, max_retries, error = %e, bytes = content.len(), reason = "SSE stream error", "LLM retry");
                             break;
                         }
                         if content.is_empty() {
@@ -223,7 +232,7 @@ impl LlmClient {
                             break;
                         }
                         if attempt < max_retries {
-                            warn!(%label, attempt, error = %e, bytes = content.len(), "LLM chunk error, partial content not usable, retrying");
+                            warn!(%label, attempt, max_retries, error = %e, bytes = content.len(), reason = "SSE chunk error", "LLM retry");
                             break;
                         }
                         return Err(e).context("LLM stream chunk error after all retries");
@@ -239,7 +248,7 @@ impl LlmClient {
                             break;
                         }
                         if attempt < max_retries {
-                            warn!(%label, attempt, bytes = content.len(), "stream timeout ({}ms), partial content not usable, retrying", self.config.stream_timeout_ms);
+                            warn!(%label, attempt, max_retries, error = "timeout", bytes = content.len(), reason = "timeout", timeout_ms = self.config.stream_timeout_ms, "LLM retry");
                             break;
                         }
                         if content.is_empty() {
