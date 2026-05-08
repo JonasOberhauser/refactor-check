@@ -37,4 +37,9 @@ Every new feature branch must be based off of main, and previous feature branche
 ## Commands
 
 - Build: `cargo build`
+- Build release: `cargo build --release`
 - Lint: `cargo clippy -- -W clippy::all`
+
+### Build habit
+
+Always run `cargo build --release` after making a change. This ensures the release binary is up to date for manual testing and prevents stale artifacts.
