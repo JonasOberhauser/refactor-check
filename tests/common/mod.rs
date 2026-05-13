@@ -7,22 +7,22 @@ use refactor_check::provider::{LlmProvider, LlmRole, SolverProvider};
 use refactor_check::smt::{SolverOutcome, SolverResult};
 
 pub struct SequenceLlm {
-    initial: Arc<Mutex<Vec<String>>>,
+    formalizer: Arc<Mutex<Vec<String>>>,
     fixer: Arc<Mutex<Vec<String>>>,
     judge: Arc<Mutex<Vec<String>>>,
 }
 
 impl SequenceLlm {
-    pub fn new(initial: Vec<String>, fixer: Vec<String>, judge: Vec<String>) -> Self {
+    pub fn new(formalizer: Vec<String>, fixer: Vec<String>, judge: Vec<String>) -> Self {
         Self {
-            initial: Arc::new(Mutex::new(initial)),
+            formalizer: Arc::new(Mutex::new(formalizer)),
             fixer: Arc::new(Mutex::new(fixer)),
             judge: Arc::new(Mutex::new(judge)),
         }
     }
 
-    pub fn initial_remaining(&self) -> usize {
-        self.initial.lock().expect("lock poisoned").len()
+    pub fn formalizer_remaining(&self) -> usize {
+        self.formalizer.lock().expect("lock poisoned").len()
     }
 
     pub fn fixer_remaining(&self) -> usize {
@@ -38,7 +38,7 @@ impl SequenceLlm {
 impl LlmProvider for SequenceLlm {
     async fn chat(&self, role: LlmRole, _messages: Vec<Message>) -> Result<String> {
         let queue = match role {
-            LlmRole::Initial => &self.initial,
+            LlmRole::Formalizer => &self.formalizer,
             LlmRole::Fixer => &self.fixer,
             LlmRole::Judge => &self.judge,
         };

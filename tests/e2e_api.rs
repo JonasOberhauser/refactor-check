@@ -21,10 +21,10 @@ fn free_models_config(api_key: &str) -> LlmConfig {
     LlmConfig {
         api_key: api_key.to_string(),
         judge_api_key: None,
-        initial_api_key: None,
+        formalizer_api_key: None,
         fixer_api_key: None,
         api_base: "https://openrouter.ai/api/v1".to_string(),
-        initial_model: "openrouter/free".to_string(),
+        formalizer_model: "openrouter/free".to_string(),
         fixer_model: "openrouter/free".to_string(),
         judge_model: "openrouter/free".to_string(),
         stream_timeout_ms: 120000,

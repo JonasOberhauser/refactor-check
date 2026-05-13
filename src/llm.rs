@@ -32,11 +32,11 @@ pub struct LlmConfig {
     #[serde(default)]
     pub judge_api_key: Option<String>,
     #[serde(default)]
-    pub initial_api_key: Option<String>,
+    pub formalizer_api_key: Option<String>,
     #[serde(default)]
     pub fixer_api_key: Option<String>,
     pub api_base: String,
-    pub initial_model: String,
+    pub formalizer_model: String,
     pub fixer_model: String,
     pub judge_model: String,
     #[serde(default = "default_stream_timeout_ms")]
@@ -64,10 +64,10 @@ impl Default for LlmConfig {
         Self {
             api_key: String::new(),
             judge_api_key: None,
-            initial_api_key: None,
+            formalizer_api_key: None,
             fixer_api_key: None,
             api_base: String::new(),
-            initial_model: String::new(),
+            formalizer_model: String::new(),
             fixer_model: String::new(),
             judge_model: String::new(),
             stream_timeout_ms: default_stream_timeout_ms(),
@@ -82,10 +82,10 @@ impl fmt::Debug for LlmConfig {
         f.debug_struct("LlmConfig")
             .field("api_key", &"[REDACTED]")
             .field("judge_api_key", &self.judge_api_key.as_ref().map(|_| "[REDACTED]"))
-            .field("initial_api_key", &self.initial_api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("formalizer_api_key", &self.formalizer_api_key.as_ref().map(|_| "[REDACTED]"))
             .field("fixer_api_key", &self.fixer_api_key.as_ref().map(|_| "[REDACTED]"))
             .field("api_base", &self.api_base)
-            .field("initial_model", &self.initial_model)
+            .field("formalizer_model", &self.formalizer_model)
             .field("fixer_model", &self.fixer_model)
             .field("judge_model", &self.judge_model)
             .field("stream_timeout_ms", &self.stream_timeout_ms)
@@ -96,7 +96,7 @@ impl fmt::Debug for LlmConfig {
 }
 
 pub struct LlmClient {
-    initial_client: async_openai::Client<async_openai::config::OpenAIConfig>,
+    formalizer_client: async_openai::Client<async_openai::config::OpenAIConfig>,
     fixer_client: async_openai::Client<async_openai::config::OpenAIConfig>,
     judge_client: async_openai::Client<async_openai::config::OpenAIConfig>,
     config: LlmConfig,
@@ -131,9 +131,9 @@ impl ConnectionTracer {
 impl LlmClient {
     #[must_use]
     pub fn new(config: LlmConfig) -> Self {
-        let initial_key = config.initial_api_key.as_deref().unwrap_or(&config.api_key);
-        let initial_config = async_openai::config::OpenAIConfig::new()
-            .with_api_key(initial_key)
+        let formalizer_key = config.formalizer_api_key.as_deref().unwrap_or(&config.api_key);
+        let formalizer_config = async_openai::config::OpenAIConfig::new()
+            .with_api_key(formalizer_key)
             .with_api_base(&config.api_base);
 
         let fixer_key = config.fixer_api_key.as_deref().unwrap_or(&config.api_key);
@@ -146,16 +146,16 @@ impl LlmClient {
             .with_api_key(judge_key)
             .with_api_base(&config.api_base);
 
-        let initial_client = async_openai::Client::with_config(initial_config);
+        let formalizer_client = async_openai::Client::with_config(formalizer_config);
         let fixer_client = async_openai::Client::with_config(fixer_config);
         let judge_client = async_openai::Client::with_config(judge_config);
 
-        Self { initial_client, fixer_client, judge_client, config }
+        Self { formalizer_client, fixer_client, judge_client, config }
     }
 
-    #[instrument(skip_all, fields(model = %self.config.initial_model))]
-    pub async fn chat_initial(&self, messages: Vec<Message>) -> Result<String> {
-        self.chat_inner("initial", &self.initial_client, &self.config.initial_model, messages, |content| {
+    #[instrument(skip_all, fields(model = %self.config.formalizer_model))]
+    pub async fn chat_formalizer(&self, messages: Vec<Message>) -> Result<String> {
+        self.chat_inner("formalizer", &self.formalizer_client, &self.config.formalizer_model, messages, |content| {
             crate::smt::extract_smt_formula(content).is_some()
         }).await
     }
@@ -380,7 +380,7 @@ pub fn assistant_message(content: &str) -> Message {
 impl LlmProvider for LlmClient {
     async fn chat(&self, role: LlmRole, messages: Vec<Message>) -> Result<String> {
         match role {
-            LlmRole::Initial => self.chat_initial(messages).await,
+            LlmRole::Formalizer => self.chat_formalizer(messages).await,
             LlmRole::Fixer => self.chat_fixer(messages).await,
             LlmRole::Judge => self.chat_judge(messages).await,
         }

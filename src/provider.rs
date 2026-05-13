@@ -6,7 +6,7 @@ use crate::smt::{SolverOutcome, SolverResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmRole {
-    Initial,
+    Formalizer,
     Fixer,
     Judge,
 }

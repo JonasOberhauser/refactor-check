@@ -23,9 +23,9 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_SOLVER_TIMEOUT_SECS)]
     solver_timeout_secs: u64,
 
-    /// Initial LLM model (first formula generation attempt)
+    /// Formalizer LLM model (first formula generation attempt)
     #[arg(long, default_value = "qwen/qwen3-coder:free")]
-    initial_model: String,
+    formalizer_model: String,
 
     /// Error-fixing LLM model (subsequent formula generation)
     #[arg(long, default_value = "qwen/qwen3-coder:free")]
@@ -47,9 +47,9 @@ struct Cli {
     #[arg(long, env = "JUDGE_API_KEY")]
     judge_api_key: Option<String>,
 
-    /// Separate API key for the initial model (falls back to --api-key if not set)
-    #[arg(long, env = "INITIAL_API_KEY")]
-    initial_api_key: Option<String>,
+    /// Separate API key for the formalizer model (falls back to --api-key if not set)
+    #[arg(long, env = "FORMALIZER_API_KEY")]
+    formalizer_api_key: Option<String>,
 
     /// Separate API key for the fixer model (falls back to --api-key if not set)
     #[arg(long, env = "FIXER_API_KEY")]
@@ -98,10 +98,10 @@ async fn main() -> Result<()> {
         llm_config: LlmConfig {
             api_key,
             judge_api_key: cli.judge_api_key,
-            initial_api_key: cli.initial_api_key,
+            formalizer_api_key: cli.formalizer_api_key,
             fixer_api_key: cli.fixer_api_key,
             api_base: cli.api_base,
-            initial_model: cli.initial_model,
+            formalizer_model: cli.formalizer_model,
             fixer_model: cli.fixer_model,
             judge_model: cli.judge_model,
             stream_timeout_ms: cli.stream_timeout_ms,

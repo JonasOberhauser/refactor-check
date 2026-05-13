@@ -85,7 +85,7 @@ pub async fn run_with_providers(
     for iteration in 0..MAX_ITERATIONS {
         info!(iteration = iteration + 1, "starting iteration");
 
-        let gen_role = if iteration == 0 { LlmRole::Initial } else { LlmRole::Fixer };
+        let gen_role = if iteration == 0 { LlmRole::Formalizer } else { LlmRole::Fixer };
 
         // 1. Generate batch
         let messages = build_generation_messages(input_content, &verified, &open);
