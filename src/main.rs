@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use refactor_check::agent::{AgentConfig, DEFAULT_SOLVER_TIMEOUT_SECS, run};
-use refactor_check::llm::LlmConfig;
+use refactor_check::llm::{LlmConfig, ServiceTier};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -50,6 +50,10 @@ struct Cli {
     /// Maximum stream retry attempts on timeout or connection error
     #[arg(long, default_value = "5")]
     max_stream_retries: u32,
+
+    /// OpenRouter service tier: auto, default, flex, scale, or priority
+    #[arg(long, default_value = "priority")]
+    service_tier: String,
 }
 
 #[tokio::main]
@@ -67,6 +71,17 @@ async fn main() -> Result<()> {
         anyhow::anyhow!("API key required: set --api-key or OPENROUTER_API_KEY env var")
     })?;
 
+    let service_tier = match cli.service_tier.to_lowercase().as_str() {
+        "auto" => ServiceTier::Auto,
+        "default" => ServiceTier::Default,
+        "flex" => ServiceTier::Flex,
+        "scale" => ServiceTier::Scale,
+        "priority" => ServiceTier::Priority,
+        other => anyhow::bail!(
+            "Invalid service tier: {other}. Valid values: auto, default, flex, scale, priority"
+        ),
+    };
+
     let config = AgentConfig {
         llm_config: LlmConfig {
             api_key,
@@ -76,6 +91,7 @@ async fn main() -> Result<()> {
             judge_model: cli.judge_model,
             stream_timeout_ms: cli.stream_timeout_ms,
             max_stream_retries: cli.max_stream_retries,
+            service_tier,
         },
         solver_path: cli.solver_path,
         solver_args: cli.solver_args,

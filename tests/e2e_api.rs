@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
 use refactor_check::agent::run_with_providers;
-use refactor_check::llm::{LlmClient, LlmConfig};
+use refactor_check::llm::{LlmClient, LlmConfig, ServiceTier};
 use refactor_check::provider::AgentResult;
 use refactor_check::smt::Z3Solver;
 
@@ -26,6 +26,7 @@ fn free_models_config(api_key: &str) -> LlmConfig {
         judge_model: "openrouter/free".to_string(),
         stream_timeout_ms: 120000,
         max_stream_retries: 2,
+        service_tier: ServiceTier::Priority,
     }
 }
 

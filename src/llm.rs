@@ -3,6 +3,8 @@ use async_openai::types::chat::{
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest, FinishReason,
 };
+
+pub use async_openai::types::chat::ServiceTier;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -36,6 +38,8 @@ pub struct LlmConfig {
     pub stream_timeout_ms: u64,
     #[serde(default = "default_max_stream_retries")]
     pub max_stream_retries: u32,
+    #[serde(default = "default_service_tier")]
+    pub service_tier: ServiceTier,
 }
 
 fn default_stream_timeout_ms() -> u64 {
@@ -44,6 +48,10 @@ fn default_stream_timeout_ms() -> u64 {
 
 fn default_max_stream_retries() -> u32 {
     5
+}
+
+fn default_service_tier() -> ServiceTier {
+    ServiceTier::Priority
 }
 
 impl Default for LlmConfig {
@@ -56,6 +64,7 @@ impl Default for LlmConfig {
             judge_model: String::new(),
             stream_timeout_ms: default_stream_timeout_ms(),
             max_stream_retries: default_max_stream_retries(),
+            service_tier: default_service_tier(),
         }
     }
 }
@@ -70,6 +79,7 @@ impl fmt::Debug for LlmConfig {
             .field("judge_model", &self.judge_model)
             .field("stream_timeout_ms", &self.stream_timeout_ms)
             .field("max_stream_retries", &self.max_stream_retries)
+            .field("service_tier", &self.service_tier)
             .finish()
     }
 }
@@ -192,6 +202,7 @@ impl LlmClient {
                 model: model.to_string(),
                 messages: request_messages.clone(),
                 stream: Some(true),
+                service_tier: Some(self.config.service_tier.clone()),
                 ..Default::default()
             };
 
