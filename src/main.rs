@@ -23,9 +23,13 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_SOLVER_TIMEOUT_SECS)]
     solver_timeout_secs: u64,
 
-    /// Primary LLM model identifier
+    /// Initial LLM model (first formula generation attempt)
     #[arg(long, default_value = "qwen/qwen3-coder:free")]
-    primary_model: String,
+    initial_model: String,
+
+    /// Error-fixing LLM model (subsequent formula generation)
+    #[arg(long, default_value = "qwen/qwen3-coder:free")]
+    fixer_model: String,
 
     /// Judge (cheaper) LLM model identifier
     #[arg(long, default_value = "google/gemma-3-4b-it:free")]
@@ -42,6 +46,14 @@ struct Cli {
     /// Separate API key for the judge model (falls back to --api-key if not set)
     #[arg(long, env = "JUDGE_API_KEY")]
     judge_api_key: Option<String>,
+
+    /// Separate API key for the initial model (falls back to --api-key if not set)
+    #[arg(long, env = "INITIAL_API_KEY")]
+    initial_api_key: Option<String>,
+
+    /// Separate API key for the fixer model (falls back to --api-key if not set)
+    #[arg(long, env = "FIXER_API_KEY")]
+    fixer_api_key: Option<String>,
 
     /// Per-chunk stream timeout in milliseconds
     #[arg(long, default_value = "3000")]
@@ -86,8 +98,11 @@ async fn main() -> Result<()> {
         llm_config: LlmConfig {
             api_key,
             judge_api_key: cli.judge_api_key,
+            initial_api_key: cli.initial_api_key,
+            fixer_api_key: cli.fixer_api_key,
             api_base: cli.api_base,
-            primary_model: cli.primary_model,
+            initial_model: cli.initial_model,
+            fixer_model: cli.fixer_model,
             judge_model: cli.judge_model,
             stream_timeout_ms: cli.stream_timeout_ms,
             max_stream_retries: cli.max_stream_retries,

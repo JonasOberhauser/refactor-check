@@ -33,6 +33,7 @@ fn two_formula_response() -> String {
 async fn test_happy_path_unsat() {
     let llm = SequenceLlm::new(
         vec![formula_response()],
+        vec![],
         vec![JUDGE_REASONABLE.to_string()],
     );
     let solver = FakeSolver { outcome: SolverOutcome::Unsat };
@@ -46,7 +47,7 @@ async fn test_happy_path_unsat() {
     assert_eq!(result.formulas[0].outcome, SolverOutcome::Unsat);
     assert!(result.overall_equivalent);
     assert_eq!(result.reasonable_unsat, 1);
-    assert_eq!(llm.primary_remaining(), 0);
+    assert_eq!(llm.initial_remaining(), 0);
     assert_eq!(llm.judge_remaining(), 0);
 }
 
@@ -57,6 +58,7 @@ async fn test_formula_not_found_then_found() {
             "I don't have a formula yet.".to_string(),
             formula_response(),
         ],
+        vec![],
         vec![JUDGE_REASONABLE.to_string()],
     );
     let solver = FakeSolver { outcome: SolverOutcome::Unsat };
@@ -69,7 +71,7 @@ async fn test_formula_not_found_then_found() {
     assert!(result.formulas[0].formula.contains("(set-logic"));
     assert_eq!(result.formulas[0].outcome, SolverOutcome::Unsat);
     assert!(result.overall_equivalent);
-    assert_eq!(llm.primary_remaining(), 0);
+    assert_eq!(llm.initial_remaining(), 0);
     assert_eq!(llm.judge_remaining(), 0);
 }
 
@@ -113,11 +115,10 @@ async fn test_solver_error_in_batch_then_partial_result() {
     // In the compositional flow, an errored formula stays open until explicitly replaced.
     // With fixed LLM responses, the agent never generates a replacement for the specific
     // errored item, so it reaches MAX_ITERATIONS with a partial result.
-    let primary: Vec<String> = std::iter::once(two_formula_response())
-        .chain((0..29).map(unique_formula_response))
-        .collect();
+    let initial: Vec<String> = vec![two_formula_response()];
+    let fixer: Vec<String> = (0..29).map(unique_formula_response).collect();
     let judge: Vec<String> = (0..30).map(|_| JUDGE_REASONABLE.to_string()).collect();
-    let llm = SequenceLlm::new(primary, judge);
+    let llm = SequenceLlm::new(initial, fixer, judge);
 
     let call_count = Arc::new(Mutex::new(0usize));
     let solver = ToggleSolver { call_count: call_count.clone(), error_until: 1 };
@@ -138,14 +139,13 @@ async fn test_judge_retry_in_batch_then_partial_result() {
     // A RETRY verdict moves the formula to open items, where it persists until
     // explicitly replaced. With fixed LLM responses the agent never generates
     // a targeted replacement, so it reaches MAX_ITERATIONS with a partial result.
-    let primary: Vec<String> = std::iter::once(two_formula_response())
-        .chain((0..29).map(unique_formula_response))
-        .collect();
+    let initial: Vec<String> = vec![two_formula_response()];
+    let fixer: Vec<String> = (0..29).map(unique_formula_response).collect();
     // 2 judge calls in iteration 1 (RETRY + REASONABLE) + 29 more in iterations 2..30
     let judge: Vec<String> = std::iter::once("The formula does not capture the loop invariant properly".to_string())
         .chain((0..30).map(|_| JUDGE_REASONABLE.to_string()))
         .collect();
-    let llm = SequenceLlm::new(primary, judge);
+    let llm = SequenceLlm::new(initial, fixer, judge);
     let solver = FakeSolver { outcome: SolverOutcome::Unsat };
 
     let result = run_with_providers("refactoring desc", &llm, &solver)
@@ -160,10 +160,8 @@ async fn test_judge_retry_in_batch_then_partial_result() {
 #[test_log::test(tokio::test)]
 async fn test_judge_gives_unclear_answer_then_clear() {
     let llm = SequenceLlm::new(
-        vec![
-            formula_response(),
-            formula_response(),
-        ],
+        vec![formula_response()],
+        vec![formula_response()],
         vec![
             "The formula doesn't capture the loop invariant correctly".to_string(),
             JUDGE_REASONABLE.to_string(),
@@ -178,7 +176,8 @@ async fn test_judge_gives_unclear_answer_then_clear() {
     assert_eq!(result.formulas.len(), 1);
     assert_eq!(result.formulas[0].outcome, SolverOutcome::Unsat);
     assert!(result.overall_equivalent);
-    assert_eq!(llm.primary_remaining(), 0);
+    assert_eq!(llm.initial_remaining(), 0);
+    assert_eq!(llm.fixer_remaining(), 0);
     assert_eq!(llm.judge_remaining(), 0);
 }
 
@@ -311,6 +310,7 @@ fn jemalloc_formula_response() -> String {
 async fn test_jemalloc_refactoring_unsat() {
     let llm = SequenceLlm::new(
         vec![jemalloc_formula_response()],
+        vec![],
         vec![JUDGE_REASONABLE.to_string()],
     );
     let solver = FakeSolver { outcome: SolverOutcome::Unsat };
@@ -329,7 +329,7 @@ async fn test_jemalloc_refactoring_unsat() {
     assert!(result.formulas[0].formula.contains("(check-sat)"));
     assert_eq!(result.formulas[0].outcome, SolverOutcome::Unsat);
     assert!(result.overall_equivalent);
-    assert_eq!(llm.primary_remaining(), 0);
+    assert_eq!(llm.initial_remaining(), 0);
     assert_eq!(llm.judge_remaining(), 0);
 }
 
@@ -337,6 +337,7 @@ async fn test_jemalloc_refactoring_unsat() {
 async fn test_multi_formula_batch() {
     let llm = SequenceLlm::new(
         vec![two_formula_response()],
+        vec![],
         vec![JUDGE_REASONABLE.to_string(), JUDGE_REASONABLE.to_string()],
     );
     let call_count = Arc::new(Mutex::new(0usize));
@@ -350,6 +351,6 @@ async fn test_multi_formula_batch() {
     assert_eq!(*call_count.lock().unwrap(), 2, "both formulas should be solved in parallel");
     assert!(result.overall_equivalent);
     assert_eq!(result.reasonable_unsat, 2);
-    assert_eq!(llm.primary_remaining(), 0);
+    assert_eq!(llm.initial_remaining(), 0);
     assert_eq!(llm.judge_remaining(), 0);
 }

@@ -7,20 +7,26 @@ use refactor_check::provider::{LlmProvider, LlmRole, SolverProvider};
 use refactor_check::smt::{SolverOutcome, SolverResult};
 
 pub struct SequenceLlm {
-    primary: Arc<Mutex<Vec<String>>>,
+    initial: Arc<Mutex<Vec<String>>>,
+    fixer: Arc<Mutex<Vec<String>>>,
     judge: Arc<Mutex<Vec<String>>>,
 }
 
 impl SequenceLlm {
-    pub fn new(primary: Vec<String>, judge: Vec<String>) -> Self {
+    pub fn new(initial: Vec<String>, fixer: Vec<String>, judge: Vec<String>) -> Self {
         Self {
-            primary: Arc::new(Mutex::new(primary)),
+            initial: Arc::new(Mutex::new(initial)),
+            fixer: Arc::new(Mutex::new(fixer)),
             judge: Arc::new(Mutex::new(judge)),
         }
     }
 
-    pub fn primary_remaining(&self) -> usize {
-        self.primary.lock().expect("lock poisoned").len()
+    pub fn initial_remaining(&self) -> usize {
+        self.initial.lock().expect("lock poisoned").len()
+    }
+
+    pub fn fixer_remaining(&self) -> usize {
+        self.fixer.lock().expect("lock poisoned").len()
     }
 
     pub fn judge_remaining(&self) -> usize {
@@ -32,7 +38,8 @@ impl SequenceLlm {
 impl LlmProvider for SequenceLlm {
     async fn chat(&self, role: LlmRole, _messages: Vec<Message>) -> Result<String> {
         let queue = match role {
-            LlmRole::Primary => &self.primary,
+            LlmRole::Initial => &self.initial,
+            LlmRole::Fixer => &self.fixer,
             LlmRole::Judge => &self.judge,
         };
         let mut responses = queue.lock().expect("lock poisoned");

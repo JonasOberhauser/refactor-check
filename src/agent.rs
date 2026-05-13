@@ -85,16 +85,18 @@ pub async fn run_with_providers(
     for iteration in 0..MAX_ITERATIONS {
         info!(iteration = iteration + 1, "starting iteration");
 
+        let gen_role = if iteration == 0 { LlmRole::Initial } else { LlmRole::Fixer };
+
         // 1. Generate batch
         let messages = build_generation_messages(input_content, &verified, &open);
-        let response = llm.chat(LlmRole::Primary, messages).await?;
+        let response = llm.chat(gen_role, messages).await?;
 
         debug!(response, "formula batch received");
 
         let mut formulas = extract_all_formulas(&response);
         if formulas.is_empty() {
             warn!("no formulas found in response, insisting");
-            let one = insist_on_at_least_one_formula(llm, input_content, &response).await?;
+            let one = insist_on_at_least_one_formula(llm, gen_role, input_content, &response).await?;
             formulas = vec![one];
         }
 
@@ -229,7 +231,7 @@ async fn explain_formulas(input_content: &str, llm: &dyn LlmProvider, mut result
         let outcome = result.formulas[i].outcome.clone();
         async move {
             let messages = build_explanation_messages(input_content, &formula, &outcome);
-            let response = llm.chat(LlmRole::Primary, messages).await;
+            let response = llm.chat(LlmRole::Fixer, messages).await;
             (i, response)
         }
     });
@@ -355,6 +357,7 @@ fn build_generation_messages(
 #[instrument(skip_all)]
 async fn insist_on_at_least_one_formula(
     llm: &dyn LlmProvider,
+    role: LlmRole,
     input_content: &str,
     previous_response: &str,
 ) -> Result<String> {
@@ -383,7 +386,7 @@ async fn insist_on_at_least_one_formula(
             )),
         ];
 
-        let response = llm.chat(LlmRole::Primary, messages).await?;
+        let response = llm.chat(role, messages).await?;
         let formulas = extract_all_formulas(&response);
         if formulas.is_empty() {
             last_response = response;

@@ -65,6 +65,7 @@ fn struct_max_formula_response() -> String {
 async fn test_sat_judge_overrules() {
     let llm = SequenceLlm::new(
         vec![struct_max_formula_response()],
+        vec![],
         vec![JUDGE_REASONABLE.to_string()],
     );
     let solver = FakeSolver {
