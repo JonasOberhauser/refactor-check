@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::time::Duration;
 use tracing::{debug, info, instrument, trace, warn};
 
 use crate::provider::{LlmProvider, LlmRole};
@@ -77,6 +78,32 @@ pub struct LlmClient {
     primary_client: async_openai::Client<async_openai::config::OpenAIConfig>,
     judge_client: async_openai::Client<async_openai::config::OpenAIConfig>,
     config: LlmConfig,
+}
+
+struct ConnectionTracer {
+    empty_chunks: u64,
+    total_content_bytes: u64,
+}
+
+impl ConnectionTracer {
+    fn new() -> Self {
+        Self { empty_chunks: 0, total_content_bytes: 0 }
+    }
+
+    fn on_content(&mut self, label: &str, text: &str) -> u64 {
+        let skipped = self.empty_chunks;
+        self.empty_chunks = 0;
+        self.total_content_bytes += text.len() as u64;
+        trace!(%label, content_len = text.len(), empties_since_last = skipped, content = %text, "SSE content chunk");
+        skipped
+    }
+
+    fn on_empty(&mut self, label: &str) {
+        self.empty_chunks += 1;
+        if self.empty_chunks.is_multiple_of(1000) {
+            trace!(%label, total_empty_chunks = self.empty_chunks, total_content_bytes = self.total_content_bytes, "SSE heartbeat");
+        }
+    }
 }
 
 impl LlmClient {
@@ -158,6 +185,9 @@ impl LlmClient {
         let max_retries = self.config.max_stream_retries;
 
         for attempt in 0..=max_retries {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
             let request = CreateChatCompletionRequest {
                 model: model.to_string(),
                 messages: request_messages.clone(),
@@ -182,6 +212,7 @@ impl LlmClient {
             let mut finish_reason: Option<FinishReason> = None;
             let mut stream_ended = false;
             let mut got_first_chunk = false;
+            let mut tracer = ConnectionTracer::new();
 
             loop {
                 let current_timeout = if got_first_chunk {
@@ -193,17 +224,17 @@ impl LlmClient {
                     Ok(Some(Ok(response))) => {
                         got_first_chunk = true;
                         if let Some(choice) = response.choices.first() {
-let has_content = choice.delta.content.as_ref().is_some_and(|s| !s.is_empty());
-                        let has_tool_calls = choice.delta.tool_calls.as_ref().is_some_and(|v| !v.is_empty());
+                            let has_content = choice.delta.content.as_ref().is_some_and(|s| !s.is_empty());
+                            let _has_tool_calls = choice.delta.tool_calls.as_ref().is_some_and(|v| !v.is_empty());
                             #[allow(deprecated)]
-                            let has_function_call = choice.delta.function_call.is_some();
+                            let _has_function_call = choice.delta.function_call.is_some();
 
                             if has_content {
                                 let text = choice.delta.content.as_ref().unwrap();
-                                trace!(%label, content_len = text.len(), content = %text, tool_calls = has_tool_calls, function_call = has_function_call, "SSE content chunk");
+                                tracer.on_content(label, text);
                                 content.push_str(text);
                             } else {
-                                trace!(%label, response_id = %response.id, model = %response.model, content_len = 0, tool_calls = has_tool_calls, function_call = has_function_call, "SSE alive chunk");
+                                tracer.on_empty(label);
                             }
                             if let Some(fr) = &choice.finish_reason {
                                 finish_reason = Some(*fr);
@@ -266,6 +297,9 @@ let has_content = choice.delta.content.as_ref().is_some_and(|s| !s.is_empty());
             }
 
             if stream_ended {
+                if tracer.empty_chunks > 0 {
+                    trace!(%label, total_empty_chunks = tracer.empty_chunks, total_content_bytes = tracer.total_content_bytes, "SSE stream ended");
+                }
                 if matches!(finish_reason, Some(FinishReason::Length)) {
                     warn!(%label, bytes = content.len(), "LLM response truncated (finish_reason=length)");
                 }
