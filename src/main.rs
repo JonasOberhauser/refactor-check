@@ -23,17 +23,21 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_SOLVER_TIMEOUT_SECS)]
     solver_timeout_secs: u64,
 
-    /// Formalizer LLM model (first formula generation attempt)
-    #[arg(long, default_value = "qwen/qwen3-coder:free")]
-    formalizer_model: String,
+    /// Default model for all LLM roles (overridden by per-role --*-model flags)
+    #[arg(long, default_value = "openrouter/free")]
+    api_model: String,
 
-    /// Error-fixing LLM model (subsequent formula generation)
-    #[arg(long, default_value = "qwen/qwen3-coder:free")]
-    fixer_model: String,
+    /// Formalizer LLM model (first formula generation attempt, falls back to --api-model)
+    #[arg(long)]
+    formalizer_model: Option<String>,
 
-    /// Judge (cheaper) LLM model identifier
-    #[arg(long, default_value = "google/gemma-3-4b-it:free")]
-    judge_model: String,
+    /// Error-fixing LLM model (subsequent formula generation, falls back to --api-model)
+    #[arg(long)]
+    fixer_model: Option<String>,
+
+    /// Judge (cheaper) LLM model identifier (falls back to --api-model)
+    #[arg(long)]
+    judge_model: Option<String>,
 
     /// API base URL
     #[arg(long, default_value = "https://openrouter.ai/api/v1")]
@@ -94,6 +98,8 @@ async fn main() -> Result<()> {
         ),
     };
 
+    let api_model = cli.api_model;
+
     let config = AgentConfig {
         llm_config: LlmConfig {
             api_key,
@@ -101,9 +107,9 @@ async fn main() -> Result<()> {
             formalizer_api_key: cli.formalizer_api_key,
             fixer_api_key: cli.fixer_api_key,
             api_base: cli.api_base,
-            formalizer_model: cli.formalizer_model,
-            fixer_model: cli.fixer_model,
-            judge_model: cli.judge_model,
+            formalizer_model: cli.formalizer_model.unwrap_or_else(|| api_model.clone()),
+            fixer_model: cli.fixer_model.unwrap_or_else(|| api_model.clone()),
+            judge_model: cli.judge_model.unwrap_or_else(|| api_model.clone()),
             stream_timeout_ms: cli.stream_timeout_ms,
             max_stream_retries: cli.max_stream_retries,
             service_tier,
