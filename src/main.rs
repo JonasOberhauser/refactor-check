@@ -43,8 +43,8 @@ struct Cli {
     #[arg(long, default_value = "https://openrouter.ai/api/v1")]
     api_base: String,
 
-    /// API key (defaults to OPENROUTER_API_KEY env var)
-    #[arg(long, env = "OPENROUTER_API_KEY")]
+    /// API key (defaults to OPENROUTER_API_KEY env var, or built-in free key)
+    #[arg(long, env = "OPENROUTER_API_KEY", default_value = "***REDACTED***")]
     api_key: Option<String>,
 
     /// Separate API key for the judge model (falls back to --api-key if not set)
@@ -83,9 +83,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let api_key = cli.api_key.ok_or_else(|| {
-        anyhow::anyhow!("API key required: set --api-key or OPENROUTER_API_KEY env var")
-    })?;
+    let api_key = cli.api_key.expect("api_key has a default value");
 
     let service_tier = match cli.service_tier.to_lowercase().as_str() {
         "auto" => ServiceTier::Auto,
