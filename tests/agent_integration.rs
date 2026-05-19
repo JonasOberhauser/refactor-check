@@ -9,7 +9,7 @@ use refactor_check::machine;
 use refactor_check::provider::SolverProvider;
 use refactor_check::smt::{SolverOutcome, SolverResult};
 
-fn smt_formula() -> String {
+fn smt_formula_single() -> String {
     "\
 (set-logic QF_LIA)
 (declare-fun x () Int)
@@ -19,342 +19,329 @@ fn smt_formula() -> String {
         .to_string()
 }
 
-fn formula_response() -> String {
-    format!("Here is the formula:\n\n```smt2\n{}\n```", smt_formula())
+fn formula_response_single() -> String {
+    format!("Here is the formula:\n\n```smt2\n{}\n```", smt_formula_single())
 }
 
-fn two_formula_response() -> String {
+fn formula_response_two() -> String {
     format!(
-        "Formula for part A:\n\n```smt2\n{}\n```\n\nFormula for part B:\n\n```smt2\n(set-logic QF_LIA)\n(declare-fun z () Int)\n(declare-fun w () Int)\n(assert (= z w))\n(check-sat)\n```",
-        smt_formula()
+        "Piece 1:\n\n```smt2\n{}\n```\n\n\
+         Piece 2:\n\n```smt2\n(set-logic QF_LIA)\n(declare-fun z () Int)\n(declare-fun w () Int)\n(assert (= z w))\n(check-sat)\n```",
+        smt_formula_single()
     )
 }
 
-#[test_log::test(tokio::test)]
-async fn test_happy_path_unsat() {
-    let llm = SequenceLlm::new(
-        vec![formula_response()],
-        vec![],
-        vec![JUDGE_REASONABLE.to_string()],
-    );
-    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
-
-    let result = machine::run("refactoring desc", &llm, &solver)
-        .await
-        .expect("agent should succeed");
-
-    assert_eq!(result.formulas.len(), 1);
-    assert!(result.formulas[0].formula.contains("(set-logic"));
-    assert_eq!(result.formulas[0].outcome, SolverOutcome::Unsat);
-    assert!(result.overall_equivalent);
-    assert_eq!(result.reasonable_unsat, 1);
-    assert_eq!(llm.formalizer_remaining(), 0);
-    assert_eq!(llm.judge_remaining(), 0);
-}
-
-#[test_log::test(tokio::test)]
-async fn test_formula_not_found_then_found() {
-    let llm = SequenceLlm::new(
-        vec![
-            "I don't have a formula yet.".to_string(),
-            formula_response(),
-        ],
-        vec![],
-        vec![JUDGE_REASONABLE.to_string()],
-    );
-    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
-
-    let result = machine::run("refactoring desc", &llm, &solver)
-        .await
-        .expect("agent should succeed");
-
-    assert_eq!(result.formulas.len(), 1);
-    assert!(result.formulas[0].formula.contains("(set-logic"));
-    assert_eq!(result.formulas[0].outcome, SolverOutcome::Unsat);
-    assert!(result.overall_equivalent);
-    assert_eq!(llm.formalizer_remaining(), 0);
-    assert_eq!(llm.judge_remaining(), 0);
-}
-
-struct ToggleSolver {
-    call_count: Arc<Mutex<usize>>,
-    error_until: usize,
-}
-
-#[async_trait]
-impl SolverProvider for ToggleSolver {
-    async fn run(&self, _formula: &str) -> anyhow::Result<SolverResult> {
-        let mut count = self.call_count.lock().expect("lock poisoned");
-        *count += 1;
-        let n = *count;
-        if n <= self.error_until {
-            Ok(SolverResult {
-                outcome: SolverOutcome::Error("parse error".to_string()),
-                stdout: "parse error".to_string(),
-                stderr: "error".to_string(),
-            })
-        } else {
-            Ok(SolverResult {
-                outcome: SolverOutcome::Unsat,
-                stdout: "unsat".to_string(),
-                stderr: String::new(),
-            })
-        }
-    }
-}
-
-/// Generates a unique formula with distinct variable names to avoid accidental matching.
-fn unique_formula_response(i: usize) -> String {
-    format!(
-        "Formula {}:\n\n```smt2\n(set-logic QF_LIA)\n(declare-fun v{i} () Int)\n(declare-fun u{i} () Int)\n(assert (= v{i} u{i}))\n(check-sat)\n```",
-        i + 1
-    )
-}
-
-#[test_log::test(tokio::test)]
-async fn test_solver_error_in_batch_then_partial_result() {
-    // In the compositional flow, an errored formula stays open until explicitly replaced.
-    // With fixed LLM responses, the agent never generates a replacement for the specific
-    // errored item, so it reaches MAX_ITERATIONS with a partial result.
-    let formalizer: Vec<String> = vec![two_formula_response()];
-    let fixer: Vec<String> = (0..29).map(unique_formula_response).collect();
-    let judge: Vec<String> = (0..30).map(|_| JUDGE_REASONABLE.to_string()).collect();
-    let llm = SequenceLlm::new(formalizer, fixer, judge);
-
-    let call_count = Arc::new(Mutex::new(0usize));
-    let solver = ToggleSolver { call_count: call_count.clone(), error_until: 1 };
-
-    // After MAX_ITERATIONS the agent returns Ok with a partial result
-    let result = machine::run("refactoring desc", &llm, &solver)
-        .await
-        .expect("agent should return partial result after max iterations");
-
-    // 1 errored formula never resolved, 30 others verified (1 in iter 1 + 29 rest)
-    assert_eq!(result.open_count, 1);
-    assert_eq!(result.formulas.len(), 30);
-    assert_eq!(*call_count.lock().unwrap(), 31, "solver called 31 times (2 in iter 1 + 29 rest)");
-}
-
-#[test_log::test(tokio::test)]
-async fn test_judge_retry_in_branch_then_verified() {
-    // Formula 1: judge RETRY → branch retries → Fixer generates → judge REASONABLE → verified
-    // Formula 2: judge REASONABLE → verified
-    let formalizer: Vec<String> = vec![two_formula_response()];
-    let fixer: Vec<String> = vec![unique_formula_response(0)];
-    let judge: Vec<String> = vec![
-        "The formula does not capture the loop invariant properly".to_string(),
-        JUDGE_REASONABLE.to_string(),
-        JUDGE_REASONABLE.to_string(),
-    ];
-    let llm = SequenceLlm::new(formalizer, fixer, judge);
-    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
-
-    let result = machine::run("refactoring desc", &llm, &solver)
-        .await
-        .expect("agent should succeed with branch retry");
-
-    assert_eq!(result.formulas.len(), 2);
-    assert_eq!(result.reasonable_unsat, 2);
-    assert_eq!(result.open_count, 0);
-    assert!(result.overall_equivalent);
-    assert_eq!(llm.fixer_remaining(), 0);
-    assert_eq!(llm.judge_remaining(), 0);
-}
-
-#[test_log::test(tokio::test)]
-async fn test_judge_gives_unclear_answer_then_clear() {
-    let llm = SequenceLlm::new(
-        vec![formula_response()],
-        vec![formula_response()],
-        vec![
-            "The formula doesn't capture the loop invariant correctly".to_string(),
-            JUDGE_REASONABLE.to_string(),
-        ],
-    );
-    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
-
-    let result = machine::run("refactoring desc", &llm, &solver)
-        .await
-        .expect("agent should succeed");
-
-    assert_eq!(result.formulas.len(), 1);
-    assert_eq!(result.formulas[0].outcome, SolverOutcome::Unsat);
-    assert!(result.overall_equivalent);
-    assert_eq!(llm.formalizer_remaining(), 0);
-    assert_eq!(llm.fixer_remaining(), 0);
-    assert_eq!(llm.judge_remaining(), 0);
-}
-
-fn jemalloc_refactoring_formula() -> String {
+fn split_no_split() -> String {
     "\
-(set-logic UF)
-
-(declare-sort Emitter 0)
-
-(declare-fun f_version (Emitter) Emitter)
-(declare-fun f_config  (Emitter) Emitter)
-(declare-fun f_system  (Emitter) Emitter)
-(declare-fun f_opt     (Emitter) Emitter)
-(declare-fun f_prof    (Emitter) Emitter)
-(declare-fun f_arenas  (Emitter) Emitter)
-
-(declare-fun h_config  (Emitter) Emitter)
-(declare-fun h_system  (Emitter) Emitter)
-(declare-fun h_opt     (Emitter) Emitter)
-(declare-fun h_prof    (Emitter) Emitter)
-(declare-fun h_arenas  (Emitter) Emitter)
-
-(declare-fun emit (Emitter Int) Emitter)
-
-(define-fun op_cfg_dict_begin       () Int 100)
-(define-fun op_cfg_cache_oblivious () Int 101)
-(define-fun op_cfg_debug           () Int 102)
-(define-fun op_cfg_fill            () Int 103)
-(define-fun op_cfg_lazy_lock       () Int 104)
-(define-fun op_cfg_malloc_conf     () Int 105)
-(define-fun op_cfg_opt_safety      () Int 106)
-(define-fun op_cfg_prof            () Int 107)
-(define-fun op_cfg_prof_libgcc     () Int 108)
-(define-fun op_cfg_prof_libunwind  () Int 109)
-(define-fun op_cfg_prof_frameptr   () Int 110)
-(define-fun op_cfg_stats           () Int 111)
-(define-fun op_cfg_utrace          () Int 112)
-(define-fun op_cfg_xmalloc         () Int 113)
-(define-fun op_cfg_dict_end        () Int 114)
-
-(define-fun op_sys_dict_begin () Int 200)
-(define-fun op_sys_thp_mode   () Int 201)
-(define-fun op_sys_dict_end   () Int 202)
-
-(define-fun f_config_detail ((e Emitter)) Emitter
-  (let ((e1  (emit e  op_cfg_dict_begin)))
-  (let ((e2  (emit e1 op_cfg_cache_oblivious)))
-  (let ((e3  (emit e2 op_cfg_debug)))
-  (let ((e4  (emit e3 op_cfg_fill)))
-  (let ((e5  (emit e4 op_cfg_lazy_lock)))
-  (let ((e6  (emit e5 op_cfg_malloc_conf)))
-  (let ((e7  (emit e6 op_cfg_opt_safety)))
-  (let ((e8  (emit e7 op_cfg_prof)))
-  (let ((e9  (emit e8 op_cfg_prof_libgcc)))
-  (let ((e10 (emit e9 op_cfg_prof_libunwind)))
-  (let ((e11 (emit e10 op_cfg_prof_frameptr)))
-  (let ((e12 (emit e11 op_cfg_stats)))
-  (let ((e13 (emit e12 op_cfg_utrace)))
-  (let ((e14 (emit e13 op_cfg_xmalloc)))
-  (let ((e15 (emit e14 op_cfg_dict_end)))
-    e15)))))))))))))))
-
-(define-fun h_config_detail ((e Emitter)) Emitter
-  (let ((e1  (emit e  op_cfg_dict_begin)))
-  (let ((e2  (emit e1 op_cfg_cache_oblivious)))
-  (let ((e3  (emit e2 op_cfg_debug)))
-  (let ((e4  (emit e3 op_cfg_fill)))
-  (let ((e5  (emit e4 op_cfg_lazy_lock)))
-  (let ((e6  (emit e5 op_cfg_malloc_conf)))
-  (let ((e7  (emit e6 op_cfg_opt_safety)))
-  (let ((e8  (emit e7 op_cfg_prof)))
-  (let ((e9  (emit e8 op_cfg_prof_libgcc)))
-  (let ((e10 (emit e9 op_cfg_prof_libunwind)))
-  (let ((e11 (emit e10 op_cfg_prof_frameptr)))
-  (let ((e12 (emit e11 op_cfg_stats)))
-  (let ((e13 (emit e12 op_cfg_utrace)))
-  (let ((e14 (emit e13 op_cfg_xmalloc)))
-  (let ((e15 (emit e14 op_cfg_dict_end)))
-    e15)))))))))))))))
-
-(define-fun f_system_detail ((e Emitter)) Emitter
-  (let ((e1 (emit e  op_sys_dict_begin)))
-  (let ((e2 (emit e1 op_sys_thp_mode)))
-  (let ((e3 (emit e2 op_sys_dict_end)))
-    e3))))
-
-(define-fun h_system_detail ((e Emitter)) Emitter
-  (let ((e1 (emit e  op_sys_dict_begin)))
-  (let ((e2 (emit e1 op_sys_thp_mode)))
-  (let ((e3 (emit e2 op_sys_dict_end)))
-    e3))))
-
-(assert (forall ((e Emitter)) (= (h_config_detail e) (f_config_detail e))))
-(assert (forall ((e Emitter)) (= (h_system_detail e) (f_system_detail e))))
-
-(assert (forall ((e Emitter)) (= (f_config e) (f_config_detail e))))
-(assert (forall ((e Emitter)) (= (h_config e) (h_config_detail e))))
-(assert (forall ((e Emitter)) (= (f_system e) (f_system_detail e))))
-(assert (forall ((e Emitter)) (= (h_system e) (h_system_detail e))))
-
-(assert (forall ((e Emitter)) (= (h_opt e) (f_opt e))))
-(assert (forall ((e Emitter)) (= (h_prof e) (f_prof e))))
-(assert (forall ((e Emitter)) (= (h_arenas e) (f_arenas e))))
-
-(define-fun before ((e Emitter)) Emitter
-  (f_arenas (f_prof (f_opt (f_system (f_config (f_version e)))))))
-
-(define-fun after ((e Emitter)) Emitter
-  (h_arenas (h_prof (h_opt (h_system (h_config (f_version e)))))))
-
-(assert (exists ((e Emitter)) (not (= (before e) (after e)))))
-
-(check-sat)
-(get-model)"
+Piece: whole
+---- BEFORE ----
+fn main() { x + 1 }
+---- AFTER ----
+fn main() { x + 1 }"
         .to_string()
 }
 
-fn jemalloc_formula_response() -> String {
-    format!(
-        "Looking at this refactoring, the \"before\" version is a monolithic \
-         `stats_general_print` function that performs all operations inline, while the \
-         \"after\" version decomposes it into helper functions called in the same order.\n\n\
-          ```smt2\n{}\n```\n\n\
-          **Expected result: UNSAT**",
-        jemalloc_refactoring_formula()
-    )
+fn split_two_pieces() -> String {
+    "\
+Piece: prelude
+---- BEFORE ----
+let x = 1;
+---- AFTER ----
+let x = 1;
+
+Piece: body
+---- BEFORE ----
+x + 1
+---- AFTER ----
+x + 1"
+        .to_string()
 }
 
+fn split_four_pieces() -> String {
+    "\
+Piece: a
+---- BEFORE ----
+fn a() { 1 }
+---- AFTER ----
+fn a() { 1 }
+
+Piece: b
+---- BEFORE ----
+fn b() { 2 }
+---- AFTER ----
+fn b() { 2 }
+
+Piece: c
+---- BEFORE ----
+fn c() { 3 }
+---- AFTER ----
+fn c() { 3 }
+
+Piece: d
+---- BEFORE ----
+fn d() { 4 }
+---- AFTER ----
+fn d() { 4 }"
+        .to_string()
+}
+
+/// No-split: splitter says one piece, happy path.
 #[test_log::test(tokio::test)]
-async fn test_jemalloc_refactoring_unsat() {
+async fn test_split_no_split_happy_path() {
     let llm = SequenceLlm::new(
-        vec![jemalloc_formula_response()],
+        vec![formula_response_single()],
         vec![],
         vec![JUDGE_REASONABLE.to_string()],
+        vec![split_no_split()],
     );
     let solver = FakeSolver { outcome: SolverOutcome::Unsat };
 
-    let result = machine::run(
-        "stats_general_print refactoring: inline sections extracted to helper functions",
-        &llm,
-        &solver,
-    )
+    let result = machine::run("refactoring desc", &llm, &solver)
         .await
         .expect("agent should succeed");
 
     assert_eq!(result.formulas.len(), 1);
-    assert!(result.formulas[0].formula.contains("(set-logic UF)"));
-    assert!(result.formulas[0].formula.contains("(declare-sort Emitter 0)"));
-    assert!(result.formulas[0].formula.contains("(check-sat)"));
-    assert_eq!(result.formulas[0].outcome, SolverOutcome::Unsat);
+    assert_eq!(result.formulas[0].piece_label, "whole");
+    assert_eq!(result.reasonable_unsat, 1);
     assert!(result.overall_equivalent);
-    assert_eq!(llm.formalizer_remaining(), 0);
-    assert_eq!(llm.judge_remaining(), 0);
 }
 
+/// Splitter gives 2 pieces, each generates one formula.
 #[test_log::test(tokio::test)]
-async fn test_multi_formula_batch() {
+async fn test_split_two_pieces() {
     let llm = SequenceLlm::new(
-        vec![two_formula_response()],
+        vec![formula_response_two()],
         vec![],
-        vec![JUDGE_REASONABLE.to_string(), JUDGE_REASONABLE.to_string()],
+        vec![
+            JUDGE_REASONABLE.to_string(),
+            JUDGE_REASONABLE.to_string(),
+        ],
+        vec![split_two_pieces()],
     );
-    let call_count = Arc::new(Mutex::new(0usize));
-    let solver = ToggleSolver { call_count: call_count.clone(), error_until: 0 };
+    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
 
     let result = machine::run("refactoring desc", &llm, &solver)
         .await
         .expect("agent should succeed");
 
     assert_eq!(result.formulas.len(), 2);
-    assert_eq!(*call_count.lock().unwrap(), 2, "both formulas should be solved in parallel");
-    assert!(result.overall_equivalent);
     assert_eq!(result.reasonable_unsat, 2);
-    assert_eq!(llm.formalizer_remaining(), 0);
-    assert_eq!(llm.judge_remaining(), 0);
+    assert!(result.overall_equivalent);
+}
+
+/// Splitter gives 4 pieces, all verified.
+#[test_log::test(tokio::test)]
+async fn test_split_four_pieces() {
+    let llm = SequenceLlm::new(
+        vec![
+            "\
+Piece 1:\n```smt2\n(set-logic QF_LIA)\n(declare-fun x () Int)\n(declare-fun y () Int)\n(assert (= x y))\n(check-sat)\n```\n\n\
+Piece 2:\n```smt2\n(set-logic QF_LIA)\n(declare-fun a () Int)\n(declare-fun b () Int)\n(assert (= a b))\n(check-sat)\n```\n\n\
+Piece 3:\n```smt2\n(set-logic QF_LIA)\n(declare-fun c () Int)\n(declare-fun d () Int)\n(assert (= c d))\n(check-sat)\n```\n\n\
+Piece 4:\n```smt2\n(set-logic QF_LIA)\n(declare-fun e () Int)\n(declare-fun f () Int)\n(assert (= e f))\n(check-sat)\n```"
+                .to_string(),
+        ],
+        vec![],
+        vec![
+            JUDGE_REASONABLE.to_string(),
+            JUDGE_REASONABLE.to_string(),
+            JUDGE_REASONABLE.to_string(),
+            JUDGE_REASONABLE.to_string(),
+        ],
+        vec![split_four_pieces()],
+    );
+    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
+
+    let result = machine::run("refactoring desc", &llm, &solver)
+        .await
+        .expect("agent should succeed");
+
+    assert_eq!(result.formulas.len(), 4);
+    assert_eq!(result.reasonable_unsat, 4);
+    assert!(result.overall_equivalent);
+}
+
+/// One piece times out → splitter asked to resplit → children verified with UNSAT.
+#[test_log::test(tokio::test)]
+async fn test_split_timeout_resplit() {
+    struct ToggleSolver {
+        call_count: Arc<Mutex<usize>>,
+    }
+    #[async_trait]
+    impl SolverProvider for ToggleSolver {
+        async fn run(&self, _formula: &str) -> anyhow::Result<SolverResult> {
+            let mut count = self.call_count.lock().expect("lock poisoned");
+            *count += 1;
+            if *count == 1 {
+                Ok(SolverResult {
+                    outcome: SolverOutcome::Unknown,
+                    stdout: "unknown".to_string(),
+                    stderr: String::new(),
+                })
+            } else {
+                Ok(SolverResult {
+                    outcome: SolverOutcome::Unsat,
+                    stdout: "unsat".to_string(),
+                    stderr: String::new(),
+                })
+            }
+        }
+    }
+
+    let llm = SequenceLlm::new(
+        vec![
+            formula_response_single(),
+            formula_response_two(),
+        ],
+        vec![],
+        vec![
+            JUDGE_REASONABLE.to_string(),
+            JUDGE_REASONABLE.to_string(),
+        ],
+        vec![
+            "\
+Piece: big
+---- BEFORE ----
+large code
+---- AFTER ----
+large code"
+                .to_string(),
+            split_two_pieces(),
+        ],
+    );
+    let solver = ToggleSolver { call_count: Arc::new(Mutex::new(0)) };
+
+    let result = machine::run("refactoring desc", &llm, &solver)
+        .await
+        .expect("agent should succeed");
+
+    assert_eq!(result.formulas.len(), 2);
+    assert_eq!(result.reasonable_unsat, 2);
+    assert!(result.overall_equivalent);
+}
+
+/// SAT result should be detected and not-equivalent reported.
+#[test_log::test(tokio::test)]
+async fn test_split_sat_result() {
+    let llm = SequenceLlm::new(
+        vec![formula_response_single()],
+        vec![],
+        vec![JUDGE_REASONABLE.to_string()],
+        vec![split_no_split()],
+    );
+    let solver = FakeSolver { outcome: SolverOutcome::Sat };
+
+    let result = machine::run("refactoring desc", &llm, &solver)
+        .await
+        .expect("agent should succeed");
+
+    assert_eq!(result.formulas.len(), 1);
+    assert_eq!(result.reasonable_sat, 1);
+    assert!(!result.overall_equivalent);
+}
+
+/// Old happy path without splitter (empty splitter queue).
+#[test_log::test(tokio::test)]
+async fn test_old_happy_path_unsat() {
+    let llm = SequenceLlm::new(
+        vec![formula_response_single()],
+        vec![],
+        vec![JUDGE_REASONABLE.to_string()],
+        vec!["".to_string()],
+    );
+    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
+
+    let result = machine::run("refactoring desc", &llm, &solver)
+        .await
+        .expect("agent should succeed");
+
+    assert_eq!(result.formulas.len(), 1);
+    assert!(result.overall_equivalent);
+}
+
+/// Generator insist then succeeds on split pieces.
+#[test_log::test(tokio::test)]
+async fn test_split_generator_insist_then_ok() {
+    let llm = SequenceLlm::new(
+        vec![
+            "no formula here".to_string(),
+            formula_response_single(),
+        ],
+        vec![],
+        vec![JUDGE_REASONABLE.to_string()],
+        vec![split_no_split()],
+    );
+    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
+
+    let result = machine::run("refactoring desc", &llm, &solver)
+        .await
+        .expect("agent should succeed");
+
+    assert_eq!(result.formulas.len(), 1);
+    assert!(result.overall_equivalent);
+}
+
+/// Splitter returns empty → falls back to one-piece generation without split.
+#[test_log::test(tokio::test)]
+async fn test_splitter_returns_empty_falls_back() {
+    let llm = SequenceLlm::new(
+        vec![formula_response_single()],
+        vec![],
+        vec![JUDGE_REASONABLE.to_string()],
+        vec!["".to_string()],
+    );
+    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
+
+    let result = machine::run("refactoring desc", &llm, &solver)
+        .await
+        .expect("agent should succeed");
+
+    assert_eq!(result.formulas.len(), 1);
+    assert!(result.overall_equivalent);
+}
+
+/// Judge says retry for one piece of a split → generator fixes → verified.
+#[test_log::test(tokio::test)]
+async fn test_split_one_piece_judge_retry_then_verified() {
+    let llm = SequenceLlm::new(
+        vec![formula_response_two()],
+        vec![formula_response_single()],
+        vec![
+            "formula does not capture the loop invariant".to_string(),
+            JUDGE_REASONABLE.to_string(),
+            JUDGE_REASONABLE.to_string(),
+        ],
+        vec![split_two_pieces()],
+    );
+    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
+
+    let result = machine::run("refactoring desc", &llm, &solver)
+        .await
+        .expect("agent should succeed");
+
+    assert_eq!(result.formulas.len(), 2);
+    assert_eq!(result.reasonable_unsat, 2);
+    assert!(result.overall_equivalent);
+}
+
+/// Old multi-formula batch without splitter.
+#[test_log::test(tokio::test)]
+async fn test_old_multi_formula_batch() {
+    let llm = SequenceLlm::new(
+        vec![formula_response_two()],
+        vec![],
+        vec![
+            JUDGE_REASONABLE.to_string(),
+            JUDGE_REASONABLE.to_string(),
+        ],
+        vec!["".to_string()],
+    );
+    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
+
+    let result = machine::run("refactoring desc", &llm, &solver)
+        .await
+        .expect("agent should succeed");
+
+    assert_eq!(result.formulas.len(), 2);
+    assert!(result.overall_equivalent);
 }

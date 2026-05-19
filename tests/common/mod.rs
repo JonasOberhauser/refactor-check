@@ -10,15 +10,22 @@ pub struct SequenceLlm {
     formalizer: Arc<Mutex<Vec<String>>>,
     fixer: Arc<Mutex<Vec<String>>>,
     judge: Arc<Mutex<Vec<String>>>,
+    splitter: Arc<Mutex<Vec<String>>>,
 }
 
 #[allow(dead_code)]
 impl SequenceLlm {
-    pub fn new(formalizer: Vec<String>, fixer: Vec<String>, judge: Vec<String>) -> Self {
+    pub fn new(
+        formalizer: Vec<String>,
+        fixer: Vec<String>,
+        judge: Vec<String>,
+        splitter: Vec<String>,
+    ) -> Self {
         Self {
             formalizer: Arc::new(Mutex::new(formalizer)),
             fixer: Arc::new(Mutex::new(fixer)),
             judge: Arc::new(Mutex::new(judge)),
+            splitter: Arc::new(Mutex::new(splitter)),
         }
     }
 
@@ -39,6 +46,7 @@ impl SequenceLlm {
 impl LlmProvider for SequenceLlm {
     async fn chat(&self, role: LlmRole, _messages: Vec<Message>) -> Result<String> {
         let queue = match role {
+            LlmRole::Splitter => &self.splitter,
             LlmRole::Formalizer => &self.formalizer,
             LlmRole::Fixer => &self.fixer,
             LlmRole::Judge => &self.judge,
@@ -60,12 +68,7 @@ impl SolverProvider for FakeSolver {
     async fn run(&self, _formula: &str) -> Result<SolverResult> {
         Ok(SolverResult {
             outcome: self.outcome.clone(),
-            stdout: match &self.outcome {
-                SolverOutcome::Unsat => "unsat".to_string(),
-                SolverOutcome::Sat => "sat".to_string(),
-                SolverOutcome::Unknown => "unknown".to_string(),
-                SolverOutcome::Error(e) => e.clone(),
-            },
+            stdout: format!("{:?}", self.outcome).to_lowercase(),
             stderr: String::new(),
         })
     }

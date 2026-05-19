@@ -243,7 +243,7 @@ let status = tokio::select! {
         let _ = read_stderr.await;
         let timeout_msg = format!("solver timed out after {}s", timeout.as_secs());
         return Ok(SolverResult {
-            outcome: SolverOutcome::Error(timeout_msg.clone()),
+            outcome: SolverOutcome::Unknown,
             stdout: timeout_msg,
             stderr: String::new(),
         });

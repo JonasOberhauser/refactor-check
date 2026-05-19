@@ -41,8 +41,8 @@ pub async fn run(input_file: &str, config: AgentConfig) -> anyhow::Result<()> {
     println!("=== Open Pieces ===\n{}\n", result.open_count);
     for f in &result.formulas {
         println!(
-            "--- Formula ---\n{}\nOutcome: {:?}, Verdict: {}\n",
-            f.formula, f.outcome, f.verdict
+            "--- Formula ---\n[{}]\n{}\nOutcome: {:?}, Verdict: {}\n",
+            f.piece_label, f.formula, f.outcome, f.verdict
         );
         if let Some(ref explanation) = f.explanation {
             println!("--- Explanation ---\n{explanation}\n");
@@ -81,7 +81,7 @@ pub fn build_generation_messages(
         for (i, piece) in verified.iter().enumerate() {
             let _ = write!(
                 content,
-                "Piece {} ({}):\n{piece}\n",
+                "Piece {} ({}):\n[{}] {}\n",
                 i + 1,
                 match &piece.outcome {
                     SolverOutcome::Sat => "SAT — NOT EQUIVALENT",
@@ -89,7 +89,8 @@ pub fn build_generation_messages(
                     SolverOutcome::Unknown => "UNKNOWN — inconclusive",
                     SolverOutcome::Error(_) => unreachable!(),
                 },
-                piece = piece.formula,
+                piece.piece_label,
+                piece.formula,
             );
         }
         content.push('\n');
@@ -100,8 +101,9 @@ pub fn build_generation_messages(
         for (i, item) in open.iter().enumerate() {
             let _ = write!(
                 content,
-                "Open piece {}:\nFormula:\n{}\nIssue: {}\n",
+                "Open piece {}:\nLabel: {}\nFormula:\n{}\nIssue: {}\n",
                 i + 1,
+                item.piece_label,
                 item.formula,
                 item.reason,
             );

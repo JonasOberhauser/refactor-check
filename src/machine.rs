@@ -17,23 +17,53 @@ pub async fn run(
 
     loop {
         state = match state {
-            AlgorithmState::Idle => AlgorithmState::WaitForGeneration(WaitForGeneration {
+            AlgorithmState::Idle => AlgorithmState::WaitForSplit(WaitForSplit {
                 input_content: Arc::clone(&input_arc),
+                pieces_to_resplit: Vec::new(),
                 verified: Vec::new(),
                 open: Vec::new(),
                 iteration: 0,
-                insist: InsistState::Idle,
+                split_depth: 0,
+                pending_pieces: Vec::new(),
             }),
-            AlgorithmState::WaitForGeneration(s) => {
-                if let InsistState::Insisting { attempt, .. } = &s.insist {
-                    if *attempt >= MAX_INSIST_ATTEMPTS {
-                        anyhow::bail!("failed to extract any SMT formula after {MAX_INSIST_ATTEMPTS} insist attempts");
-                    }
+            AlgorithmState::WaitForSplit(s) => {
+                let s_open = s.open.clone();
+                let pieces = behaviors::splitter::execute(&s, llm).await;
+                match pieces {
+                    Ok(pcs) => match s.transition(pcs) {
+                        TransitionFromSplit::Generate(next) => AlgorithmState::WaitForGeneration(next),
+                        TransitionFromSplit::Insist(next) => AlgorithmState::WaitForSplit(next),
+                        TransitionFromSplit::Exhausted(msg) => anyhow::bail!(msg),
+                        TransitionFromSplit::Open(open_items, next) => {
+                            let mut open = s_open;
+                            open.extend(open_items);
+                            AlgorithmState::WaitForGeneration(WaitForGeneration {
+                                open,
+                                ..next
+                            })
+                        }
+                    },
+                    Err(e) => return Err(e),
                 }
-                let response = behaviors::generation::execute(&s, llm).await?;
-                match s.transition(response) {
-                    TransitionFromGeneration::Results(next) => AlgorithmState::WaitForResults(next),
-                    TransitionFromGeneration::Insist(next) => AlgorithmState::WaitForGeneration(next),
+            }
+            AlgorithmState::WaitForGeneration(s) => {
+                if s.pieces.is_empty() {
+                    if let InsistState::Insisting { attempt, .. } = &s.insist {
+                        if *attempt >= MAX_INSIST_ATTEMPTS {
+                            anyhow::bail!("failed to extract any SMT formula after {MAX_INSIST_ATTEMPTS} insist attempts");
+                        }
+                    }
+                    let response = behaviors::generation::execute(&s, llm).await?;
+                    match s.transition(response) {
+                        TransitionFromGeneration::Results(next) => AlgorithmState::WaitForResults(next),
+                        TransitionFromGeneration::Insist(next) => AlgorithmState::WaitForGeneration(next),
+                    }
+                } else {
+                    let response = behaviors::generation::execute(&s, llm).await?;
+                    match s.transition(response) {
+                        TransitionFromGeneration::Results(next) => AlgorithmState::WaitForResults(next),
+                        TransitionFromGeneration::Insist(next) => AlgorithmState::WaitForGeneration(next),
+                    }
                 }
             }
             AlgorithmState::WaitForResults(s) => {
@@ -41,8 +71,7 @@ pub async fn run(
                 match s.transition(done) {
                     TransitionFromResults::Generation(next) => {
                         if next.iteration >= MAX_GLOBAL_CYCLES {
-                            let counts =
-                                OutcomeCounts::from_verified(&next.verified);
+                            let counts = OutcomeCounts::from_verified(&next.verified);
                             return Ok(build_result(
                                 &next.verified,
                                 next.open.len(),
@@ -51,6 +80,7 @@ pub async fn run(
                         }
                         AlgorithmState::WaitForGeneration(next)
                     }
+                    TransitionFromResults::Resplit(next) => AlgorithmState::WaitForSplit(next),
                     TransitionFromResults::Explain(next) => AlgorithmState::WaitForExplanation(next),
                     TransitionFromResults::Done(result) => return Ok(result),
                 }

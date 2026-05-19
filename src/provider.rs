@@ -6,6 +6,7 @@ use crate::smt::{SolverOutcome, SolverResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmRole {
+    Splitter,
     Formalizer,
     Fixer,
     Judge,
@@ -23,6 +24,7 @@ pub trait SolverProvider: Send + Sync {
 
 pub struct FormulaResult {
     pub formula: String,
+    pub piece_label: String,
     pub outcome: SolverOutcome,
     pub verdict: String,
     pub explanation: Option<String>,

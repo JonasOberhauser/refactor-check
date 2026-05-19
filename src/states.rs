@@ -3,8 +3,16 @@ use std::sync::Arc;
 use crate::provider::AgentResult;
 use crate::smt::{SolverOutcome, SolverResult};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodePiece {
+    pub label: String,
+    pub before: String,
+    pub after: String,
+}
+
 pub enum AlgorithmState {
     Idle,
+    WaitForSplit(WaitForSplit),
     WaitForGeneration(WaitForGeneration),
     WaitForResults(WaitForResults),
     WaitForExplanation(WaitForExplanation),
@@ -24,12 +32,23 @@ impl InsistState {
     }
 }
 
+pub struct WaitForSplit {
+    pub input_content: Arc<String>,
+    pub pieces_to_resplit: Vec<(CodePiece, String)>,
+    pub verified: Vec<VerifiedPiece>,
+    pub open: Vec<OpenItem>,
+    pub iteration: usize,
+    pub split_depth: u32,
+    pub pending_pieces: Vec<CodePiece>,
+}
+
 pub struct WaitForGeneration {
     pub input_content: Arc<String>,
     pub verified: Vec<VerifiedPiece>,
     pub open: Vec<OpenItem>,
     pub iteration: usize,
     pub insist: InsistState,
+    pub pieces: Vec<CodePiece>,
 }
 
 pub struct WaitForResults {
@@ -38,11 +57,20 @@ pub struct WaitForResults {
     pub open: Vec<OpenItem>,
     pub iteration: usize,
     pub branches: Vec<FormulaBranch>,
+    pub split_depth: u32,
+    pub remaining_pieces: Vec<CodePiece>,
 }
 
 pub struct WaitForExplanation {
     pub input_content: Arc<String>,
     pub result: AgentResult,
+}
+
+pub enum TransitionFromSplit {
+    Generate(WaitForGeneration),
+    Insist(WaitForSplit),
+    Exhausted(String),
+    Open(Vec<OpenItem>, WaitForGeneration),
 }
 
 pub enum TransitionFromGeneration {
@@ -54,17 +82,26 @@ pub enum TransitionFromResults {
     Generation(WaitForGeneration),
     Explain(WaitForExplanation),
     Done(AgentResult),
+    Resplit(WaitForSplit),
 }
 
 #[derive(Debug, Clone)]
 pub struct VerifiedPiece {
     pub formula: String,
+    pub piece_label: String,
     pub outcome: SolverOutcome,
+}
+
+impl std::fmt::Display for VerifiedPiece {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] {} ({:?})", self.piece_label, self.formula, self.outcome)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct OpenItem {
     pub formula: String,
+    pub piece_label: String,
     pub reason: String,
     pub solver_stdout: String,
     pub solver_stderr: String,
@@ -77,9 +114,10 @@ pub enum JudgeVerdict {
 }
 
 pub struct FormulaBranch {
+    pub piece: CodePiece,
     pub input_content: Arc<String>,
     pub verified: Vec<VerifiedPiece>,
-    pub formula_id: String,
+    pub formula: String,
     pub phase: BranchPhase,
     pub retry_count: usize,
 }
@@ -106,13 +144,13 @@ pub enum BranchPhase {
 pub enum BranchFromNeedFormula {
     Proceed(String),
     Insist,
-    FanOut(Vec<String>),
     Exhausted(String),
 }
 
 pub enum BranchFromSolver {
     Judge(String, SolverResult),
     Error(String, SolverResult),
+    Resplit(String, SolverResult),
 }
 
 pub enum BranchFromJudge {
@@ -125,6 +163,7 @@ pub enum BranchFromJudge {
     },
     Exhausted {
         formula: String,
+        piece_label: String,
         feedback: String,
         solver_stdout: String,
         solver_stderr: String,
@@ -134,6 +173,7 @@ pub enum BranchFromJudge {
 pub enum ChildDone {
     Verified(VerifiedPiece),
     Open(OpenItem),
+    NeedsResplit(CodePiece, String, String),
 }
 
 #[derive(Default)]

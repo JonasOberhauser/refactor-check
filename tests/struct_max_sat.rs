@@ -68,6 +68,7 @@ async fn test_sat_judge_overrules() {
         vec![struct_max_formula_response()],
         vec![],
         vec![JUDGE_REASONABLE.to_string()],
+        vec!["".to_string()],
     );
     let solver = FakeSolver {
         outcome: SolverOutcome::Sat,
