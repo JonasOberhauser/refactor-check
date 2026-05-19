@@ -3,13 +3,11 @@ use tracing::{debug, warn};
 
 use crate::consts::{JUDGE_REASONABLE, MAX_JUDGE_ATTEMPTS};
 use crate::llm;
-use crate::llm::LlmConfig;
 use crate::provider::{LlmProvider, LlmRole};
 use crate::smt::SolverResult;
 use crate::states::JudgeVerdict;
 
 pub async fn execute(
-    _config: &LlmConfig,
     input_content: &str,
     formula: &str,
     solver_result: &SolverResult,
@@ -66,7 +64,7 @@ pub async fn execute(
             return Ok(JudgeVerdict::Reasonable);
         }
 
-        let explanation = if upper.len() > 4 && &upper[..5] == "RETRY" {
+        let explanation = if upper.len() > 4 && upper[..5].starts_with("RETRY") {
             trimmed[5..].trim().to_string()
         } else {
             trimmed.to_string()

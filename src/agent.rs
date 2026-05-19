@@ -1,25 +1,25 @@
 use std::fmt::Write;
 
-use crate::llm::{Message, system_message, user_message};
+use crate::llm::{LlmConfig, Message, system_message, user_message};
 use crate::smt::SolverOutcome;
 use crate::states::{OpenItem, VerifiedPiece};
 
 pub use crate::consts::*;
 pub use crate::smt::DEFAULT_SOLVER_TIMEOUT_SECS;
-pub use crate::states::AgentConfig;
+
+pub struct AgentConfig {
+    pub llm_config: LlmConfig,
+    pub solver_path: String,
+    pub solver_args: Vec<String>,
+    pub solver_timeout_secs: u64,
+}
 
 pub async fn run_with_providers(
     input_content: &str,
     llm: &dyn crate::provider::LlmProvider,
     solver: &dyn crate::provider::SolverProvider,
 ) -> anyhow::Result<crate::provider::AgentResult> {
-    let config = AgentConfig {
-        llm_config: Default::default(),
-        solver_path: "z3".to_string(),
-        solver_args: vec!["-in".to_string()],
-        solver_timeout_secs: DEFAULT_SOLVER_TIMEOUT_SECS,
-    };
-    crate::machine::run(input_content, config, llm, solver).await
+    crate::machine::run(input_content, llm, solver).await
 }
 
 pub async fn run(input_file: &str, config: AgentConfig) -> anyhow::Result<()> {
@@ -33,8 +33,11 @@ pub async fn run(input_file: &str, config: AgentConfig) -> anyhow::Result<()> {
         std::time::Duration::from_secs(config.solver_timeout_secs),
     );
 
-    let result = crate::machine::run(&input_content, config.clone(), &llm, &solver).await?;
-    println!("=== Overall Equivalent ===\n{}\n", result.overall_equivalent);
+    let result = crate::machine::run(&input_content, &llm, &solver).await?;
+    println!(
+        "=== Overall Equivalent ===\n{}\n",
+        result.overall_equivalent
+    );
     println!(
         "=== Verified Formulas ===\n{}/{} reasonable (SAT: {}, UNSAT: {}, UNKNOWN: {})\n",
         result.formulas.len(),
@@ -63,10 +66,6 @@ pub enum GenerationContext<'a> {
         verified: &'a [VerifiedPiece],
         open: &'a [OpenItem],
     },
-    LocalRetry {
-        verified: &'a [VerifiedPiece],
-        target: &'a OpenItem,
-    },
 }
 
 pub fn build_generation_messages(
@@ -94,8 +93,9 @@ pub fn build_generation_messages(
     match ctx {
         GenerationContext::Global { verified, open } => {
             if !verified.is_empty() {
-                content
-                    .push_str("Pieces that have already been verified — you do NOT need to recheck these:\n\n");
+                content.push_str(
+                    "Pieces that have already been verified — you do NOT need to recheck these:\n\n",
+                );
                 for (i, piece) in verified.iter().enumerate() {
                     let _ = write!(
                         content,
@@ -142,45 +142,6 @@ pub fn build_generation_messages(
                     "Please generate new or improved formulas for the unverified pieces above. You can also add new pieces if you think some behavior has not been checked yet.\n",
                 );
             }
-        }
-        GenerationContext::LocalRetry { verified, target } => {
-            if !verified.is_empty() {
-                content
-                    .push_str("Pieces that have already been verified (for context only):\n\n");
-                for (i, piece) in verified.iter().enumerate() {
-                    let _ = write!(
-                        content,
-                        "Piece {} ({}):\n{piece}\n",
-                        i + 1,
-                        match &piece.outcome {
-                            SolverOutcome::Sat => "SAT — NOT EQUIVALENT",
-                            SolverOutcome::Unsat => "UNSAT — equivalent",
-                            SolverOutcome::Unknown => "UNKNOWN — inconclusive",
-                            SolverOutcome::Error(_) => unreachable!(),
-                        },
-                        piece = piece.formula,
-                    );
-                }
-                content.push('\n');
-            }
-
-            let _ = write!(
-                content,
-                "Piece that needs improvement:\nFormula:\n{}\nIssue: {}\n",
-                target.formula,
-                target.reason,
-            );
-            if !target.solver_stdout.is_empty() {
-                let _ = write!(content, "Solver output:\n{}\n", target.solver_stdout);
-            }
-            if !target.solver_stderr.is_empty() {
-                let _ = write!(content, "Standard error:\n{}\n", target.solver_stderr);
-            }
-
-            content.push_str(
-                "Please generate ONE improved SMT-LIB2 formula for the piece above. \
-                 Put it in a single ```smt2 code block.\n",
-            );
         }
     }
 

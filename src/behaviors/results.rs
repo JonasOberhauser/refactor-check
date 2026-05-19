@@ -53,10 +53,9 @@ async fn run_branch(
     let mut current = FormulaBranch {
         input_content: Arc::clone(&branch.input_content),
         verified: branch.verified.clone(),
-        region: branch.region.clone(),
+        formula_id: branch.formula_id.clone(),
         state: branch.state.clone(),
         retry_count: branch.retry_count,
-        config: branch.config.clone(),
     };
 
     loop {
@@ -84,7 +83,6 @@ async fn run_branch(
                 solver_result,
             } => {
                 let verdict = child_judge::execute(
-                    &current.config.llm_config,
                     &current.input_content,
                     formula,
                     solver_result,
@@ -128,13 +126,9 @@ async fn run_branch(
                 solver_stdout,
                 solver_stderr,
             } => {
-                let formula_name = match &current.region {
-                    Region::Formula(f) => f.as_str(),
-                    Region::Global => "",
-                };
                 let response = generate_retry_formula(
                     &current.input_content,
-                    formula_name,
+                    &current.formula_id,
                     feedback.as_deref().unwrap_or(""),
                     solver_stdout,
                     solver_stderr,
@@ -144,7 +138,7 @@ async fn run_branch(
                 let formulas = extract_all_formulas(&response);
                 if formulas.is_empty() {
                     return Ok(vec![ChildDone::Open(OpenItem {
-                        formula: formula_name.to_string(),
+                        formula: current.formula_id.clone(),
                         reason: "Branch generation produced no formula".to_string(),
                         solver_stdout: solver_stdout.clone(),
                         solver_stderr: solver_stderr.clone(),
@@ -163,10 +157,9 @@ async fn run_branch(
                         .map(|f| FormulaBranch {
                             input_content: Arc::clone(&current.input_content),
                             verified: current.verified.clone(),
-                            region: Region::Formula(f.clone()),
+                            formula_id: f.clone(),
                             state: BranchState::WaitForSolver { formula: f },
                             retry_count: current.retry_count,
-                            config: current.config.clone(),
                         })
                         .collect();
 
@@ -182,7 +175,7 @@ async fn run_branch(
                     }
                     if all_done.is_empty() {
                         all_done.push(ChildDone::Open(OpenItem {
-                            formula: formula_name.to_string(),
+                            formula: current.formula_id.clone(),
                             reason: "All sub-branches exhausted".to_string(),
                             solver_stdout: solver_stdout.clone(),
                             solver_stderr: solver_stderr.clone(),
@@ -220,7 +213,9 @@ async fn generate_retry_formula(
     while extract_all_formulas(&response).is_empty() {
         insist_attempts += 1;
         if insist_attempts > MAX_INSIST_ATTEMPTS {
-            anyhow::bail!("Branch failed to produce valid formula after {MAX_INSIST_ATTEMPTS} insist attempts");
+            anyhow::bail!(
+                "Branch failed to produce valid formula after {MAX_INSIST_ATTEMPTS} insist attempts"
+            );
         }
         response = llm
             .chat(
