@@ -23,6 +23,16 @@ pub struct SolverResult {
     pub stderr: String,
 }
 
+impl Clone for SolverResult {
+    fn clone(&self) -> Self {
+        Self {
+            outcome: self.outcome.clone(),
+            stdout: self.stdout.clone(),
+            stderr: self.stderr.clone(),
+        }
+    }
+}
+
 pub fn extract_smt_formula(response: &str) -> Option<String> {
     trace!("extracting SMT formula from LLM response");
     let formulas = collect_smt_formulas(response);

@@ -135,26 +135,29 @@ async fn test_solver_error_in_batch_then_partial_result() {
 }
 
 #[test_log::test(tokio::test)]
-async fn test_judge_retry_in_batch_then_partial_result() {
-    // A RETRY verdict moves the formula to open items, where it persists until
-    // explicitly replaced. With fixed LLM responses the agent never generates
-    // a targeted replacement, so it reaches MAX_ITERATIONS with a partial result.
+async fn test_judge_retry_in_branch_then_verified() {
+    // Formula 1: judge RETRY → branch retries → Fixer generates → judge REASONABLE → verified
+    // Formula 2: judge REASONABLE → verified
     let formalizer: Vec<String> = vec![two_formula_response()];
-    let fixer: Vec<String> = (0..29).map(unique_formula_response).collect();
-    // 2 judge calls in iteration 1 (RETRY + REASONABLE) + 29 more in iterations 2..30
-    let judge: Vec<String> = std::iter::once("The formula does not capture the loop invariant properly".to_string())
-        .chain((0..30).map(|_| JUDGE_REASONABLE.to_string()))
-        .collect();
+    let fixer: Vec<String> = vec![unique_formula_response(0)];
+    let judge: Vec<String> = vec![
+        "The formula does not capture the loop invariant properly".to_string(),
+        JUDGE_REASONABLE.to_string(),
+        JUDGE_REASONABLE.to_string(),
+    ];
     let llm = SequenceLlm::new(formalizer, fixer, judge);
     let solver = FakeSolver { outcome: SolverOutcome::Unsat };
 
     let result = run_with_providers("refactoring desc", &llm, &solver)
         .await
-        .expect("agent should return partial result after max iterations");
+        .expect("agent should succeed with branch retry");
 
-    assert_eq!(result.open_count, 1);
-    assert_eq!(result.formulas.len(), 30);
-    assert_eq!(result.reasonable_unsat, 30);
+    assert_eq!(result.formulas.len(), 2);
+    assert_eq!(result.reasonable_unsat, 2);
+    assert_eq!(result.open_count, 0);
+    assert!(result.overall_equivalent);
+    assert_eq!(llm.fixer_remaining(), 0);
+    assert_eq!(llm.judge_remaining(), 0);
 }
 
 #[test_log::test(tokio::test)]
