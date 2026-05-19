@@ -2,8 +2,7 @@ use anyhow::Result;
 use std::sync::Arc;
 
 use crate::behaviors;
-use crate::consts::MAX_GLOBAL_CYCLES;
-use crate::consts::MAX_INSIST_ATTEMPTS;
+use crate::consts::{MAX_GLOBAL_CYCLES, MAX_INSIST_ATTEMPTS};
 use crate::provider::{AgentResult, LlmProvider, SolverProvider};
 use crate::states::*;
 use crate::transitions::build_result;
@@ -14,18 +13,17 @@ pub async fn run(
     solver: &dyn SolverProvider,
 ) -> Result<AgentResult> {
     let input_arc = Arc::new(input_content.to_string());
-    let mut state = AlgorithmState::Idle(Idle);
+    let mut state = AlgorithmState::Idle;
 
     loop {
         state = match state {
-            AlgorithmState::Idle(_) => AlgorithmState::WaitForGeneration(WaitForGeneration {
+            AlgorithmState::Idle => AlgorithmState::WaitForGeneration(WaitForGeneration {
                 input_content: Arc::clone(&input_arc),
                 verified: Vec::new(),
                 open: Vec::new(),
                 iteration: 0,
-                insist_pending: false,
+                insist: InsistState::Idle,
                 insist_attempt: 0,
-                last_response: None,
             }),
             AlgorithmState::WaitForGeneration(s) => {
                 if s.insist_attempt > MAX_INSIST_ATTEMPTS {
@@ -42,13 +40,15 @@ pub async fn run(
                 match s.transition(done) {
                     TransitionFromResults::Generation(next) => {
                         if next.iteration >= MAX_GLOBAL_CYCLES {
-                            AlgorithmState::Done(build_result(
+                            let counts =
+                                OutcomeCounts::from_verified(&next.verified);
+                            return Ok(build_result(
                                 &next.verified,
                                 next.open.len(),
-                            ))
-                        } else {
-                            AlgorithmState::WaitForGeneration(next)
+                                &counts,
+                            ));
                         }
+                        AlgorithmState::WaitForGeneration(next)
                     }
                     TransitionFromResults::Explain(next) => AlgorithmState::WaitForExplanation(next),
                     TransitionFromResults::Done(result) => return Ok(result),

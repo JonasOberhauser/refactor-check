@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::provider::{LlmProvider, LlmRole};
-use crate::states::WaitForGeneration;
+use crate::states::{InsistState, WaitForGeneration};
 
 pub fn role_for_iteration(iteration: usize) -> LlmRole {
     if iteration == 0 {
@@ -17,11 +17,7 @@ pub async fn execute(
 ) -> Result<String> {
     let role = role_for_iteration(state.iteration);
 
-    if state.insist_pending {
-        let prev = state
-            .last_response
-            .as_deref()
-            .unwrap_or("(no previous response)");
+    if let InsistState::Insisting { ref last_response } = &state.insist {
         let messages = vec![
             crate::llm::system_message(
                 "You MUST output at least ONE SMT-LIB2 formula. \
@@ -30,7 +26,7 @@ pub async fn execute(
             ),
             crate::llm::user_message(&format!(
                 "Your previous response did not contain any valid SMT formula. \
-                 Here was your previous response:\n\n{prev}\n\n\
+                 Here was your previous response:\n\n{last_response}\n\n\
                  Please try again. Output at least ONE valid SMT-LIB2 formula in a ```smt2 code block.",
             )),
         ];
@@ -39,10 +35,8 @@ pub async fn execute(
 
     let messages = crate::agent::build_generation_messages(
         &state.input_content,
-        &crate::agent::GenerationContext::Global {
-            verified: &state.verified,
-            open: &state.open,
-        },
+        &state.verified,
+        &state.open,
     );
     llm.chat(role, messages).await
 }

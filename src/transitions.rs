@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
-use crate::consts::JUDGE_REASONABLE;
+use crate::consts::{JUDGE_REASONABLE, MAX_BRANCH_RETRIES, MAX_INSIST_ATTEMPTS};
 use crate::provider::{AgentResult, FormulaResult};
-use crate::smt::{SolverOutcome, extract_all_formulas};
+use crate::smt::{SolverOutcome, SolverResult, extract_all_formulas};
 use crate::states::*;
+
+// ===== Global transitions =====
 
 impl WaitForGeneration {
     #[must_use]
@@ -15,9 +17,10 @@ impl WaitForGeneration {
                 verified: self.verified,
                 open: self.open,
                 iteration: self.iteration,
-                insist_pending: true,
+                insist: InsistState::Insisting {
+                    last_response: llm_response,
+                },
                 insist_attempt: self.insist_attempt + 1,
-                last_response: Some(llm_response),
             });
         }
 
@@ -27,7 +30,7 @@ impl WaitForGeneration {
                 input_content: Arc::clone(&self.input_content),
                 verified: self.verified.clone(),
                 formula_id: formula.clone(),
-                state: BranchState::WaitForSolver { formula },
+                phase: BranchPhase::WaitForSolver { formula },
                 retry_count: 0,
             })
             .collect();
@@ -55,16 +58,16 @@ impl WaitForResults {
             }
         }
 
-        let overall = build_result(&verified, open.len());
+        let counts = OutcomeCounts::from_verified(&verified);
 
         if open.is_empty() {
-            if overall.reasonable_sat > 0 || overall.reasonable_unknown > 0 {
+            if counts.needs_explanation() {
                 return TransitionFromResults::Explain(WaitForExplanation {
                     input_content: self.input_content,
-                    result: overall,
+                    result: build_result(&verified, open.len(), &counts),
                 });
             }
-            return TransitionFromResults::Done(overall);
+            return TransitionFromResults::Done(build_result(&verified, 0, &counts));
         }
 
         TransitionFromResults::Generation(WaitForGeneration {
@@ -72,9 +75,8 @@ impl WaitForResults {
             verified,
             open,
             iteration: self.iteration + 1,
-            insist_pending: false,
+            insist: InsistState::Idle,
             insist_attempt: 0,
-            last_response: None,
         })
     }
 }
@@ -89,21 +91,65 @@ impl WaitForExplanation {
     }
 }
 
-pub fn build_result(verified: &[VerifiedPiece], open_count: usize) -> AgentResult {
-    let reasonable_sat = verified
-        .iter()
-        .filter(|v| matches!(v.outcome, SolverOutcome::Sat))
-        .count();
-    let reasonable_unsat = verified
-        .iter()
-        .filter(|v| matches!(v.outcome, SolverOutcome::Unsat))
-        .count();
-    let reasonable_unknown = verified
-        .iter()
-        .filter(|v| matches!(v.outcome, SolverOutcome::Unknown))
-        .count();
-    let overall_equivalent = open_count == 0 && reasonable_sat == 0 && reasonable_unknown == 0;
+// ===== Branch transitions =====
 
+pub fn transition_need_formula(formulas: Vec<String>, insist_attempt: usize) -> BranchFromNeedFormula {
+    if formulas.is_empty() {
+        if insist_attempt >= MAX_INSIST_ATTEMPTS {
+            return BranchFromNeedFormula::Exhausted(
+                format!("failed to produce formula after {MAX_INSIST_ATTEMPTS} insist attempts"),
+            );
+        }
+        return BranchFromNeedFormula::Insist;
+    }
+    if formulas.len() == 1 {
+        return BranchFromNeedFormula::Proceed(formulas.into_iter().next().unwrap());
+    }
+    BranchFromNeedFormula::FanOut(formulas)
+}
+
+pub fn transition_solver(formula: String, result: SolverResult) -> BranchFromSolver {
+    if matches!(result.outcome, SolverOutcome::Error(_)) {
+        BranchFromSolver::Error(formula, result)
+    } else {
+        BranchFromSolver::Judge(formula, result)
+    }
+}
+
+pub fn transition_judge(
+    formula: String,
+    solver_result: SolverResult,
+    verdict: JudgeVerdict,
+    retry_count: usize,
+) -> BranchFromJudge {
+    match verdict {
+        JudgeVerdict::Reasonable => BranchFromJudge::Verified(VerifiedPiece {
+            formula,
+            outcome: solver_result.outcome,
+        }),
+        JudgeVerdict::Retry(feedback) => {
+            if retry_count + 1 >= MAX_BRANCH_RETRIES {
+                BranchFromJudge::Exhausted {
+                    formula,
+                    feedback,
+                    solver_stdout: solver_result.stdout,
+                    solver_stderr: solver_result.stderr,
+                }
+            } else {
+                BranchFromJudge::Retry {
+                    formula,
+                    feedback,
+                    solver_stdout: solver_result.stdout,
+                    solver_stderr: solver_result.stderr,
+                }
+            }
+        }
+    }
+}
+
+// ===== Helpers =====
+
+pub fn build_result(verified: &[VerifiedPiece], open_count: usize, counts: &OutcomeCounts) -> AgentResult {
     AgentResult {
         formulas: verified
             .iter()
@@ -114,10 +160,10 @@ pub fn build_result(verified: &[VerifiedPiece], open_count: usize) -> AgentResul
                 explanation: None,
             })
             .collect(),
-        overall_equivalent,
+        overall_equivalent: counts.overall_equivalent(open_count),
         open_count,
-        reasonable_sat,
-        reasonable_unsat,
-        reasonable_unknown,
+        reasonable_sat: counts.sat,
+        reasonable_unsat: counts.unsat,
+        reasonable_unknown: counts.unknown,
     }
 }

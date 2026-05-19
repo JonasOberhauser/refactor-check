@@ -4,23 +4,25 @@ use crate::provider::AgentResult;
 use crate::smt::{SolverOutcome, SolverResult};
 
 pub enum AlgorithmState {
-    Idle(Idle),
+    Idle,
     WaitForGeneration(WaitForGeneration),
     WaitForResults(WaitForResults),
     WaitForExplanation(WaitForExplanation),
     Done(AgentResult),
 }
 
-pub struct Idle;
+pub enum InsistState {
+    Idle,
+    Insisting { last_response: String },
+}
 
 pub struct WaitForGeneration {
     pub input_content: Arc<String>,
     pub verified: Vec<VerifiedPiece>,
     pub open: Vec<OpenItem>,
     pub iteration: usize,
-    pub insist_pending: bool,
+    pub insist: InsistState,
     pub insist_attempt: usize,
-    pub last_response: Option<String>,
 }
 
 pub struct WaitForResults {
@@ -75,16 +77,19 @@ pub struct FormulaBranch {
     pub input_content: Arc<String>,
     pub verified: Vec<VerifiedPiece>,
     pub formula_id: String,
-    pub state: BranchState,
+    pub phase: BranchPhase,
     pub retry_count: usize,
 }
 
 #[derive(Clone)]
-pub enum BranchState {
+pub enum BranchPhase {
     NeedFormula {
         feedback: Option<String>,
         solver_stdout: String,
         solver_stderr: String,
+        insist_pending: bool,
+        insist_attempt: usize,
+        last_response: Option<String>,
     },
     WaitForSolver {
         formula: String,
@@ -95,7 +100,65 @@ pub enum BranchState {
     },
 }
 
+pub enum BranchFromNeedFormula {
+    Proceed(String),
+    Insist,
+    FanOut(Vec<String>),
+    Exhausted(String),
+}
+
+pub enum BranchFromSolver {
+    Judge(String, SolverResult),
+    Error(String, SolverResult),
+}
+
+pub enum BranchFromJudge {
+    Verified(VerifiedPiece),
+    Retry {
+        formula: String,
+        feedback: String,
+        solver_stdout: String,
+        solver_stderr: String,
+    },
+    Exhausted {
+        formula: String,
+        feedback: String,
+        solver_stdout: String,
+        solver_stderr: String,
+    },
+}
+
 pub enum ChildDone {
     Verified(VerifiedPiece),
     Open(OpenItem),
+}
+
+#[derive(Default)]
+pub struct OutcomeCounts {
+    pub sat: usize,
+    pub unsat: usize,
+    pub unknown: usize,
+}
+
+impl OutcomeCounts {
+    pub fn from_verified(verified: &[VerifiedPiece]) -> Self {
+        let mut c = Self::default();
+        for v in verified {
+            match v.outcome {
+                SolverOutcome::Sat => c.sat += 1,
+                SolverOutcome::Unsat => c.unsat += 1,
+                SolverOutcome::Unknown => c.unknown += 1,
+                _ => {}
+            }
+        }
+        c
+    }
+
+    pub fn needs_explanation(&self) -> bool {
+        self.sat > 0 || self.unknown > 0
+    }
+
+    pub fn overall_equivalent(&self, open_count: usize) -> bool {
+        open_count == 0 && self.sat == 0 && self.unknown == 0
+    }
 }

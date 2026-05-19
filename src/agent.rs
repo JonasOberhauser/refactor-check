@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::fmt::Write;
 
 use crate::llm::{LlmConfig, Message, system_message, user_message};
@@ -59,18 +60,10 @@ pub async fn run(input_file: &str, config: AgentConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-use anyhow::Context;
-
-pub enum GenerationContext<'a> {
-    Global {
-        verified: &'a [VerifiedPiece],
-        open: &'a [OpenItem],
-    },
-}
-
 pub fn build_generation_messages(
     input_content: &str,
-    ctx: &GenerationContext,
+    verified: &[VerifiedPiece],
+    open: &[OpenItem],
 ) -> Vec<Message> {
     let mut messages = Vec::new();
 
@@ -90,59 +83,58 @@ pub fn build_generation_messages(
 
     let mut content = format!("Here is the refactoring description:\n\n{input_content}\n\n");
 
-    match ctx {
-        GenerationContext::Global { verified, open } => {
-            if !verified.is_empty() {
-                content.push_str(
-                    "Pieces that have already been verified — you do NOT need to recheck these:\n\n",
-                );
-                for (i, piece) in verified.iter().enumerate() {
-                    let _ = write!(
-                        content,
-                        "Piece {} ({}):\n{piece}\n",
-                        i + 1,
-                        match &piece.outcome {
-                            SolverOutcome::Sat => "SAT — NOT EQUIVALENT",
-                            SolverOutcome::Unsat => "UNSAT — equivalent",
-                            SolverOutcome::Unknown => "UNKNOWN — inconclusive",
-                            SolverOutcome::Error(_) => unreachable!(),
-                        },
-                        piece = piece.formula,
-                    );
-                }
-                content.push('\n');
-            }
-
-            if !open.is_empty() {
-                content.push_str("Pieces that still need work:\n\n");
-                for (i, item) in open.iter().enumerate() {
-                    let _ = write!(
-                        content,
-                        "Open piece {}:\nFormula:\n{}\nIssue: {}\n",
-                        i + 1,
-                        item.formula,
-                        item.reason,
-                    );
-                    if !item.solver_stdout.is_empty() {
-                        let _ = write!(content, "Solver output:\n{}\n", item.solver_stdout);
-                    }
-                    if !item.solver_stderr.is_empty() {
-                        let _ = write!(content, "Standard error:\n{}\n", item.solver_stderr);
-                    }
-                    content.push('\n');
-                }
-            }
-
-            if verified.is_empty() && open.is_empty() {
-                content.push_str(
-                    "Generate SMT-LIB2 formula(s) checking equivalence. Start with one formula covering the whole refactoring. If the solver times out, split the code into smaller analogous pieces (e.g., loop bodies, helper functions, conditionals) and generate one formula per piece.\n",
-                );
-            } else {
-                content.push_str(
-                    "Please generate new or improved formulas for the unverified pieces above. You can also add new pieces if you think some behavior has not been checked yet.\n",
-                );
-            }
+    if !verified.is_empty() {
+        content.push_str(
+            "Pieces that have already been verified — you do NOT need to recheck these:\n\n",
+        );
+        for (i, piece) in verified.iter().enumerate() {
+            let _ = write!(
+                content,
+                "Piece {} ({}):\n{piece}\n",
+                i + 1,
+                match &piece.outcome {
+                    SolverOutcome::Sat => "SAT — NOT EQUIVALENT",
+                    SolverOutcome::Unsat => "UNSAT — equivalent",
+                    SolverOutcome::Unknown => "UNKNOWN — inconclusive",
+                    SolverOutcome::Error(_) => unreachable!(),
+                },
+                piece = piece.formula,
+            );
         }
+        content.push('\n');
+    }
+
+    if !open.is_empty() {
+        content.push_str("Pieces that still need work:\n\n");
+        for (i, item) in open.iter().enumerate() {
+            let _ = write!(
+                content,
+                "Open piece {}:\nFormula:\n{}\nIssue: {}\n",
+                i + 1,
+                item.formula,
+                item.reason,
+            );
+            if !item.solver_stdout.is_empty() {
+                let _ = write!(content, "Solver output:\n{}\n", item.solver_stdout);
+            }
+            if !item.solver_stderr.is_empty() {
+                let _ = write!(content, "Standard error:\n{}\n", item.solver_stderr);
+            }
+            content.push('\n');
+        }
+    }
+
+    if verified.is_empty() && open.is_empty() {
+        content.push_str(
+            "Generate SMT-LIB2 formula(s) checking equivalence. Start with one formula covering the whole refactoring. \
+             If the solver times out, split the code into smaller analogous pieces (e.g., loop bodies, helper functions, \
+             conditionals) and generate one formula per piece.\n",
+        );
+    } else {
+        content.push_str(
+            "Please generate new or improved formulas for the unverified pieces above. \
+             You can also add new pieces if you think some behavior has not been checked yet.\n",
+        );
     }
 
     messages.push(user_message(&content));

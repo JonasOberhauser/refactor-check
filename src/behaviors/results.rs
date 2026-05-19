@@ -2,26 +2,21 @@ use anyhow::Result;
 use std::sync::Arc;
 use futures::future;
 
-use crate::consts::{MAX_BRANCH_RETRIES, MAX_INSIST_ATTEMPTS};
+use crate::llm;
 use crate::provider::{LlmProvider, LlmRole, SolverProvider};
-use crate::smt::{SolverOutcome, extract_all_formulas};
+use crate::smt::extract_all_formulas;
 use crate::states::*;
+use crate::transitions;
 
 use super::child_judge;
-use super::child_solver;
 
-fn build_branch_retry_messages(
+fn build_retry_messages(
     input_content: &str,
-    formula: &str,
+    formula_id: &str,
     feedback: &str,
     solver_stdout: &str,
     solver_stderr: &str,
 ) -> Vec<crate::llm::Message> {
-    use crate::llm;
-
-    let system = "You are an expert in formal verification. Fix the following SMT formula so it correctly checks equivalence. \
-                  Do NOT output any explanation. Output ONLY the fixed formula in a single ```smt2 code block.";
-
     let prompt = format!(
         "Original refactoring:\n\n{}\n\n\
          The formula that failed:\n\n{}\n\n\
@@ -29,10 +24,39 @@ fn build_branch_retry_messages(
          Solver output: {}\n\n\
          Solver stderr: {}\n\n\
          Please provide ONE corrected SMT-LIB2 formula in a ```smt2 code block.",
-        input_content, formula, feedback, solver_stdout, solver_stderr,
+        input_content, formula_id, feedback, solver_stdout, solver_stderr,
     );
 
-    vec![llm::system_message(system), llm::user_message(&prompt)]
+    vec![
+        llm::system_message(
+            "You are an expert in formal verification. Fix the following SMT formula so \
+             it correctly checks equivalence. Do NOT output any explanation. \
+             Output ONLY the fixed formula in a single ```smt2 code block.",
+        ),
+        llm::user_message(&prompt),
+    ]
+}
+
+fn build_retry_insist_messages(
+    input_content: &str,
+    formula_id: &str,
+    feedback: &str,
+    last_response: &str,
+) -> Vec<crate::llm::Message> {
+    vec![
+        llm::system_message(
+            "You MUST output exactly one SMT-LIB2 formula in a single ```smt2 code block. \
+             Do NOT include any explanations.",
+        ),
+        llm::user_message(&format!(
+            "Your previous response contained no valid SMT formula.\n\
+             Here it was:\n\n{last_response}\n\n\
+             Original refactoring:\n\n{input_content}\n\n\
+             Formula to fix:\n\n{formula_id}\n\n\
+             Feedback: {feedback}\n\n\
+             Try again. ONE complete formula in a ```smt2 code block.",
+        )),
+    ]
 }
 
 pub async fn execute_all(
@@ -40,7 +64,10 @@ pub async fn execute_all(
     llm: &dyn LlmProvider,
     solver: &dyn SolverProvider,
 ) -> Result<Vec<ChildDone>> {
-    let futures = state.branches.iter().map(|branch| run_branch(branch, llm, solver));
+    let futures = state
+        .branches
+        .iter()
+        .map(|branch| run_branch(branch, llm, solver));
     let results: Vec<Vec<ChildDone>> = future::try_join_all(futures).await?;
     Ok(results.into_iter().flatten().collect())
 }
@@ -50,192 +77,156 @@ async fn run_branch(
     llm: &dyn LlmProvider,
     solver: &dyn SolverProvider,
 ) -> Result<Vec<ChildDone>> {
-    let mut current = FormulaBranch {
-        input_content: Arc::clone(&branch.input_content),
-        verified: branch.verified.clone(),
-        formula_id: branch.formula_id.clone(),
-        state: branch.state.clone(),
-        retry_count: branch.retry_count,
-    };
+    let input = Arc::clone(&branch.input_content);
+    let verified = branch.verified.clone();
+    let formula_id = branch.formula_id.clone();
+    let retry_count = branch.retry_count;
+    let mut phase = branch.phase.clone();
 
     loop {
-        match &current.state {
-            BranchState::WaitForSolver { formula } => {
-                let result = child_solver::execute(formula, solver).await?;
-                if matches!(result.outcome, SolverOutcome::Error(_)) {
-                    return Ok(vec![ChildDone::Open(OpenItem {
-                        formula: formula.clone(),
-                        reason: format!("Solver error: {}", result.stdout),
-                        solver_stdout: result.stdout,
-                        solver_stderr: result.stderr,
-                    })]);
+        match phase {
+            BranchPhase::WaitForSolver { formula } => {
+                let result = solver.run(&formula).await?;
+                match transitions::transition_solver(formula, result) {
+                    BranchFromSolver::Judge(f, r) => {
+                        phase = BranchPhase::WaitForJudge {
+                            formula: f,
+                            solver_result: r,
+                        };
+                    }
+                    BranchFromSolver::Error(f, r) => {
+                        return Ok(vec![ChildDone::Open(OpenItem {
+                            formula: f,
+                            reason: format!("Solver error: {}", r.stdout),
+                            solver_stdout: r.stdout,
+                            solver_stderr: r.stderr,
+                        })]);
+                    }
                 }
-                current = FormulaBranch {
-                    state: BranchState::WaitForJudge {
-                        formula: formula.clone(),
-                        solver_result: result,
-                    },
-                    ..current
-                };
             }
-            BranchState::WaitForJudge {
+            BranchPhase::WaitForJudge {
                 formula,
                 solver_result,
             } => {
-                let verdict = child_judge::execute(
-                    &current.input_content,
+                let verdict =
+                    child_judge::execute(&input, &formula, &solver_result, llm).await?;
+                match transitions::transition_judge(
                     formula,
                     solver_result,
-                    llm,
-                )
-                .await?;
-                match verdict {
-                    JudgeVerdict::Reasonable => {
-                        return Ok(vec![ChildDone::Verified(VerifiedPiece {
-                            formula: formula.clone(),
-                            outcome: solver_result.outcome.clone(),
-                        })]);
+                    verdict,
+                    retry_count,
+                ) {
+                    BranchFromJudge::Verified(piece) => {
+                        return Ok(vec![ChildDone::Verified(piece)]);
                     }
-                    JudgeVerdict::Retry(feedback) => {
-                        let new_retry = current.retry_count + 1;
-                        if new_retry >= MAX_BRANCH_RETRIES {
-                            return Ok(vec![ChildDone::Open(OpenItem {
-                                formula: formula.clone(),
-                                reason: format!(
-                                    "Branch retry exhausted ({}): {}",
-                                    MAX_BRANCH_RETRIES, feedback
-                                ),
-                                solver_stdout: solver_result.stdout.clone(),
-                                solver_stderr: solver_result.stderr.clone(),
-                            })]);
-                        }
-                        current = FormulaBranch {
-                            state: BranchState::NeedFormula {
-                                feedback: Some(feedback),
-                                solver_stdout: solver_result.stdout.clone(),
-                                solver_stderr: solver_result.stderr.clone(),
-                            },
-                            retry_count: new_retry,
-                            ..current
+                    BranchFromJudge::Retry {
+                        formula: _,
+                        feedback,
+                        solver_stdout,
+                        solver_stderr,
+                    } => {
+                        phase = BranchPhase::NeedFormula {
+                            feedback: Some(feedback),
+                            solver_stdout,
+                            solver_stderr,
+                            insist_pending: false,
+                            insist_attempt: 0,
+                            last_response: None,
                         };
                     }
+                    BranchFromJudge::Exhausted {
+                        formula,
+                        feedback,
+                        solver_stdout,
+                        solver_stderr,
+                    } => {
+                        return Ok(vec![ChildDone::Open(OpenItem {
+                            formula,
+                            reason: format!("Branch retry exhausted: {feedback}"),
+                            solver_stdout,
+                            solver_stderr,
+                        })]);
+                    }
                 }
             }
-            BranchState::NeedFormula {
-                feedback,
-                solver_stdout,
-                solver_stderr,
+            BranchPhase::NeedFormula {
+                ref feedback,
+                ref solver_stdout,
+                ref solver_stderr,
+                insist_pending,
+                insist_attempt,
+                last_response,
             } => {
-                let response = generate_retry_formula(
-                    &current.input_content,
-                    &current.formula_id,
-                    feedback.as_deref().unwrap_or(""),
-                    solver_stdout,
-                    solver_stderr,
-                    llm,
-                )
-                .await?;
-                let formulas = extract_all_formulas(&response);
-                if formulas.is_empty() {
-                    return Ok(vec![ChildDone::Open(OpenItem {
-                        formula: current.formula_id.clone(),
-                        reason: "Branch generation produced no formula".to_string(),
-                        solver_stdout: solver_stdout.clone(),
-                        solver_stderr: solver_stderr.clone(),
-                    })]);
-                }
-                if formulas.len() == 1 {
-                    current = FormulaBranch {
-                        state: BranchState::WaitForSolver {
-                            formula: formulas.into_iter().next().unwrap(),
-                        },
-                        ..current
-                    };
+                let fb = feedback.as_deref().unwrap_or("");
+                let role = LlmRole::Fixer;
+
+                let response = if insist_pending {
+                    let prev = last_response.as_deref().unwrap_or("");
+                    llm.chat(
+                        role,
+                        build_retry_insist_messages(&input, &formula_id, fb, prev),
+                    )
+                    .await?
                 } else {
-                    let sub_branches: Vec<FormulaBranch> = formulas
-                        .into_iter()
-                        .map(|f| FormulaBranch {
-                            input_content: Arc::clone(&current.input_content),
-                            verified: current.verified.clone(),
-                            formula_id: f.clone(),
-                            state: BranchState::WaitForSolver { formula: f },
-                            retry_count: current.retry_count,
-                        })
-                        .collect();
+                    llm.chat(
+                        role,
+                        build_retry_messages(&input, &formula_id, fb, solver_stdout, solver_stderr),
+                    )
+                    .await?
+                };
 
-                    let sub_futures = sub_branches
-                        .iter()
-                        .map(|b| run_branch(b, llm, solver));
-                    let sub_results: Vec<Vec<ChildDone>> =
-                        future::try_join_all(sub_futures).await?;
-
-                    let mut all_done = Vec::new();
-                    for chunks in sub_results {
-                        all_done.extend(chunks);
+                let formulas = extract_all_formulas(&response);
+                match transitions::transition_need_formula(formulas, insist_attempt) {
+                    BranchFromNeedFormula::Proceed(formula) => {
+                        phase = BranchPhase::WaitForSolver { formula };
                     }
-                    if all_done.is_empty() {
-                        all_done.push(ChildDone::Open(OpenItem {
-                            formula: current.formula_id.clone(),
-                            reason: "All sub-branches exhausted".to_string(),
+                    BranchFromNeedFormula::Insist => {
+                        phase = BranchPhase::NeedFormula {
+                            feedback: Some(fb.to_string()),
                             solver_stdout: solver_stdout.clone(),
                             solver_stderr: solver_stderr.clone(),
-                        }));
+                            insist_pending: true,
+                            insist_attempt: insist_attempt + 1,
+                            last_response: Some(response),
+                        };
                     }
-                    return Ok(all_done);
+                    BranchFromNeedFormula::FanOut(formulas) => {
+                        let sub = formulas.into_iter().map(|f| FormulaBranch {
+                            input_content: Arc::clone(&input),
+                            verified: verified.clone(),
+                            formula_id: f.clone(),
+                            phase: BranchPhase::WaitForSolver { formula: f },
+                            retry_count,
+                        });
+                        let subs: Vec<FormulaBranch> = sub.collect();
+                        let sub_results: Vec<Vec<ChildDone>> = future::try_join_all(
+                            subs.iter().map(|b| run_branch(b, llm, solver)),
+                        )
+                        .await?;
+                        let mut all = Vec::new();
+                        for chunks in sub_results {
+                            all.extend(chunks);
+                        }
+                        if all.is_empty() {
+                            all.push(ChildDone::Open(OpenItem {
+                                formula: formula_id,
+                                reason: "All sub-branches exhausted".to_string(),
+                                solver_stdout: solver_stdout.clone(),
+                                solver_stderr: solver_stderr.clone(),
+                            }));
+                        }
+                        return Ok(all);
+                    }
+                    BranchFromNeedFormula::Exhausted(reason) => {
+                        return Ok(vec![ChildDone::Open(OpenItem {
+                            formula: formula_id,
+                            reason,
+                            solver_stdout: solver_stdout.clone(),
+                            solver_stderr: solver_stderr.clone(),
+                        })]);
+                    }
                 }
             }
         }
     }
-}
-
-async fn generate_retry_formula(
-    input_content: &str,
-    formula: &str,
-    feedback: &str,
-    solver_stdout: &str,
-    solver_stderr: &str,
-    llm: &dyn LlmProvider,
-) -> Result<String> {
-    let mut response = llm
-        .chat(
-            LlmRole::Fixer,
-            build_branch_retry_messages(
-                input_content,
-                formula,
-                feedback,
-                solver_stdout,
-                solver_stderr,
-            ),
-        )
-        .await?;
-
-    let mut insist_attempts = 0;
-    while extract_all_formulas(&response).is_empty() {
-        insist_attempts += 1;
-        if insist_attempts > MAX_INSIST_ATTEMPTS {
-            anyhow::bail!(
-                "Branch failed to produce valid formula after {MAX_INSIST_ATTEMPTS} insist attempts"
-            );
-        }
-        response = llm
-            .chat(
-                LlmRole::Fixer,
-                vec![
-                    crate::llm::system_message(
-                        "You MUST output exactly one SMT-LIB2 formula in a single ```smt2 code block. Do NOT include any explanations.",
-                    ),
-                    crate::llm::user_message(&format!(
-                        "Your previous response contained no valid SMT formula. \
-                         Here it was:\n\n{response}\n\n\
-                         Original formula to fix:\n{}\n\n\
-                         Feedback: {}\n\n\
-                         Try again. ONE complete formula in a ```smt2 code block.",
-                        formula, feedback,
-                    )),
-                ],
-            )
-            .await?;
-    }
-
-    Ok(response)
 }

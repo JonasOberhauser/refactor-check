@@ -57,21 +57,15 @@ pub async fn execute(
         ];
 
         let response = llm.chat(LlmRole::Judge, messages).await?;
-        let trimmed = response.trim();
+        let trimmed = response.trim().to_string();
         let upper = trimmed.to_uppercase();
 
         if upper.starts_with(JUDGE_REASONABLE) {
             return Ok(JudgeVerdict::Reasonable);
         }
 
-        let explanation = if upper.len() > 4 && upper[..5].starts_with("RETRY") {
-            trimmed[5..].trim().to_string()
-        } else {
-            trimmed.to_string()
-        };
-
-        if !explanation.is_empty() {
-            return Ok(JudgeVerdict::Retry(explanation));
+        if !trimmed.is_empty() {
+            return Ok(JudgeVerdict::Retry(trimmed));
         }
 
         warn!(response = %response, "judge gave unclear answer, insisting");
