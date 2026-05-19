@@ -12,7 +12,16 @@ pub enum AlgorithmState {
 
 pub enum InsistState {
     Idle,
-    Insisting { last_response: String },
+    Insisting { last_response: String, attempt: usize },
+}
+
+impl InsistState {
+    pub fn attempt(&self) -> usize {
+        match self {
+            InsistState::Idle => 0,
+            InsistState::Insisting { attempt, .. } => *attempt,
+        }
+    }
 }
 
 pub struct WaitForGeneration {
@@ -21,7 +30,6 @@ pub struct WaitForGeneration {
     pub open: Vec<OpenItem>,
     pub iteration: usize,
     pub insist: InsistState,
-    pub insist_attempt: usize,
 }
 
 pub struct WaitForResults {

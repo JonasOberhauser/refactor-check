@@ -23,11 +23,12 @@ pub async fn run(
                 open: Vec::new(),
                 iteration: 0,
                 insist: InsistState::Idle,
-                insist_attempt: 0,
             }),
             AlgorithmState::WaitForGeneration(s) => {
-                if s.insist_attempt >= MAX_INSIST_ATTEMPTS {
-                    anyhow::bail!("failed to extract any SMT formula after {MAX_INSIST_ATTEMPTS} insist attempts");
+                if let InsistState::Insisting { attempt, .. } = &s.insist {
+                    if *attempt >= MAX_INSIST_ATTEMPTS {
+                        anyhow::bail!("failed to extract any SMT formula after {MAX_INSIST_ATTEMPTS} insist attempts");
+                    }
                 }
                 let response = behaviors::generation::execute(&s, llm).await?;
                 match s.transition(response) {

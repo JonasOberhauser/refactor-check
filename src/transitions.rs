@@ -19,8 +19,8 @@ impl WaitForGeneration {
                 iteration: self.iteration,
                 insist: InsistState::Insisting {
                     last_response: llm_response,
+                    attempt: self.insist.attempt() + 1,
                 },
-                insist_attempt: self.insist_attempt + 1,
             });
         }
 
@@ -76,7 +76,6 @@ impl WaitForResults {
             open,
             iteration: self.iteration + 1,
             insist: InsistState::Idle,
-            insist_attempt: 0,
         })
     }
 }

@@ -17,7 +17,7 @@ pub async fn execute(
 ) -> Result<String> {
     let role = role_for_iteration(state.iteration);
 
-    if let InsistState::Insisting { ref last_response } = &state.insist {
+    if let InsistState::Insisting { ref last_response, .. } = &state.insist {
         let messages = vec![
             crate::llm::system_message(
                 "You MUST output at least ONE SMT-LIB2 formula. \
