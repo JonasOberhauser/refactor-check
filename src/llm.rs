@@ -5,7 +5,7 @@ use async_openai::types::chat::{
 };
 
 pub use async_openai::types::chat::ServiceTier;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -128,6 +128,151 @@ impl ConnectionTracer {
     }
 }
 
+struct StreamHandler<'a> {
+    client: &'a async_openai::Client<async_openai::config::OpenAIConfig>,
+    label: &'a str,
+    timeout: Duration,
+    max_retries: u32,
+    service_tier: ServiceTier,
+}
+
+enum FailureAction {
+    UseContent(String),
+    Retry,
+}
+
+impl<'a> StreamHandler<'a> {
+    fn new(
+        client: &'a async_openai::Client<async_openai::config::OpenAIConfig>,
+        label: &'a str,
+        timeout: Duration,
+        max_retries: u32,
+        service_tier: ServiceTier,
+    ) -> Self {
+        Self { client, label, timeout, max_retries, service_tier }
+    }
+
+    async fn run(
+        &self,
+        model: &str,
+        request_messages: Vec<ChatCompletionRequestMessage>,
+        is_valid: &impl Fn(&str) -> bool,
+    ) -> Result<String> {
+        for attempt in 0..=self.max_retries {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+
+            let request = CreateChatCompletionRequest {
+                model: model.to_string(),
+                messages: request_messages.clone(),
+                stream: Some(true),
+                service_tier: Some(self.service_tier.clone()),
+                ..Default::default()
+            };
+
+            debug!(%self.label, attempt, "sending LLM streaming request");
+
+            let mut stream = match self.client.chat().create_stream(request).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if attempt < self.max_retries {
+                        warn!(%self.label, attempt, max_retries = self.max_retries, "LLM retry");
+                        continue;
+                    }
+                    return Err(e).context("LLM streaming request failed after all retries");
+                }
+            };
+
+            let mut content = String::new();
+            let mut got_first_chunk = false;
+            let mut finish_reason: Option<FinishReason> = None;
+            let mut tracer = ConnectionTracer::new();
+
+            loop {
+                let current_timeout = if got_first_chunk { self.timeout } else { self.timeout * 4 };
+                match tokio::time::timeout(current_timeout, stream.next()).await {
+                    Ok(Some(Ok(response))) => {
+                        got_first_chunk = true;
+                        if let Some(choice) = response.choices.first() {
+                            let has_content = choice.delta.content.as_ref().is_some_and(|c| !c.is_empty());
+                            if has_content {
+                                let text = choice.delta.content.as_ref().unwrap();
+                                tracer.on_content(self.label, text);
+                                content.push_str(text);
+                            } else {
+                                tracer.on_empty(self.label);
+                            }
+                            if let Some(fr) = &choice.finish_reason {
+                                finish_reason = Some(*fr);
+                            }
+                        }
+                    }
+                    Ok(Some(Err(e))) => {
+                        let reason = format!("{e}");
+                        match self.handle_failure(&content, attempt, is_valid, &reason)? {
+                            FailureAction::UseContent(c) => return Ok(c),
+                            FailureAction::Retry => break,
+                        }
+                    }
+                    Ok(None) => {
+                        return self.finish(content, &tracer, finish_reason);
+                    }
+                    Err(_) => {
+                        let reason = format!("timeout after {}ms", self.timeout.as_millis());
+                        match self.handle_failure(&content, attempt, is_valid, &reason)? {
+                            FailureAction::UseContent(c) => return Ok(c),
+                            FailureAction::Retry => break,
+                        }
+                    }
+                }
+            }
+        }
+
+        bail!("LLM stream exhausted all {} retries without completing", self.max_retries)
+    }
+
+    fn handle_failure(
+        &self,
+        content: &str,
+        attempt: u32,
+        is_valid: &impl Fn(&str) -> bool,
+        reason: &str,
+    ) -> Result<FailureAction> {
+        if !content.is_empty() && is_valid(content) {
+            warn!(%self.label, bytes = content.len(), reason, "LLM error, but partial content is valid, returning it");
+            let content = content.trim().to_string();
+            info!(%self.label, bytes = content.len(), "LLM response received");
+            Ok(FailureAction::UseContent(content))
+        } else if attempt < self.max_retries {
+            warn!(%self.label, attempt, max_retries = self.max_retries, reason, "LLM retry");
+            Ok(FailureAction::Retry)
+        } else if content.is_empty() {
+            bail!("LLM error with no content after all retries: {reason}")
+        } else {
+            bail!("LLM error after all retries, partial content not usable: {reason}")
+        }
+    }
+
+    fn finish(
+        &self,
+        content: String,
+        tracer: &ConnectionTracer,
+        finish_reason: Option<FinishReason>,
+    ) -> Result<String> {
+        if tracer.empty_chunks > 0 {
+            trace!(%self.label, total_empty_chunks = tracer.empty_chunks, total_content_bytes = tracer.total_content_bytes, "SSE stream ended");
+        }
+        if matches!(finish_reason, Some(FinishReason::Length)) {
+            warn!(%self.label, bytes = content.len(), "LLM response truncated (finish_reason=length)");
+        }
+        let content = content.trim().to_string();
+        info!(%self.label, bytes = content.len(), "LLM response received");
+        debug!(%self.label, %content, "full LLM response");
+        Ok(content)
+    }
+}
+
 impl LlmClient {
     #[must_use]
     pub fn new(config: LlmConfig) -> Self {
@@ -184,8 +329,6 @@ impl LlmClient {
         messages: Vec<Message>,
         is_partial_valid: impl Fn(&str) -> bool,
     ) -> Result<String> {
-        // TODO: Instead of discarding unusable partial content on retry, we could
-        // feed it back to the LLM and ask it to complete the response.
         let request_messages: Vec<ChatCompletionRequestMessage> = messages
             .into_iter()
             .map(|msg| match msg.role {
@@ -217,138 +360,15 @@ impl LlmClient {
             })
             .collect();
 
-        let timeout = std::time::Duration::from_millis(self.config.stream_timeout_ms);
-        let max_retries = self.config.max_stream_retries;
+        let handler = StreamHandler::new(
+            client,
+            label,
+            Duration::from_millis(self.config.stream_timeout_ms),
+            self.config.max_stream_retries,
+            self.config.service_tier.clone(),
+        );
 
-        for attempt in 0..=max_retries {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-            let request = CreateChatCompletionRequest {
-                model: model.to_string(),
-                messages: request_messages.clone(),
-                stream: Some(true),
-                service_tier: Some(self.config.service_tier.clone()),
-                ..Default::default()
-            };
-
-            debug!(%label, attempt, "sending LLM streaming request");
-
-            let mut stream = match client.chat().create_stream(request).await {
-                Ok(s) => s,
-                Err(e) => {
-                    if attempt < max_retries {
-                        warn!(%label, attempt, max_retries, error = %e, bytes = 0, reason = "stream creation failed", "LLM retry");
-                        continue;
-                    }
-                    return Err(e).context("LLM streaming request failed after all retries");
-                }
-            };
-
-            let mut content = String::new();
-            let mut finish_reason: Option<FinishReason> = None;
-            let mut stream_ended = false;
-            let mut got_first_chunk = false;
-            let mut tracer = ConnectionTracer::new();
-
-            loop {
-                let current_timeout = if got_first_chunk {
-                    timeout
-                } else {
-                    timeout * 4
-                };
-                match tokio::time::timeout(current_timeout, stream.next()).await {
-                    Ok(Some(Ok(response))) => {
-                        got_first_chunk = true;
-                        if let Some(choice) = response.choices.first() {
-                            let has_content = choice.delta.content.as_ref().is_some_and(|s| !s.is_empty());
-                            let _has_tool_calls = choice.delta.tool_calls.as_ref().is_some_and(|v| !v.is_empty());
-                            #[allow(deprecated)]
-                            let _has_function_call = choice.delta.function_call.is_some();
-
-                            if has_content {
-                                let text = choice.delta.content.as_ref().unwrap();
-                                tracer.on_content(label, text);
-                                content.push_str(text);
-                            } else {
-                                tracer.on_empty(label);
-                            }
-                            if let Some(fr) = &choice.finish_reason {
-                                finish_reason = Some(*fr);
-                            }
-                        }
-                    }
-                    Ok(Some(Err(async_openai::error::OpenAIError::StreamError(e)))) => {
-                        if !content.is_empty() && is_partial_valid(&content) {
-                            warn!(%label, error = %e, bytes = content.len(), "LLM stream error, but partial content is valid, returning it");
-                            stream_ended = true;
-                            break;
-                        }
-                        if attempt < max_retries {
-                            warn!(%label, attempt, max_retries, error = %e, bytes = content.len(), reason = "SSE stream error", "LLM retry");
-                            break;
-                        }
-                        if content.is_empty() {
-                            anyhow::bail!("LLM stream error with no content received after all retries: {e}");
-                        }
-                        anyhow::bail!("LLM stream error after all retries, partial content not usable: {e}");
-                    }
-                    Ok(Some(Err(e))) => {
-                        if !content.is_empty() && is_partial_valid(&content) {
-                            warn!(%label, error = %e, bytes = content.len(), "LLM chunk error, but partial content is valid, returning it");
-                            stream_ended = true;
-                            break;
-                        }
-                        if attempt < max_retries {
-                            warn!(%label, attempt, max_retries, error = %e, bytes = content.len(), reason = "SSE chunk error", "LLM retry");
-                            break;
-                        }
-                        return Err(e).context("LLM stream chunk error after all retries");
-                    }
-                    Ok(None) => {
-                        stream_ended = true;
-                        break;
-                    }
-                    Err(_) => {
-                        if !content.is_empty() && is_partial_valid(&content) {
-                            warn!(%label, bytes = content.len(), "stream timed out, but partial content is valid, returning it");
-                            stream_ended = true;
-                            break;
-                        }
-                        if attempt < max_retries {
-                            warn!(%label, attempt, max_retries, error = "timeout", bytes = content.len(), reason = "timeout", timeout_ms = self.config.stream_timeout_ms, "LLM retry");
-                            break;
-                        }
-                        if content.is_empty() {
-                            anyhow::bail!(
-                                "LLM stream timed out ({}ms) with no content after all retries",
-                                self.config.stream_timeout_ms
-                            );
-                        }
-                        anyhow::bail!(
-                            "LLM stream timed out ({}ms) after all retries, partial content not usable",
-                            self.config.stream_timeout_ms
-                        );
-                    }
-                }
-            }
-
-            if stream_ended {
-                if tracer.empty_chunks > 0 {
-                    trace!(%label, total_empty_chunks = tracer.empty_chunks, total_content_bytes = tracer.total_content_bytes, "SSE stream ended");
-                }
-                if matches!(finish_reason, Some(FinishReason::Length)) {
-                    warn!(%label, bytes = content.len(), "LLM response truncated (finish_reason=length)");
-                }
-
-                let content = content.trim().to_string();
-                info!(%label, bytes = content.len(), "LLM response received");
-                debug!(%label, %content, "full LLM response");
-                return Ok(content);
-            }
-        }
-
-        anyhow::bail!("LLM stream exhausted all {max_retries} retries without completing");
+        handler.run(model, request_messages, &is_partial_valid).await
     }
 }
 
