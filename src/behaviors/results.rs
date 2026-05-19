@@ -80,7 +80,7 @@ async fn run_branch(
     let input = Arc::clone(&branch.input_content);
     let verified = branch.verified.clone();
     let formula_id = branch.formula_id.clone();
-    let retry_count = branch.retry_count;
+    let mut retry_count = branch.retry_count;
     let mut phase = branch.phase.clone();
 
     loop {
@@ -119,12 +119,13 @@ async fn run_branch(
                     BranchFromJudge::Verified(piece) => {
                         return Ok(vec![ChildDone::Verified(piece)]);
                     }
-                    BranchFromJudge::Retry {
+BranchFromJudge::Retry {
                         formula: _,
                         feedback,
                         solver_stdout,
                         solver_stderr,
                     } => {
+                        retry_count += 1;
                         phase = BranchPhase::NeedFormula {
                             feedback: Some(feedback),
                             solver_stdout,

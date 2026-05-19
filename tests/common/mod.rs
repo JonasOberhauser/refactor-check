@@ -12,6 +12,7 @@ pub struct SequenceLlm {
     judge: Arc<Mutex<Vec<String>>>,
 }
 
+#[allow(dead_code)]
 impl SequenceLlm {
     pub fn new(formalizer: Vec<String>, fixer: Vec<String>, judge: Vec<String>) -> Self {
         Self {

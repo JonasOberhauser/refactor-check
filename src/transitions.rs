@@ -83,11 +83,11 @@ impl WaitForResults {
 
 impl WaitForExplanation {
     #[must_use]
-    pub fn transition(mut self, explanations: Vec<Option<String>>) -> TransitionFromExplanation {
+    pub fn transition(mut self, explanations: Vec<Option<String>>) -> AgentResult {
         for (f, explanation) in self.result.formulas.iter_mut().zip(explanations) {
             f.explanation = explanation;
         }
-        TransitionFromExplanation::Done(self.result)
+        self.result
     }
 }
 

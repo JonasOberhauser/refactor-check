@@ -18,7 +18,7 @@ pub async fn execute(
 
     loop {
         attempts += 1;
-        if attempts > MAX_JUDGE_ATTEMPTS {
+        if attempts >= MAX_JUDGE_ATTEMPTS {
             anyhow::bail!("Judge failed to give a clear verdict after {MAX_JUDGE_ATTEMPTS} attempts");
         }
 

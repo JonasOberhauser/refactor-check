@@ -8,7 +8,6 @@ pub enum AlgorithmState {
     WaitForGeneration(WaitForGeneration),
     WaitForResults(WaitForResults),
     WaitForExplanation(WaitForExplanation),
-    Done(AgentResult),
 }
 
 pub enum InsistState {
@@ -46,10 +45,6 @@ pub enum TransitionFromGeneration {
 pub enum TransitionFromResults {
     Generation(WaitForGeneration),
     Explain(WaitForExplanation),
-    Done(AgentResult),
-}
-
-pub enum TransitionFromExplanation {
     Done(AgentResult),
 }
 

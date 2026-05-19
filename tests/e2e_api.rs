@@ -1,10 +1,11 @@
 use std::sync::OnceLock;
 
-use refactor_check::agent::run_with_providers;
 use refactor_check::llm::{LlmClient, LlmConfig, ServiceTier};
+use refactor_check::machine;
 use refactor_check::provider::AgentResult;
 use refactor_check::smt::Z3Solver;
 
+// free key: no credits
 const FREE_API_KEY: &str = "***REDACTED***";
 
 static API_KEY: OnceLock<String> = OnceLock::new();
@@ -37,7 +38,7 @@ async fn check_equivalent(input: &str) -> AgentResult {
     let api_key = get_api_key();
     let llm = LlmClient::new(free_models_config(api_key));
     let solver = Z3Solver::new("z3".to_string());
-    run_with_providers(input, &llm, &solver).await.expect("agent should succeed")
+    machine::run(input, &llm, &solver).await.expect("agent should succeed")
 }
 
 fn print_result(label: &str, result: &AgentResult) {

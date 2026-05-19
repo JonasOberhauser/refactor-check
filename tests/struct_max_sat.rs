@@ -1,7 +1,8 @@
 mod common;
 
 use common::{FakeSolver, SequenceLlm};
-use refactor_check::agent::{run_with_providers, JUDGE_REASONABLE};
+use refactor_check::consts::JUDGE_REASONABLE;
+use refactor_check::machine;
 use refactor_check::smt::SolverOutcome;
 
 fn struct_max_formula_response() -> String {
@@ -72,7 +73,7 @@ async fn test_sat_judge_overrules() {
         outcome: SolverOutcome::Sat,
     };
 
-    let result = run_with_providers("max_of_three struct refactoring", &llm, &solver)
+    let result = machine::run("max_of_three struct refactoring", &llm, &solver)
         .await
         .expect("agent should succeed (bug: judge overruled)");
 

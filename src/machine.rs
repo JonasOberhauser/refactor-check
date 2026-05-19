@@ -26,7 +26,7 @@ pub async fn run(
                 insist_attempt: 0,
             }),
             AlgorithmState::WaitForGeneration(s) => {
-                if s.insist_attempt > MAX_INSIST_ATTEMPTS {
+                if s.insist_attempt >= MAX_INSIST_ATTEMPTS {
                     anyhow::bail!("failed to extract any SMT formula after {MAX_INSIST_ATTEMPTS} insist attempts");
                 }
                 let response = behaviors::generation::execute(&s, llm).await?;
@@ -56,11 +56,8 @@ pub async fn run(
             }
             AlgorithmState::WaitForExplanation(s) => {
                 let explanations = behaviors::explain::execute(&s, llm).await?;
-                match s.transition(explanations) {
-                    TransitionFromExplanation::Done(result) => return Ok(result),
-                }
+                return Ok(s.transition(explanations));
             }
-            AlgorithmState::Done(result) => return Ok(result),
         }
     }
 }

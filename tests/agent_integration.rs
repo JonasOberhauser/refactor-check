@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use common::{FakeSolver, SequenceLlm};
-use refactor_check::agent::{JUDGE_REASONABLE, run_with_providers};
+use refactor_check::consts::JUDGE_REASONABLE;
+use refactor_check::machine;
 use refactor_check::provider::SolverProvider;
 use refactor_check::smt::{SolverOutcome, SolverResult};
 
@@ -38,7 +39,7 @@ async fn test_happy_path_unsat() {
     );
     let solver = FakeSolver { outcome: SolverOutcome::Unsat };
 
-    let result = run_with_providers("refactoring desc", &llm, &solver)
+    let result = machine::run("refactoring desc", &llm, &solver)
         .await
         .expect("agent should succeed");
 
@@ -63,7 +64,7 @@ async fn test_formula_not_found_then_found() {
     );
     let solver = FakeSolver { outcome: SolverOutcome::Unsat };
 
-    let result = run_with_providers("refactoring desc", &llm, &solver)
+    let result = machine::run("refactoring desc", &llm, &solver)
         .await
         .expect("agent should succeed");
 
@@ -124,7 +125,7 @@ async fn test_solver_error_in_batch_then_partial_result() {
     let solver = ToggleSolver { call_count: call_count.clone(), error_until: 1 };
 
     // After MAX_ITERATIONS the agent returns Ok with a partial result
-    let result = run_with_providers("refactoring desc", &llm, &solver)
+    let result = machine::run("refactoring desc", &llm, &solver)
         .await
         .expect("agent should return partial result after max iterations");
 
@@ -148,7 +149,7 @@ async fn test_judge_retry_in_branch_then_verified() {
     let llm = SequenceLlm::new(formalizer, fixer, judge);
     let solver = FakeSolver { outcome: SolverOutcome::Unsat };
 
-    let result = run_with_providers("refactoring desc", &llm, &solver)
+    let result = machine::run("refactoring desc", &llm, &solver)
         .await
         .expect("agent should succeed with branch retry");
 
@@ -172,7 +173,7 @@ async fn test_judge_gives_unclear_answer_then_clear() {
     );
     let solver = FakeSolver { outcome: SolverOutcome::Unsat };
 
-    let result = run_with_providers("refactoring desc", &llm, &solver)
+    let result = machine::run("refactoring desc", &llm, &solver)
         .await
         .expect("agent should succeed");
 
@@ -318,7 +319,7 @@ async fn test_jemalloc_refactoring_unsat() {
     );
     let solver = FakeSolver { outcome: SolverOutcome::Unsat };
 
-    let result = run_with_providers(
+    let result = machine::run(
         "stats_general_print refactoring: inline sections extracted to helper functions",
         &llm,
         &solver,
@@ -346,7 +347,7 @@ async fn test_multi_formula_batch() {
     let call_count = Arc::new(Mutex::new(0usize));
     let solver = ToggleSolver { call_count: call_count.clone(), error_until: 0 };
 
-    let result = run_with_providers("refactoring desc", &llm, &solver)
+    let result = machine::run("refactoring desc", &llm, &solver)
         .await
         .expect("agent should succeed");
 

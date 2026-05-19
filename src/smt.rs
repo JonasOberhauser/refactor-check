@@ -17,20 +17,11 @@ pub enum SolverOutcome {
     Error(String),
 }
 
+#[derive(Debug, Clone)]
 pub struct SolverResult {
     pub outcome: SolverOutcome,
     pub stdout: String,
     pub stderr: String,
-}
-
-impl Clone for SolverResult {
-    fn clone(&self) -> Self {
-        Self {
-            outcome: self.outcome.clone(),
-            stdout: self.stdout.clone(),
-            stderr: self.stderr.clone(),
-        }
-    }
 }
 
 pub fn extract_smt_formula(response: &str) -> Option<String> {
@@ -181,13 +172,12 @@ fn parse_solver_outcome(exit_code: Option<i32>, stdout: &str, stderr: &str) -> S
         Some(line) if line.starts_with("unsat") => SolverOutcome::Unsat,
         Some(line) if line.starts_with("sat") => SolverOutcome::Sat,
         Some(line) if line.starts_with("unknown") => SolverOutcome::Unknown,
-        None => SolverOutcome::Unknown,
-        Some(_) => SolverOutcome::Unknown,
+        None | Some(_) => SolverOutcome::Unknown,
     }
 }
 
 fn bytes_to_string(bytes: Vec<u8>) -> String {
-    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 pub const DEFAULT_SOLVER_TIMEOUT_SECS: u64 = 60;
@@ -233,13 +223,15 @@ pub async fn run_solver(
     let child = Arc::new(Mutex::new(child));
     let child_for_wait = child.clone();
 
-    let status = tokio::select! {
+let status = tokio::select! {
         status = async move { child_for_wait.lock().await.wait().await } => Some(status),
-        _ = tokio::time::sleep(timeout) => {
+        () = tokio::time::sleep(timeout) => {
             warn!(elapsed_ms = start.elapsed().as_millis(), "solver timed out, killing process");
-            let mut guard = child.lock().await;
-            let _ = guard.kill().await;
-            let _ = guard.wait().await;
+            {
+                let mut guard = child.lock().await;
+                let _ = guard.kill().await;
+                let _ = guard.wait().await;
+            }
             None
         }
     };

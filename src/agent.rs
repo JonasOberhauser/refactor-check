@@ -5,7 +5,6 @@ use crate::llm::{LlmConfig, Message, system_message, user_message};
 use crate::smt::SolverOutcome;
 use crate::states::{OpenItem, VerifiedPiece};
 
-pub use crate::consts::*;
 pub use crate::smt::DEFAULT_SOLVER_TIMEOUT_SECS;
 
 pub struct AgentConfig {
@@ -13,14 +12,6 @@ pub struct AgentConfig {
     pub solver_path: String,
     pub solver_args: Vec<String>,
     pub solver_timeout_secs: u64,
-}
-
-pub async fn run_with_providers(
-    input_content: &str,
-    llm: &dyn crate::provider::LlmProvider,
-    solver: &dyn crate::provider::SolverProvider,
-) -> anyhow::Result<crate::provider::AgentResult> {
-    crate::machine::run(input_content, llm, solver).await
 }
 
 pub async fn run(input_file: &str, config: AgentConfig) -> anyhow::Result<()> {

@@ -44,7 +44,7 @@ struct Cli {
     api_base: String,
 
     /// API key (defaults to OPENROUTER_API_KEY env var, or built-in free key)
-    #[arg(long, env = "OPENROUTER_API_KEY", default_value = "***REDACTED***")]
+    #[arg(long, env = "OPENROUTER_API_KEY", default_value = "***REDACTED***")]  // free key: no credits
     api_key: Option<String>,
 
     /// Separate API key for the judge model (falls back to --api-key if not set)
