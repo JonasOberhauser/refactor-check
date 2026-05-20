@@ -19,6 +19,24 @@ pub async fn execute(
     let role = role_for_iteration(state.iteration);
 
     if let InsistState::Insisting { ref last_response, .. } = &state.insist {
+        let pieces_text = if state.pieces.is_empty() {
+            String::new()
+        } else {
+            let mut s = String::from("Pieces to generate formulas for:\n");
+            for (i, piece) in state.pieces.iter().enumerate() {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut s,
+                    format_args!(
+                        "Piece {}: {}\nBEFORE:\n{}\nAFTER:\n{}\n\n",
+                        i + 1,
+                        piece.label,
+                        piece.before,
+                        piece.after,
+                    ),
+                );
+            }
+            s
+        };
         let messages = vec![
             crate::llm::system_message(
                 "You MUST output at least ONE SMT-LIB2 formula. \
@@ -26,9 +44,13 @@ pub async fn execute(
                  Each formula must be complete with set-logic, declarations, assertions, and check-sat.",
             ),
             crate::llm::user_message(&format!(
-                "Your previous response did not contain any valid SMT formula. \
+                "Original refactoring context:\n\n{ctx}\n\n\
+                 {pieces}\
+                 Your previous response did not contain any valid SMT formula. \
                  Here was your previous response:\n\n{last_response}\n\n\
                  Please try again. Output at least ONE valid SMT-LIB2 formula in a ```smt2 code block.",
+                ctx = state.input_content,
+                pieces = pieces_text,
             )),
         ];
         let response = llm.chat(role, messages).await?;
@@ -100,9 +122,11 @@ pub fn build_retry_messages(
     feedback: &str,
     solver_stdout: &str,
     solver_stderr: &str,
+    input_content: &str,
 ) -> Vec<crate::llm::Message> {
     let prompt = format!(
-        "Piece to verify: {label}\n\
+        "Original refactoring context:\n\n{ctx}\n\n\
+         Piece to verify: {label}\n\
          BEFORE:\n{before}\n\
          AFTER:\n{after}\n\n\
          The formula that failed:\n{}\n\n\
@@ -114,6 +138,7 @@ pub fn build_retry_messages(
         feedback,
         solver_stdout,
         solver_stderr,
+        ctx = input_content,
         label = piece.label,
         before = piece.before,
         after = piece.after,
@@ -134,6 +159,7 @@ pub fn build_retry_insist_messages(
     piece: &CodePiece,
     feedback: &str,
     last_response: &str,
+    input_content: &str,
 ) -> Vec<crate::llm::Message> {
     vec![
         crate::llm::system_message(
@@ -141,13 +167,15 @@ pub fn build_retry_insist_messages(
              Do NOT include any explanations.",
         ),
         crate::llm::user_message(&format!(
-            "Your previous response contained no valid SMT formula.\n\
+            "Original refactoring context:\n\n{ctx}\n\n\
+             Your previous response contained no valid SMT formula.\n\
              Here it was:\n\n{last_response}\n\n\
              Piece to fix: {label}\n\
              BEFORE:\n{before}\n\
              AFTER:\n{after}\n\n\
              Feedback: {feedback}\n\n\
              Try again. ONE complete formula in a ```smt2 code block.",
+            ctx = input_content,
             label = piece.label,
             before = piece.before,
             after = piece.after,

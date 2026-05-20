@@ -12,6 +12,7 @@ pub async fn execute(
     formula: &str,
     solver_result: &SolverResult,
     llm: &dyn LlmProvider,
+    input_content: &str,
 ) -> Result<JudgeVerdict> {
     let mut attempts = 0;
     let mut last_response = String::new();
@@ -26,7 +27,8 @@ pub async fn execute(
 
         let prompt = if attempts == 1 {
             format!(
-                "Piece to verify: {label}\n\
+                "Original refactoring context:\n\n{ctx}\n\n\
+                 Piece to verify: {label}\n\
                  BEFORE:\n{before}\n\
                  AFTER:\n{after}\n\n\
                  Formula checking this piece:\n\n{formula}\n\n\
@@ -35,13 +37,15 @@ pub async fn execute(
                  Answer ONLY with the single word REASONABLE if yes. \
                  Otherwise explain what is wrong with the formula.",
                 solver_result.stdout,
+                ctx = input_content,
                 label = piece.label,
                 before = piece.before,
                 after = piece.after,
             )
         } else {
             format!(
-                "Piece to verify: {label}\n\
+                "Original refactoring context:\n\n{ctx}\n\n\
+                 Piece to verify: {label}\n\
                  BEFORE:\n{before}\n\
                  AFTER:\n{after}\n\n\
                  Formula checking this piece:\n\n{formula}\n\n\
@@ -49,6 +53,7 @@ pub async fn execute(
                  Your previous answer was: '{last_response}'. \
                  You MUST answer ONLY with REASONABLE or explain what is wrong.",
                 solver_result.stdout,
+                ctx = input_content,
                 label = piece.label,
                 before = piece.before,
                 after = piece.after,

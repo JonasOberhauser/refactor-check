@@ -66,7 +66,7 @@ async fn run_branch(
                 solver_result,
             } => {
                 let verdict = child_judge::execute(
-                    &piece, &formula, &solver_result, llm,
+                    &piece, &formula, &solver_result, llm, &branch.input_content,
                 ).await?;
                 current_formula = formula.clone();
                 match transitions::transition_judge(
@@ -128,7 +128,7 @@ async fn run_branch(
                     llm.chat(
                         role,
                         generation::build_retry_insist_messages(
-                            &piece, fb, prev,
+                            &piece, fb, prev, &branch.input_content,
                         ),
                     )
                     .await?
@@ -137,7 +137,7 @@ async fn run_branch(
                         role,
                         generation::build_retry_messages(
                             &piece, &current_formula, fb,
-                            solver_stdout, solver_stderr,
+                            solver_stdout, solver_stderr, &branch.input_content,
                         ),
                     )
                     .await?
