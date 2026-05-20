@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tracing::warn;
 
 use crate::consts::{JUDGE_REASONABLE, MAX_BRANCH_RETRIES, MAX_INSIST_ATTEMPTS, MAX_SPLIT_DEPTH};
 use crate::provider::{AgentResult, FormulaResult};
@@ -13,15 +14,12 @@ impl WaitForSplit {
         self,
         pieces: Vec<CodePiece>,
     ) -> TransitionFromSplit {
-        let mut all_pieces = self.pending_pieces;
-        all_pieces.extend(pieces);
-
         let input_content = self.input_content;
         let verified = self.verified;
         let open = self.open;
         let iteration = self.iteration;
 
-        if all_pieces.is_empty() {
+        if pieces.is_empty() {
             return TransitionFromSplit::Open(
                 open.clone(),
                 WaitForGeneration {
@@ -41,7 +39,7 @@ impl WaitForSplit {
             open,
             iteration,
             insist: InsistState::Idle,
-            pieces: all_pieces,
+            pieces,
         })
     }
 }
@@ -87,6 +85,25 @@ impl WaitForGeneration {
                     retry_count: 0,
                 })
                 .collect()
+        } else if formulas.len() != pieces.len() {
+            warn!(
+                pieces = pieces.len(),
+                formulas = formulas.len(),
+                "formula/piece count mismatch, truncating"
+            );
+            pieces
+                .clone()
+                .into_iter()
+                .zip(formulas)
+                .map(|(piece, formula)| FormulaBranch {
+                    piece: piece.clone(),
+                    input_content: Arc::clone(&input_content),
+                    verified: verified.clone(),
+                    formula: formula.clone(),
+                    phase: BranchPhase::WaitForSolver { formula },
+                    retry_count: 0,
+                })
+                .collect()
         } else {
             pieces
                 .clone()
@@ -110,7 +127,6 @@ impl WaitForGeneration {
             iteration,
             branches,
             split_depth: 0,
-            remaining_pieces: Vec::new(),
         })
     }
 }
@@ -126,7 +142,7 @@ impl WaitForResults {
             match cd {
                 ChildDone::Verified(piece) => verified.push(piece),
                 ChildDone::Open(item) => open.push(item),
-                ChildDone::NeedsResplit(piece, _, reason) => {
+                ChildDone::NeedsResplit { piece, formula: _, reason } => {
                     needs_resplit.push((piece, reason));
                 }
             }
@@ -152,7 +168,6 @@ impl WaitForResults {
                     open,
                     iteration: self.iteration,
                     split_depth: new_depth,
-                    pending_pieces: self.remaining_pieces,
                 });
             }
         }
@@ -211,7 +226,7 @@ pub fn transition_solver(formula: String, result: SolverResult) -> BranchFromSol
     match result.outcome {
         SolverOutcome::Error(_) => BranchFromSolver::Error(formula, result),
         SolverOutcome::Unknown => BranchFromSolver::Resplit(formula, result),
-        _ => BranchFromSolver::Judge(formula, result),
+        SolverOutcome::Sat | SolverOutcome::Unsat => BranchFromSolver::Judge(formula, result),
     }
 }
 

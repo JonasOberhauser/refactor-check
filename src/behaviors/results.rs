@@ -1,5 +1,4 @@
 use anyhow::Result;
-use std::sync::Arc;
 use futures::future;
 
 use crate::provider::{LlmProvider, LlmRole, SolverProvider};
@@ -28,8 +27,6 @@ async fn run_branch(
     llm: &dyn LlmProvider,
     solver: &dyn SolverProvider,
 ) -> Result<Vec<ChildDone>> {
-    let _input = Arc::clone(&branch.input_content);
-    let _verified = branch.verified.clone();
     let piece = branch.piece.clone();
     let mut retry_count = branch.retry_count;
     let mut phase = branch.phase.clone();
@@ -56,11 +53,11 @@ async fn run_branch(
                         })]);
                     }
                     BranchFromSolver::Resplit(f, r) => {
-                        return Ok(vec![ChildDone::NeedsResplit(
+                        return Ok(vec![ChildDone::NeedsResplit {
                             piece,
-                            f,
-                            r.stdout,
-                        )]);
+                            formula: f,
+                            reason: r.stdout,
+                        }]);
                     }
                 }
             }
@@ -131,7 +128,7 @@ async fn run_branch(
                     llm.chat(
                         role,
                         generation::build_retry_insist_messages(
-                            &piece, &current_formula, fb, prev,
+                            &piece, fb, prev,
                         ),
                     )
                     .await?

@@ -24,46 +24,27 @@ pub async fn run(
                 open: Vec::new(),
                 iteration: 0,
                 split_depth: 0,
-                pending_pieces: Vec::new(),
             }),
             AlgorithmState::WaitForSplit(s) => {
-                let s_open = s.open.clone();
                 let pieces = behaviors::splitter::execute(&s, llm).await;
                 match pieces {
                     Ok(pcs) => match s.transition(pcs) {
                         TransitionFromSplit::Generate(next) => AlgorithmState::WaitForGeneration(next),
-                        TransitionFromSplit::Insist(next) => AlgorithmState::WaitForSplit(next),
-                        TransitionFromSplit::Exhausted(msg) => anyhow::bail!(msg),
-                        TransitionFromSplit::Open(open_items, next) => {
-                            let mut open = s_open;
-                            open.extend(open_items);
-                            AlgorithmState::WaitForGeneration(WaitForGeneration {
-                                open,
-                                ..next
-                            })
-                        }
+                        TransitionFromSplit::Open(_open_items, next) => AlgorithmState::WaitForGeneration(next),
                     },
                     Err(e) => return Err(e),
                 }
             }
             AlgorithmState::WaitForGeneration(s) => {
-                if s.pieces.is_empty() {
-                    if let InsistState::Insisting { attempt, .. } = &s.insist {
-                        if *attempt >= MAX_INSIST_ATTEMPTS {
-                            anyhow::bail!("failed to extract any SMT formula after {MAX_INSIST_ATTEMPTS} insist attempts");
-                        }
+                if let InsistState::Insisting { attempt, .. } = &s.insist {
+                    if *attempt >= MAX_INSIST_ATTEMPTS {
+                        anyhow::bail!("failed to extract any SMT formula after {MAX_INSIST_ATTEMPTS} insist attempts");
                     }
-                    let response = behaviors::generation::execute(&s, llm).await?;
-                    match s.transition(response) {
-                        TransitionFromGeneration::Results(next) => AlgorithmState::WaitForResults(next),
-                        TransitionFromGeneration::Insist(next) => AlgorithmState::WaitForGeneration(next),
-                    }
-                } else {
-                    let response = behaviors::generation::execute(&s, llm).await?;
-                    match s.transition(response) {
-                        TransitionFromGeneration::Results(next) => AlgorithmState::WaitForResults(next),
-                        TransitionFromGeneration::Insist(next) => AlgorithmState::WaitForGeneration(next),
-                    }
+                }
+                let response = behaviors::generation::execute(&s, llm).await?;
+                match s.transition(response) {
+                    TransitionFromGeneration::Results(next) => AlgorithmState::WaitForResults(next),
+                    TransitionFromGeneration::Insist(next) => AlgorithmState::WaitForGeneration(next),
                 }
             }
             AlgorithmState::WaitForResults(s) => {

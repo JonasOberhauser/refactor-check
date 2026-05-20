@@ -39,7 +39,6 @@ pub struct WaitForSplit {
     pub open: Vec<OpenItem>,
     pub iteration: usize,
     pub split_depth: u32,
-    pub pending_pieces: Vec<CodePiece>,
 }
 
 pub struct WaitForGeneration {
@@ -58,7 +57,6 @@ pub struct WaitForResults {
     pub iteration: usize,
     pub branches: Vec<FormulaBranch>,
     pub split_depth: u32,
-    pub remaining_pieces: Vec<CodePiece>,
 }
 
 pub struct WaitForExplanation {
@@ -68,8 +66,6 @@ pub struct WaitForExplanation {
 
 pub enum TransitionFromSplit {
     Generate(WaitForGeneration),
-    Insist(WaitForSplit),
-    Exhausted(String),
     Open(Vec<OpenItem>, WaitForGeneration),
 }
 
@@ -173,7 +169,11 @@ pub enum BranchFromJudge {
 pub enum ChildDone {
     Verified(VerifiedPiece),
     Open(OpenItem),
-    NeedsResplit(CodePiece, String, String),
+    NeedsResplit {
+        piece: CodePiece,
+        formula: String,
+        reason: String,
+    },
 }
 
 #[derive(Default)]

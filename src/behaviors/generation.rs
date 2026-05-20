@@ -127,7 +127,6 @@ pub fn build_retry_messages(
 
 pub fn build_retry_insist_messages(
     piece: &CodePiece,
-    _formula: &str,
     feedback: &str,
     last_response: &str,
 ) -> Vec<crate::llm::Message> {
