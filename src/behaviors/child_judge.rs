@@ -18,8 +18,8 @@ pub async fn execute(
     let mut last_response = String::new();
 
     assert!(
-        !piece.before.is_empty() || !piece.after.is_empty(),
-        "piece {} #{} has empty BEFORE and AFTER",
+        !piece.before.is_empty() && !piece.after.is_empty(),
+        "piece {} #{} must have non-empty BEFORE and AFTER",
         piece.label,
         piece.id,
     );
