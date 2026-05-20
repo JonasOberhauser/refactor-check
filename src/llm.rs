@@ -278,7 +278,8 @@ impl<'a> StreamHandler<'a> {
         }
         let content = content.trim().to_string();
         info!(%self.label, bytes = content.len(), "LLM response received");
-        debug!(%self.label, %content, "full LLM response");
+        let prefixed_response: String = content.lines().map(|l| format!("<\t{l}")).collect::<Vec<_>>().join("\n");
+        debug!(%self.label, content = %prefixed_response, "full LLM response");
         Ok(content)
     }
 }
@@ -354,7 +355,8 @@ impl LlmClient {
     ) -> Result<String> {
         for msg in &messages {
             if !matches!(msg.role, Role::System) {
-                debug!(%label, role = ?msg.role, content = %msg.content, "LLM message");
+                let prefixed: String = msg.content.lines().map(|l| format!(">\t{l}")).collect::<Vec<_>>().join("\n");
+                debug!(%label, role = ?msg.role, content = %prefixed, "LLM message");
             }
         }
 
