@@ -29,7 +29,7 @@ pub async fn execute(
     let futures = needs_explanation.iter().map(|(i, formula, outcome)| {
         let messages = build_explanation_messages(&state.input_content, formula, outcome);
         async move {
-            let response = llm.chat(LlmRole::Fixer, messages).await;
+            let response = llm.chat(LlmRole::Fixer, messages, None).await;
             (*i, response)
         }
     });

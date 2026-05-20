@@ -10,7 +10,7 @@ pub async fn execute(
 ) -> Result<Vec<CodePiece>> {
     for attempt in 0..3 {
         let messages = build_split_messages(state);
-        let response = llm.chat(LlmRole::Splitter, messages).await?;
+        let response = llm.chat(LlmRole::Splitter, messages, None).await?;
         let pieces = extract_split_pieces(&response);
 
         if !pieces.is_empty() {

@@ -296,7 +296,7 @@ impl Z3Solver {
 
 #[async_trait]
 impl SolverProvider for Z3Solver {
-    async fn run(&self, formula: &str) -> Result<SolverResult> {
+    async fn run(&self, formula: &str, _piece: Option<&crate::states::CodePiece>) -> Result<SolverResult> {
         run_solver(&self.solver_path, &self.solver_args, self.timeout, formula).await
     }
 }

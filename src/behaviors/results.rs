@@ -37,7 +37,7 @@ async fn run_branch(
         match phase {
             BranchPhase::WaitForSolver { formula } => {
                 debug!(piece_id = piece.id, label = %piece.label, "running solver");
-                let result = solver.run(&formula).await?;
+                let result = solver.run(&formula, Some(&piece)).await?;
                 debug!(piece_id = piece.id, label = %piece.label, outcome = ?result.outcome, "solver done");
                 match transitions::transition_solver(formula.clone(), result) {
                     BranchFromSolver::Judge(f, r) => {
@@ -136,6 +136,7 @@ async fn run_branch(
                         generation::build_retry_insist_messages(
                             &piece, fb, prev, &branch.input_content,
                         ),
+                        Some(&piece),
                     )
                     .await?
                 } else {
@@ -146,6 +147,7 @@ async fn run_branch(
                             &piece, &current_formula, fb,
                             solver_stdout, solver_stderr, &branch.input_content,
                         ),
+                        Some(&piece),
                     )
                     .await?
                 };

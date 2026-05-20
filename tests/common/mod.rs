@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use refactor_check::llm::Message;
 use refactor_check::provider::{LlmProvider, LlmRole, SolverProvider};
 use refactor_check::smt::{SolverOutcome, SolverResult};
+use refactor_check::states::CodePiece;
 
 pub struct SequenceLlm {
     formalizer: Arc<Mutex<Vec<String>>>,
@@ -44,7 +45,12 @@ impl SequenceLlm {
 
 #[async_trait]
 impl LlmProvider for SequenceLlm {
-    async fn chat(&self, role: LlmRole, _messages: Vec<Message>) -> Result<String> {
+    async fn chat(
+        &self,
+        role: LlmRole,
+        _messages: Vec<Message>,
+        _piece: Option<&refactor_check::states::CodePiece>,
+    ) -> Result<String> {
         let queue = match role {
             LlmRole::Splitter => &self.splitter,
             LlmRole::Formalizer => &self.formalizer,
@@ -65,7 +71,7 @@ pub struct FakeSolver {
 
 #[async_trait]
 impl SolverProvider for FakeSolver {
-    async fn run(&self, _formula: &str) -> Result<SolverResult> {
+    async fn run(&self, _formula: &str, _piece: Option<&CodePiece>) -> Result<SolverResult> {
         Ok(SolverResult {
             outcome: self.outcome.clone(),
             stdout: format!("{:?}", self.outcome).to_lowercase(),

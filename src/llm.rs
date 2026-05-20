@@ -144,6 +144,7 @@ struct StreamHandler<'a> {
     timeout: Duration,
     max_retries: u32,
     service_tier: ServiceTier,
+    piece_id: Option<u64>,
 }
 
 enum FailureAction {
@@ -158,8 +159,9 @@ impl<'a> StreamHandler<'a> {
         timeout: Duration,
         max_retries: u32,
         service_tier: ServiceTier,
+        piece_id: Option<u64>,
     ) -> Self {
-        Self { client, label, timeout, max_retries, service_tier }
+        Self { client, label, timeout, max_retries, service_tier, piece_id }
     }
 
     async fn run(
@@ -279,7 +281,7 @@ impl<'a> StreamHandler<'a> {
         let content = content.trim().to_string();
         info!(%self.label, bytes = content.len(), "LLM response received");
         let prefixed_response: String = content.lines().map(|l| format!("<\t{l}")).collect::<Vec<_>>().join("\n");
-        debug!(%self.label, content = %prefixed_response, "full LLM response");
+        debug!(%self.label, piece_id = self.piece_id, content = %prefixed_response, "full LLM response");
         Ok(content)
     }
 }
@@ -316,22 +318,22 @@ impl LlmClient {
     }
 
     #[instrument(skip_all, fields(model = %self.config.formalizer_model))]
-    pub async fn chat_formalizer(&self, messages: Vec<Message>) -> Result<String> {
-        self.chat_inner("formalizer", &self.formalizer_client, &self.config.formalizer_model, messages, |content| {
+    pub async fn chat_formalizer(&self, messages: Vec<Message>, piece: Option<&crate::states::CodePiece>) -> Result<String> {
+        self.chat_inner("formalizer", &self.formalizer_client, &self.config.formalizer_model, messages, piece, |content| {
             crate::smt::extract_smt_formula(content).is_some()
         }).await
     }
 
     #[instrument(skip_all, fields(model = %self.config.fixer_model))]
-    pub async fn chat_fixer(&self, messages: Vec<Message>) -> Result<String> {
-        self.chat_inner("fixer", &self.fixer_client, &self.config.fixer_model, messages, |content| {
+    pub async fn chat_fixer(&self, messages: Vec<Message>, piece: Option<&crate::states::CodePiece>) -> Result<String> {
+        self.chat_inner("fixer", &self.fixer_client, &self.config.fixer_model, messages, piece, |content| {
             crate::smt::extract_smt_formula(content).is_some()
         }).await
     }
 
     #[instrument(skip_all, fields(model = %self.config.judge_model))]
-    pub async fn chat_judge(&self, messages: Vec<Message>) -> Result<String> {
-        self.chat_inner("judge", &self.judge_client, &self.config.judge_model, messages, |content| {
+    pub async fn chat_judge(&self, messages: Vec<Message>, piece: Option<&crate::states::CodePiece>) -> Result<String> {
+        self.chat_inner("judge", &self.judge_client, &self.config.judge_model, messages, piece, |content| {
             let upper = content.trim().to_uppercase();
             let trimmed = upper.trim_start_matches(|c: char| !c.is_alphabetic());
             trimmed.starts_with("REASONABLE") || trimmed.starts_with("RETRY")
@@ -339,8 +341,8 @@ impl LlmClient {
     }
 
     #[instrument(skip_all, fields(model = %self.config.splitter_model))]
-    pub async fn chat_splitter(&self, messages: Vec<Message>) -> Result<String> {
-        self.chat_inner("splitter", &self.splitter_client, &self.config.splitter_model, messages, |content| {
+    pub async fn chat_splitter(&self, messages: Vec<Message>, piece: Option<&crate::states::CodePiece>) -> Result<String> {
+        self.chat_inner("splitter", &self.splitter_client, &self.config.splitter_model, messages, piece, |content| {
             !content.trim().is_empty()
         }).await
     }
@@ -351,12 +353,14 @@ impl LlmClient {
         client: &async_openai::Client<async_openai::config::OpenAIConfig>,
         model: &str,
         messages: Vec<Message>,
+        piece: Option<&crate::states::CodePiece>,
         is_partial_valid: impl Fn(&str) -> bool,
     ) -> Result<String> {
+        let pid = piece.map(|p| p.id);
         for msg in &messages {
             if !matches!(msg.role, Role::System) {
                 let prefixed: String = msg.content.lines().map(|l| format!(">\t{l}")).collect::<Vec<_>>().join("\n");
-                debug!(%label, role = ?msg.role, content = %prefixed, "LLM message");
+                debug!(%label, piece_id = pid, role = ?msg.role, content = %prefixed, "LLM message");
             }
         }
 
@@ -397,6 +401,7 @@ impl LlmClient {
             Duration::from_millis(self.config.stream_timeout_ms),
             self.config.max_stream_retries,
             self.config.service_tier.clone(),
+            pid,
         );
 
         handler.run(model, request_messages, &is_partial_valid).await
@@ -429,12 +434,17 @@ pub fn assistant_message(content: &str) -> Message {
 
 #[async_trait]
 impl LlmProvider for LlmClient {
-    async fn chat(&self, role: LlmRole, messages: Vec<Message>) -> Result<String> {
+    async fn chat(
+        &self,
+        role: LlmRole,
+        messages: Vec<Message>,
+        piece: Option<&crate::states::CodePiece>,
+    ) -> Result<String> {
         match role {
-            LlmRole::Splitter => self.chat_splitter(messages).await,
-            LlmRole::Formalizer => self.chat_formalizer(messages).await,
-            LlmRole::Fixer => self.chat_fixer(messages).await,
-            LlmRole::Judge => self.chat_judge(messages).await,
+            LlmRole::Splitter => self.chat_splitter(messages, piece).await,
+            LlmRole::Formalizer => self.chat_formalizer(messages, piece).await,
+            LlmRole::Fixer => self.chat_fixer(messages, piece).await,
+            LlmRole::Judge => self.chat_judge(messages, piece).await,
         }
     }
 }

@@ -3,6 +3,7 @@ use async_trait::async_trait;
 
 use crate::llm::Message;
 use crate::smt::{SolverOutcome, SolverResult};
+use crate::states::CodePiece;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmRole {
@@ -14,12 +15,17 @@ pub enum LlmRole {
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
-    async fn chat(&self, role: LlmRole, messages: Vec<Message>) -> Result<String>;
+    async fn chat(
+        &self,
+        role: LlmRole,
+        messages: Vec<Message>,
+        piece: Option<&CodePiece>,
+    ) -> Result<String>;
 }
 
 #[async_trait]
 pub trait SolverProvider: Send + Sync {
-    async fn run(&self, formula: &str) -> Result<SolverResult>;
+    async fn run(&self, formula: &str, piece: Option<&CodePiece>) -> Result<SolverResult>;
 }
 
 pub struct FormulaResult {

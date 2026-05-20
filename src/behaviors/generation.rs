@@ -69,7 +69,7 @@ async fn generate_one_formula(
         } else {
             build_single_piece_insist(piece, &last_response, input_content)
         };
-        let response = llm.chat(role, messages).await?;
+let response = llm.chat(role, messages, Some(piece)).await?;
         let mut formulas = extract_all_formulas(&response);
 
         if formulas.len() == 1 {
@@ -135,7 +135,7 @@ async fn generate_insist(
         )),
     ];
 
-    let response = llm.chat(role, messages).await?;
+    let response = llm.chat(role, messages, None).await?;
     let mut formulas = extract_all_formulas(&response);
 
     if formulas.len() != state.pieces.len() {
