@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::consts::{JUDGE_REASONABLE, MAX_BRANCH_RETRIES, MAX_INSIST_ATTEMPTS, MAX_SPLIT_DEPTH};
 use crate::provider::{AgentResult, FormulaResult};
@@ -76,17 +76,22 @@ impl WaitForGeneration {
         let branches: Vec<FormulaBranch> = if pieces.is_empty() {
             formulas
                 .into_iter()
-                .map(|formula| FormulaBranch {
-                    piece: CodePiece {
-                        label: String::new(),
-                        before: String::new(),
-                        after: String::new(),
-                    },
-                    input_content: Arc::clone(&input_content),
-                    verified: verified.clone(),
-                    formula: formula.clone(),
-                    phase: BranchPhase::WaitForSolver { formula },
-                    retry_count: 0,
+                .map(|formula| {
+                    let p = CodePiece {
+                        id: next_piece_id(),
+                        label: "whole".to_string(),
+                        before: (*input_content).clone(),
+                        after: (*input_content).clone(),
+                    };
+                    debug!(piece_id = p.id, label = %p.label, "created branch (no-split)");
+                    FormulaBranch {
+                        piece: p,
+                        input_content: Arc::clone(&input_content),
+                        verified: verified.clone(),
+                        formula: formula.clone(),
+                        phase: BranchPhase::WaitForSolver { formula },
+                        retry_count: 0,
+                    }
                 })
                 .collect()
         } else if formulas.len() != pieces.len() {
@@ -99,29 +104,38 @@ impl WaitForGeneration {
                 .clone()
                 .into_iter()
                 .zip(formulas)
-                .map(|(piece, formula)| FormulaBranch {
-                    piece: piece.clone(),
-                    input_content: Arc::clone(&input_content),
-                    verified: verified.clone(),
-                    formula: formula.clone(),
-                    phase: BranchPhase::WaitForSolver { formula },
-                    retry_count: 0,
+                .map(|(piece, formula)| {
+                    debug!(piece_id = piece.id, label = %piece.label, "paired piece with formula (mismatch)");
+                    FormulaBranch {
+                        piece: piece.clone(),
+                        input_content: Arc::clone(&input_content),
+                        verified: verified.clone(),
+                        formula: formula.clone(),
+                        phase: BranchPhase::WaitForSolver { formula },
+                        retry_count: 0,
+                    }
                 })
                 .collect()
         } else {
-            pieces
+            let expected = pieces.len();
+            let branches: Vec<_> = pieces
                 .clone()
                 .into_iter()
                 .zip(formulas)
-                .map(|(piece, formula)| FormulaBranch {
-                    piece: piece.clone(),
-                    input_content: Arc::clone(&input_content),
-                    verified: verified.clone(),
-                    formula: formula.clone(),
-                    phase: BranchPhase::WaitForSolver { formula },
-                    retry_count: 0,
+                .map(|(piece, formula)| {
+                    debug!(piece_id = piece.id, label = %piece.label, "paired piece with formula");
+                    FormulaBranch {
+                        piece: piece.clone(),
+                        input_content: Arc::clone(&input_content),
+                        verified: verified.clone(),
+                        formula: formula.clone(),
+                        phase: BranchPhase::WaitForSolver { formula },
+                        retry_count: 0,
+                    }
                 })
-                .collect()
+                .collect();
+            assert_eq!(branches.len(), expected, "zip must not truncate");
+            branches
         };
 
         TransitionFromGeneration::Results(WaitForResults {
@@ -157,8 +171,8 @@ impl WaitForResults {
             if new_depth >= MAX_SPLIT_DEPTH {
                 for (piece, reason) in needs_resplit {
                     open.push(OpenItem {
+                        piece,
                         formula: String::new(),
-                        piece_label: piece.label,
                         reason: format!("split depth exhausted ({MAX_SPLIT_DEPTH}): {reason}"),
                         solver_stdout: String::new(),
                         solver_stderr: String::new(),
@@ -188,13 +202,14 @@ impl WaitForResults {
             return TransitionFromResults::Done(build_result(&verified, 0, &counts));
         }
 
+        let pieces: Vec<CodePiece> = open.iter().map(|o| o.piece.clone()).collect();
         TransitionFromResults::Generation(WaitForGeneration {
             input_content: self.input_content,
             verified,
             open,
             iteration: self.iteration + 1,
             insist: InsistState::Idle,
-            pieces: Vec::new(),
+            pieces,
         })
     }
 }
@@ -236,22 +251,22 @@ pub fn transition_solver(formula: String, result: SolverResult) -> BranchFromSol
 
 pub fn transition_judge(
     formula: String,
-    piece_label: String,
+    piece: CodePiece,
     solver_result: SolverResult,
     verdict: JudgeVerdict,
     retry_count: usize,
 ) -> BranchFromJudge {
     match verdict {
         JudgeVerdict::Reasonable => BranchFromJudge::Verified(VerifiedPiece {
+            piece,
             formula,
-            piece_label,
             outcome: solver_result.outcome,
         }),
         JudgeVerdict::Retry(feedback) => {
             if retry_count + 1 >= MAX_BRANCH_RETRIES {
                 BranchFromJudge::Exhausted {
                     formula,
-                    piece_label,
+                    piece,
                     feedback,
                     solver_stdout: solver_result.stdout,
                     solver_stderr: solver_result.stderr,
@@ -278,7 +293,8 @@ pub fn build_result(
             .iter()
             .map(|v| FormulaResult {
                 formula: v.formula.clone(),
-                piece_label: v.piece_label.clone(),
+                piece_id: v.piece.id,
+                piece_label: v.piece.label.clone(),
                 outcome: v.outcome.clone(),
                 verdict: JUDGE_REASONABLE.to_string(),
                 explanation: None,

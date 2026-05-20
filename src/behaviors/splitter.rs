@@ -2,7 +2,7 @@ use anyhow::Result;
 use tracing::{debug, warn};
 
 use crate::provider::{LlmProvider, LlmRole};
-use crate::states::{CodePiece, WaitForSplit};
+use crate::states::{next_piece_id, CodePiece, WaitForSplit};
 
 pub async fn execute(
     state: &WaitForSplit,
@@ -85,6 +85,7 @@ fn extract_split_pieces(response: &str) -> Vec<CodePiece> {
             if let Some(label) = current_label.take() {
                 if !before_buf.trim().is_empty() || !after_buf.trim().is_empty() {
                     pieces.push(CodePiece {
+                        id: next_piece_id(),
                         label,
                         before: before_buf.trim().to_string(),
                         after: after_buf.trim().to_string(),
@@ -123,6 +124,7 @@ fn extract_split_pieces(response: &str) -> Vec<CodePiece> {
     if let Some(label) = current_label {
         if !before_buf.trim().is_empty() || !after_buf.trim().is_empty() {
             pieces.push(CodePiece {
+                id: next_piece_id(),
                 label,
                 before: before_buf.trim().to_string(),
                 after: after_buf.trim().to_string(),

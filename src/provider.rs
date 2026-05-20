@@ -24,6 +24,7 @@ pub trait SolverProvider: Send + Sync {
 
 pub struct FormulaResult {
     pub formula: String,
+    pub piece_id: u64,
     pub piece_label: String,
     pub outcome: SolverOutcome,
     pub verdict: String,

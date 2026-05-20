@@ -106,7 +106,7 @@ fn build_single_piece_messages(
     if !verified.is_empty() {
         content.push_str("Already verified pieces:\n");
         for v in verified {
-            content.push_str(&format!("  {}: {:?}\n", v.piece_label, v.outcome));
+            content.push_str(&format!("  {}: {:?}\n", v.piece.label, v.outcome));
         }
         content.push('\n');
     }

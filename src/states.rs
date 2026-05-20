@@ -1,10 +1,18 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::provider::AgentResult;
 use crate::smt::{SolverOutcome, SolverResult};
 
+static NEXT_PIECE_ID: AtomicU64 = AtomicU64::new(1);
+
+pub fn next_piece_id() -> u64 {
+    NEXT_PIECE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodePiece {
+    pub id: u64,
     pub label: String,
     pub before: String,
     pub after: String,
@@ -83,21 +91,21 @@ pub enum TransitionFromResults {
 
 #[derive(Debug, Clone)]
 pub struct VerifiedPiece {
+    pub piece: CodePiece,
     pub formula: String,
-    pub piece_label: String,
     pub outcome: SolverOutcome,
 }
 
 impl std::fmt::Display for VerifiedPiece {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{}] {} ({:?})", self.piece_label, self.formula, self.outcome)
+        write!(f, "[{} #{}] {} ({:?})", self.piece.label, self.piece.id, self.formula, self.outcome)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct OpenItem {
+    pub piece: CodePiece,
     pub formula: String,
-    pub piece_label: String,
     pub reason: String,
     pub solver_stdout: String,
     pub solver_stderr: String,
@@ -159,7 +167,7 @@ pub enum BranchFromJudge {
     },
     Exhausted {
         formula: String,
-        piece_label: String,
+        piece: CodePiece,
         feedback: String,
         solver_stdout: String,
         solver_stderr: String,

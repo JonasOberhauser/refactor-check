@@ -45,8 +45,8 @@ async fn run_branch(
                     }
                     BranchFromSolver::Error(f, r) => {
                         return Ok(vec![ChildDone::Open(OpenItem {
+                            piece,
                             formula: f,
-                            piece_label: piece.label,
                             reason: format!("Solver error: {}", r.stdout),
                             solver_stdout: r.stdout,
                             solver_stderr: r.stderr,
@@ -71,13 +71,13 @@ async fn run_branch(
                 current_formula = formula.clone();
                 match transitions::transition_judge(
                     formula,
-                    piece.label.clone(),
+                    piece.clone(),
                     solver_result,
                     verdict,
                     retry_count,
                 ) {
-                    BranchFromJudge::Verified(piece) => {
-                        return Ok(vec![ChildDone::Verified(piece)]);
+                    BranchFromJudge::Verified(verified) => {
+                        return Ok(vec![ChildDone::Verified(verified)]);
                     }
                     BranchFromJudge::Retry {
                         formula: _,
@@ -97,14 +97,14 @@ async fn run_branch(
                     }
                     BranchFromJudge::Exhausted {
                         formula,
-                        piece_label,
+                        piece: exhausted_piece,
                         feedback,
                         solver_stdout,
                         solver_stderr,
                     } => {
                         return Ok(vec![ChildDone::Open(OpenItem {
+                            piece: exhausted_piece,
                             formula,
-                            piece_label,
                             reason: format!("Branch retry exhausted: {feedback}"),
                             solver_stdout,
                             solver_stderr,
@@ -160,8 +160,8 @@ async fn run_branch(
                     }
                     BranchFromNeedFormula::Exhausted(reason) => {
                         return Ok(vec![ChildDone::Open(OpenItem {
+                            piece,
                             formula: current_formula,
-                            piece_label: piece.label,
                             reason,
                             solver_stdout: solver_stdout.clone(),
                             solver_stderr: solver_stderr.clone(),

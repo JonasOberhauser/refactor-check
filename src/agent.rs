@@ -41,8 +41,8 @@ pub async fn run(input_file: &str, config: AgentConfig) -> anyhow::Result<()> {
     println!("=== Open Pieces ===\n{}\n", result.open_count);
     for f in &result.formulas {
         println!(
-            "--- Formula ---\n[{}]\n{}\nOutcome: {:?}, Verdict: {}\n",
-            f.piece_label, f.formula, f.outcome, f.verdict
+            "--- Formula ---\n[{} #{}]\n{}\nOutcome: {:?}, Verdict: {}\n",
+            f.piece_label, f.piece_id, f.formula, f.outcome, f.verdict
         );
         if let Some(ref explanation) = f.explanation {
             println!("--- Explanation ---\n{explanation}\n");
@@ -89,7 +89,7 @@ pub fn build_generation_messages(
                     SolverOutcome::Unknown => "UNKNOWN — inconclusive",
                     SolverOutcome::Error(_) => unreachable!(),
                 },
-                piece.piece_label,
+                piece.piece.label,
                 piece.formula,
             );
         }
@@ -103,7 +103,7 @@ pub fn build_generation_messages(
                 content,
                 "Open piece {}:\nLabel: {}\nFormula:\n{}\nIssue: {}\n",
                 i + 1,
-                item.piece_label,
+                item.piece.label,
                 item.formula,
                 item.reason,
             );

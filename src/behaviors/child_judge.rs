@@ -17,13 +17,20 @@ pub async fn execute(
     let mut attempts = 0;
     let mut last_response = String::new();
 
+    assert!(
+        !piece.before.is_empty() || !piece.after.is_empty(),
+        "piece {} #{} has empty BEFORE and AFTER",
+        piece.label,
+        piece.id,
+    );
+
     loop {
         attempts += 1;
         if attempts >= MAX_JUDGE_ATTEMPTS {
             anyhow::bail!("Judge failed to give a clear verdict after {MAX_JUDGE_ATTEMPTS} attempts");
         }
 
-        debug!(attempt = attempts, "asking judge for verdict");
+        debug!(attempt = attempts, piece_id = piece.id, label = %piece.label, "asking judge for verdict");
 
         let prompt = if attempts == 1 {
             format!(
