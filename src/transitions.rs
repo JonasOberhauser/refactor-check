@@ -1,52 +1,60 @@
 use std::sync::Arc;
+
+use async_trait::async_trait;
 use tracing::debug;
 
-use crate::consts::{JUDGE_REASONABLE, MAX_BRANCH_RETRIES, MAX_INSIST_ATTEMPTS, MAX_SPLIT_DEPTH};
-use crate::provider::{AgentResult, FormulaResult};
+use crate::behaviors::{self, generation};
+use crate::consts::{JUDGE_REASONABLE, MAX_BRANCH_RETRIES, MAX_GLOBAL_CYCLES, MAX_INSIST_ATTEMPTS, MAX_SPLIT_DEPTH};
+use crate::provider::{AgentResult, FormulaResult, LlmProvider, SolverProvider};
 use crate::smt::{SolverOutcome, SolverResult};
 use crate::states::*;
 
-// ===== Global transitions =====
+// ===== State machine =====
 
-impl WaitForSplit {
-    #[must_use]
-    pub fn transition(
-        self,
-        pieces: Vec<CodePiece>,
-    ) -> TransitionFromSplit {
-        TransitionFromSplit::Generate(WaitForGeneration {
+#[async_trait]
+impl AlgorithmState for WaitForSplit {
+    async fn execute(
+        self: Box<Self>,
+        llm: &dyn LlmProvider,
+        _solver: &dyn SolverProvider,
+    ) -> anyhow::Result<Step> {
+        let pieces = behaviors::splitter::execute(&self, llm).await?;
+        Ok(Step::State(Box::new(WaitForGeneration {
             input_content: self.input_content,
             verified: self.verified,
             open: self.open,
             iteration: self.iteration,
             insist: InsistState::Idle,
             pieces,
-        })
+        })))
     }
 }
 
-impl WaitForGeneration {
-    #[must_use]
-    pub fn transition(self, formula_pairs: Vec<PieceFormula>) -> TransitionFromGeneration {
-        let input_content = self.input_content;
-        let verified = self.verified;
-        let open = self.open;
-        let iteration = self.iteration;
-        let insist = self.insist;
-        let pieces = self.pieces;
-
+#[async_trait]
+impl AlgorithmState for WaitForGeneration {
+    async fn execute(
+        self: Box<Self>,
+        llm: &dyn LlmProvider,
+        _solver: &dyn SolverProvider,
+    ) -> anyhow::Result<Step> {
+        if let InsistState::Insisting { attempt, .. } = &self.insist {
+            if *attempt >= MAX_INSIST_ATTEMPTS {
+                anyhow::bail!("failed to extract any SMT formula after {MAX_INSIST_ATTEMPTS} insist attempts");
+            }
+        }
+        let formula_pairs = generation::execute(&self, llm).await?;
         if formula_pairs.is_empty() {
-            return TransitionFromGeneration::Insist(WaitForGeneration {
-                input_content,
-                verified,
-                open,
-                iteration,
+            return Ok(Step::State(Box::new(WaitForGeneration {
+                input_content: self.input_content,
+                verified: self.verified,
+                open: self.open,
+                iteration: self.iteration,
                 insist: InsistState::Insisting {
                     last_response: String::new(),
-                    attempt: insist.attempt() + 1,
+                    attempt: self.insist.attempt() + 1,
                 },
-                pieces,
-            });
+                pieces: self.pieces,
+            })));
         }
 
         let branches: Vec<FormulaBranch> = formula_pairs
@@ -61,8 +69,8 @@ impl WaitForGeneration {
                 debug!(piece_id = pf.piece.id, label = %pf.piece.label, "paired piece with formula");
                 FormulaBranch {
                     piece: pf.piece,
-                    input_content: Arc::clone(&input_content),
-                    verified: verified.clone(),
+                    input_content: Arc::clone(&self.input_content),
+                    verified: self.verified.clone(),
                     formula: pf.formula.clone(),
                     phase: BranchPhase::WaitForSolver {
                         formula: pf.formula,
@@ -72,20 +80,26 @@ impl WaitForGeneration {
             })
             .collect();
 
-        TransitionFromGeneration::Results(WaitForResults {
-            input_content,
-            verified,
-            open,
-            iteration,
+        Ok(Step::State(Box::new(WaitForResults {
+            input_content: self.input_content,
+            verified: self.verified,
+            open: self.open,
+            iteration: self.iteration,
             branches,
             split_depth: 0,
-        })
+        })))
     }
 }
 
-impl WaitForResults {
-    #[must_use]
-    pub fn transition(self, done: Vec<ChildDone>) -> TransitionFromResults {
+#[async_trait]
+impl AlgorithmState for WaitForResults {
+    async fn execute(
+        self: Box<Self>,
+        llm: &dyn LlmProvider,
+        solver: &dyn SolverProvider,
+    ) -> anyhow::Result<Step> {
+        let done = behaviors::results::execute_all(&self, llm, solver).await?;
+
         let mut verified = self.verified;
         let mut open = self.open;
         let mut needs_resplit: Vec<(CodePiece, String)> = Vec::new();
@@ -113,14 +127,14 @@ impl WaitForResults {
                     });
                 }
             } else {
-                return TransitionFromResults::Resplit(WaitForSplit {
+                return Ok(Step::State(Box::new(WaitForSplit {
                     input_content: Arc::clone(&self.input_content),
                     pieces_to_resplit: needs_resplit,
                     verified,
                     open,
                     iteration: self.iteration,
                     split_depth: new_depth,
-                });
+                })));
             }
         }
 
@@ -128,33 +142,51 @@ impl WaitForResults {
 
         if open.is_empty() {
             if counts.needs_explanation() {
-                return TransitionFromResults::Explain(WaitForExplanation {
+                return Ok(Step::State(Box::new(WaitForExplanation {
                     input_content: self.input_content,
                     result: build_result(&verified, 0, &counts),
-                });
+                })));
             }
-            return TransitionFromResults::Done(build_result(&verified, 0, &counts));
+            return Ok(Step::Result(build_result(&verified, 0, &counts)));
         }
 
+        let next_iteration = self.iteration + 1;
         let pieces: Vec<CodePiece> = open.iter().map(|o| o.piece.clone()).collect();
-        TransitionFromResults::Generation(WaitForGeneration {
+        let next = WaitForGeneration {
             input_content: self.input_content,
             verified,
             open,
-            iteration: self.iteration + 1,
+            iteration: next_iteration,
             insist: InsistState::Idle,
             pieces,
-        })
+        };
+
+        if next_iteration >= MAX_GLOBAL_CYCLES {
+            let counts = OutcomeCounts::from_verified(&next.verified);
+            return Ok(Step::Result(build_result(
+                &next.verified,
+                next.open.len(),
+                &counts,
+            )));
+        }
+
+        Ok(Step::State(Box::new(next)))
     }
 }
 
-impl WaitForExplanation {
-    #[must_use]
-    pub fn transition(mut self, explanations: Vec<Option<String>>) -> AgentResult {
-        for (f, explanation) in self.result.formulas.iter_mut().zip(explanations) {
+#[async_trait]
+impl AlgorithmState for WaitForExplanation {
+    async fn execute(
+        self: Box<Self>,
+        llm: &dyn LlmProvider,
+        _solver: &dyn SolverProvider,
+    ) -> anyhow::Result<Step> {
+        let explanations = behaviors::explain::execute(&self, llm).await?;
+        let mut result = self.result;
+        for (f, explanation) in result.formulas.iter_mut().zip(explanations) {
             f.explanation = explanation;
         }
-        self.result
+        Ok(Step::Result(result))
     }
 }
 

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::provider::AgentResult;
+use async_trait::async_trait;
+
+use crate::provider::{AgentResult, LlmProvider, SolverProvider};
 use crate::smt::{SolverOutcome, SolverResult};
 
 static NEXT_PIECE_ID: AtomicU64 = AtomicU64::new(1);
@@ -18,12 +20,18 @@ pub struct CodePiece {
     pub after: String,
 }
 
-pub enum AlgorithmState {
-    Idle,
-    WaitForSplit(WaitForSplit),
-    WaitForGeneration(WaitForGeneration),
-    WaitForResults(WaitForResults),
-    WaitForExplanation(WaitForExplanation),
+pub enum Step {
+    State(Box<dyn AlgorithmState>),
+    Result(AgentResult),
+}
+
+#[async_trait]
+pub trait AlgorithmState: Send + Sync {
+    async fn execute(
+        self: Box<Self>,
+        llm: &dyn LlmProvider,
+        solver: &dyn SolverProvider,
+    ) -> anyhow::Result<Step>;
 }
 
 pub enum InsistState {
@@ -70,22 +78,6 @@ pub struct WaitForResults {
 pub struct WaitForExplanation {
     pub input_content: Arc<String>,
     pub result: AgentResult,
-}
-
-pub enum TransitionFromSplit {
-    Generate(WaitForGeneration),
-}
-
-pub enum TransitionFromGeneration {
-    Results(WaitForResults),
-    Insist(WaitForGeneration),
-}
-
-pub enum TransitionFromResults {
-    Generation(WaitForGeneration),
-    Explain(WaitForExplanation),
-    Done(AgentResult),
-    Resplit(WaitForSplit),
 }
 
 #[derive(Debug, Clone)]
