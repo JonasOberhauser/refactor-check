@@ -74,7 +74,10 @@ pub async fn execute(
                  specific BEFORE/AFTER pair, answer ONLY with the single word REASONABLE. \
                  If the formula does NOT correctly check equivalence, explain what is wrong: \
                  Does it fail to represent some behavior? Is the encoding wrong? \
-                 Are assertions missing important cases? Provide your explanation concisely.",
+                 Are assertions missing important cases? \
+                 For loops or recursive functions, assume inductive arguments \
+                 (loop invariants / recursive postconditions) are acceptable \
+                 even if not explicitly proven. Provide your explanation concisely.",
             ),
             llm::user_message(&prompt),
         ];
