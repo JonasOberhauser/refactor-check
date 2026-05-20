@@ -115,7 +115,7 @@ fn extract_split_pieces(response: &str) -> Vec<CodePiece> {
         }
 
         if let Some(ref mut buf) = current_section {
-            buf.push_str(trimmed);
+            buf.push_str(line);
             buf.push('\n');
         }
     }
