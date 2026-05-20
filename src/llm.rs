@@ -15,6 +15,7 @@ use tracing::{debug, info, instrument, trace, warn};
 
 use crate::provider::{LlmProvider, LlmRole};
 
+#[derive(Debug)]
 pub enum Role {
     System,
     User,
@@ -351,6 +352,12 @@ impl LlmClient {
         messages: Vec<Message>,
         is_partial_valid: impl Fn(&str) -> bool,
     ) -> Result<String> {
+        for msg in &messages {
+            if !matches!(msg.role, Role::System) {
+                debug!(%label, role = ?msg.role, content = %msg.content, "LLM message");
+            }
+        }
+
         let request_messages: Vec<ChatCompletionRequestMessage> = messages
             .into_iter()
             .map(|msg| match msg.role {
