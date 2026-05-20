@@ -77,7 +77,7 @@ pub async fn execute(
                  Are assertions missing important cases? \
                  For loops or recursive functions, assume inductive arguments \
                  (loop invariants / recursive postconditions) are acceptable \
-                 even if not explicitly proven. Provide your explanation concisely.",
+                 even if not explicitly stated. Provide your explanation concisely.",
             ),
             llm::user_message(&prompt),
         ];
