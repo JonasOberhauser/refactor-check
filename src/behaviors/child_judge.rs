@@ -78,9 +78,9 @@ pub async fn execute(
                  behaviors, incorrect assertions), explain exactly where it deviates: \
                  which part of the BEFORE or AFTER code is misrepresented, \
                  and what is wrong with the formalization. Provide your explanation concisely. \
-                 \n\nFor loops or recursive functions, assume inductive arguments \
-                 (loop invariants / recursive postconditions) are acceptable \
-                 even if not explicitly stated.",
+                 \n\nFor loops or recursive functions, assume that checking single executions of the loop body, \
+                 or single code flows through recursive calls with recursion arguments proven to be equal \
+                 (potentially under some introduced loop invariant), is sufficient.",
             ),
             llm::user_message(&prompt),
         ];
