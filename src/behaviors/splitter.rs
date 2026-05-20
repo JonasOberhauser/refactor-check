@@ -40,7 +40,11 @@ fn build_split_messages(state: &WaitForSplit) -> Vec<crate::llm::Message> {
          - For loops, conditionals, or complex restructurings, split into matching fragments.\n\
          - Each BEFORE must have a matching AFTER.\n\
          - Labels must be short and descriptive.\n\
-         - Prefer fewer larger pieces over many tiny ones.",
+         - Prefer fewer larger pieces over many tiny ones.\n\
+          - If a piece contains code whose equivalence to code in another piece \
+          has already been verified, add a comment like \
+          \"the code from ... to ... has already been verified to be equivalent \
+          to the code from ... to ...\" so the formalizer can reuse that information.",
     );
 
     let prompt = if state.pieces_to_resplit.is_empty() {
