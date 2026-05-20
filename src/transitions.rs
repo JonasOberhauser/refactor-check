@@ -46,8 +46,11 @@ impl WaitForSplit {
 
 impl WaitForGeneration {
     #[must_use]
-    pub fn transition(self, llm_response: String) -> TransitionFromGeneration {
-        let formulas = extract_all_formulas(&llm_response);
+    pub fn transition(self, responses: Vec<String>) -> TransitionFromGeneration {
+        let formulas: Vec<String> = responses
+            .iter()
+            .flat_map(|r| extract_all_formulas(r))
+            .collect();
         let input_content = self.input_content;
         let verified = self.verified;
         let open = self.open;
@@ -56,13 +59,14 @@ impl WaitForGeneration {
         let pieces = self.pieces;
 
         if formulas.is_empty() {
+            let joined = responses.join("\n---\n");
             return TransitionFromGeneration::Insist(WaitForGeneration {
                 input_content,
                 verified,
                 open,
                 iteration,
                 insist: InsistState::Insisting {
-                    last_response: llm_response,
+                    last_response: joined,
                     attempt: insist.attempt() + 1,
                 },
                 pieces,

@@ -110,7 +110,7 @@ async fn test_split_no_split_happy_path() {
 #[test_log::test(tokio::test)]
 async fn test_split_two_pieces() {
     let llm = SequenceLlm::new(
-        vec![formula_response_two()],
+        vec![formula_response_single(), formula_response_single()],
         vec![],
         vec![
             JUDGE_REASONABLE.to_string(),
@@ -135,9 +135,15 @@ async fn test_split_four_pieces() {
     let llm = SequenceLlm::new(
         vec![
             "\
-Piece 1:\n```smt2\n(set-logic QF_LIA)\n(declare-fun x () Int)\n(declare-fun y () Int)\n(assert (= x y))\n(check-sat)\n```\n\n\
-Piece 2:\n```smt2\n(set-logic QF_LIA)\n(declare-fun a () Int)\n(declare-fun b () Int)\n(assert (= a b))\n(check-sat)\n```\n\n\
-Piece 3:\n```smt2\n(set-logic QF_LIA)\n(declare-fun c () Int)\n(declare-fun d () Int)\n(assert (= c d))\n(check-sat)\n```\n\n\
+Piece 1:\n```smt2\n(set-logic QF_LIA)\n(declare-fun x () Int)\n(declare-fun y () Int)\n(assert (= x y))\n(check-sat)\n```"
+                .to_string(),
+            "\
+Piece 2:\n```smt2\n(set-logic QF_LIA)\n(declare-fun a () Int)\n(declare-fun b () Int)\n(assert (= a b))\n(check-sat)\n```"
+                .to_string(),
+            "\
+Piece 3:\n```smt2\n(set-logic QF_LIA)\n(declare-fun c () Int)\n(declare-fun d () Int)\n(assert (= c d))\n(check-sat)\n```"
+                .to_string(),
+            "\
 Piece 4:\n```smt2\n(set-logic QF_LIA)\n(declare-fun e () Int)\n(declare-fun f () Int)\n(assert (= e f))\n(check-sat)\n```"
                 .to_string(),
         ],
@@ -191,7 +197,8 @@ async fn test_split_timeout_resplit() {
     let llm = SequenceLlm::new(
         vec![
             formula_response_single(),
-            formula_response_two(),
+            formula_response_single(),
+            formula_response_single(),
         ],
         vec![],
         vec![
@@ -304,7 +311,7 @@ async fn test_splitter_returns_empty_falls_back() {
 #[test_log::test(tokio::test)]
 async fn test_split_one_piece_judge_retry_then_verified() {
     let llm = SequenceLlm::new(
-        vec![formula_response_two()],
+        vec![formula_response_single(), formula_response_single()],
         vec![formula_response_single()],
         vec![
             "formula does not capture the loop invariant".to_string(),
