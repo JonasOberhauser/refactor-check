@@ -23,14 +23,6 @@ fn formula_response_single() -> String {
     format!("Here is the formula:\n\n```smt2\n{}\n```", smt_formula_single())
 }
 
-fn formula_response_two() -> String {
-    format!(
-        "Piece 1:\n\n```smt2\n{}\n```\n\n\
-         Piece 2:\n\n```smt2\n(set-logic QF_LIA)\n(declare-fun z () Int)\n(declare-fun w () Int)\n(assert (= z w))\n(check-sat)\n```",
-        smt_formula_single()
-    )
-}
-
 fn split_no_split() -> String {
     "\
 Piece: whole
@@ -94,7 +86,9 @@ async fn test_split_no_split_happy_path() {
         vec![JUDGE_REASONABLE.to_string()],
         vec![split_no_split()],
     );
-    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
+    let solver = FakeSolver {
+        outcome: SolverOutcome::Unsat,
+    };
 
     let result = machine::run("refactoring desc", &llm, &solver)
         .await
@@ -118,7 +112,9 @@ async fn test_split_two_pieces() {
         ],
         vec![split_two_pieces()],
     );
-    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
+    let solver = FakeSolver {
+        outcome: SolverOutcome::Unsat,
+    };
 
     let result = machine::run("refactoring desc", &llm, &solver)
         .await
@@ -156,7 +152,9 @@ Piece 4:\n```smt2\n(set-logic QF_LIA)\n(declare-fun e () Int)\n(declare-fun f ()
         ],
         vec![split_four_pieces()],
     );
-    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
+    let solver = FakeSolver {
+        outcome: SolverOutcome::Unsat,
+    };
 
     let result = machine::run("refactoring desc", &llm, &solver)
         .await
@@ -216,7 +214,9 @@ large code"
             split_two_pieces(),
         ],
     );
-    let solver = ToggleSolver { call_count: Arc::new(Mutex::new(0)) };
+    let solver = ToggleSolver {
+        call_count: Arc::new(Mutex::new(0)),
+    };
 
     let result = machine::run("refactoring desc", &llm, &solver)
         .await
@@ -236,7 +236,9 @@ async fn test_split_sat_result() {
         vec![JUDGE_REASONABLE.to_string()],
         vec![split_no_split()],
     );
-    let solver = FakeSolver { outcome: SolverOutcome::Sat };
+    let solver = FakeSolver {
+        outcome: SolverOutcome::Sat,
+    };
 
     let result = machine::run("refactoring desc", &llm, &solver)
         .await
@@ -247,38 +249,18 @@ async fn test_split_sat_result() {
     assert!(!result.overall_equivalent);
 }
 
-/// Old happy path without splitter (empty splitter queue).
-#[test_log::test(tokio::test)]
-async fn test_old_happy_path_unsat() {
-    let llm = SequenceLlm::new(
-        vec![formula_response_single()],
-        vec![],
-        vec![JUDGE_REASONABLE.to_string()],
-        vec!["".to_string()],
-    );
-    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
-
-    let result = machine::run("refactoring desc", &llm, &solver)
-        .await
-        .expect("agent should succeed");
-
-    assert_eq!(result.formulas.len(), 1);
-    assert!(result.overall_equivalent);
-}
-
-/// Generator insist then succeeds on split pieces.
+/// Per-piece generator retries on empty response.
 #[test_log::test(tokio::test)]
 async fn test_split_generator_insist_then_ok() {
     let llm = SequenceLlm::new(
-        vec![
-            "no formula here".to_string(),
-            formula_response_single(),
-        ],
+        vec!["no formula here".to_string(), formula_response_single()],
         vec![],
         vec![JUDGE_REASONABLE.to_string()],
         vec![split_no_split()],
     );
-    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
+    let solver = FakeSolver {
+        outcome: SolverOutcome::Unsat,
+    };
 
     let result = machine::run("refactoring desc", &llm, &solver)
         .await
@@ -288,16 +270,18 @@ async fn test_split_generator_insist_then_ok() {
     assert!(result.overall_equivalent);
 }
 
-/// Splitter returns empty → falls back to one-piece generation without split.
+/// Simple 1-piece verification with UNSAT.
 #[test_log::test(tokio::test)]
-async fn test_splitter_returns_empty_falls_back() {
+async fn test_split_one_piece_unsat() {
     let llm = SequenceLlm::new(
         vec![formula_response_single()],
         vec![],
         vec![JUDGE_REASONABLE.to_string()],
-        vec!["".to_string()],
+        vec![split_no_split()],
     );
-    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
+    let solver = FakeSolver {
+        outcome: SolverOutcome::Unsat,
+    };
 
     let result = machine::run("refactoring desc", &llm, &solver)
         .await
@@ -320,7 +304,9 @@ async fn test_split_one_piece_judge_retry_then_verified() {
         ],
         vec![split_two_pieces()],
     );
-    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
+    let solver = FakeSolver {
+        outcome: SolverOutcome::Unsat,
+    };
 
     let result = machine::run("refactoring desc", &llm, &solver)
         .await
@@ -331,24 +317,24 @@ async fn test_split_one_piece_judge_retry_then_verified() {
     assert!(result.overall_equivalent);
 }
 
-/// Old multi-formula batch without splitter.
+/// SAT piece with judge verifying it's a spurious SAT → overall not-equivalent.
 #[test_log::test(tokio::test)]
-async fn test_old_multi_formula_batch() {
+async fn test_split_sat_piece_detected() {
     let llm = SequenceLlm::new(
-        vec![formula_response_two()],
+        vec![formula_response_single()],
         vec![],
-        vec![
-            JUDGE_REASONABLE.to_string(),
-            JUDGE_REASONABLE.to_string(),
-        ],
-        vec!["".to_string()],
+        vec![JUDGE_REASONABLE.to_string()],
+        vec![split_no_split()],
     );
-    let solver = FakeSolver { outcome: SolverOutcome::Unsat };
+    let solver = FakeSolver {
+        outcome: SolverOutcome::Sat,
+    };
 
     let result = machine::run("refactoring desc", &llm, &solver)
         .await
         .expect("agent should succeed");
 
-    assert_eq!(result.formulas.len(), 2);
-    assert!(result.overall_equivalent);
+    assert_eq!(result.formulas.len(), 1);
+    assert_eq!(result.reasonable_sat, 1);
+    assert!(!result.overall_equivalent);
 }

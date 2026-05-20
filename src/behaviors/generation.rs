@@ -1,8 +1,10 @@
 use anyhow::Result;
 use futures::future::try_join_all;
+use tracing::warn;
 
 use crate::provider::{LlmProvider, LlmRole};
-use crate::states::{CodePiece, InsistState, VerifiedPiece, WaitForGeneration};
+use crate::smt::extract_all_formulas;
+use crate::states::{CodePiece, InsistState, PieceFormula, VerifiedPiece, WaitForGeneration};
 
 pub fn role_for_iteration(iteration: usize) -> LlmRole {
     if iteration == 0 {
@@ -15,68 +17,134 @@ pub fn role_for_iteration(iteration: usize) -> LlmRole {
 pub async fn execute(
     state: &WaitForGeneration,
     llm: &dyn LlmProvider,
-) -> Result<Vec<String>> {
+) -> Result<Vec<PieceFormula>> {
     let role = role_for_iteration(state.iteration);
 
     if let InsistState::Insisting { ref last_response, .. } = &state.insist {
-        let pieces_text = if state.pieces.is_empty() {
-            String::new()
-        } else {
-            let mut s = String::from("Pieces to generate formulas for:\n");
-            for (i, piece) in state.pieces.iter().enumerate() {
-                let _ = std::fmt::Write::write_fmt(
-                    &mut s,
-                    format_args!(
-                        "Piece {}: {}\nBEFORE:\n{}\nAFTER:\n{}\n\n",
-                        i + 1,
-                        piece.label,
-                        piece.before,
-                        piece.after,
-                    ),
-                );
-            }
-            s
-        };
-        let messages = vec![
-            crate::llm::system_message(
-                "You MUST output at least ONE SMT-LIB2 formula. \
-                 Put each formula in a separate ```smt2 code block. \
-                 Each formula must be complete with set-logic, declarations, assertions, and check-sat.",
-            ),
-            crate::llm::user_message(&format!(
-                "Original refactoring context:\n\n{ctx}\n\n\
-                 {pieces}\
-                 Your previous response did not contain any valid SMT formula. \
-                 Here was your previous response:\n\n{last_response}\n\n\
-                 Please try again. Output at least ONE valid SMT-LIB2 formula in a ```smt2 code block.",
-                ctx = state.input_content,
-                pieces = pieces_text,
-            )),
-        ];
-        let response = llm.chat(role, messages).await?;
-        return Ok(vec![response]);
+        return generate_insist(state, llm, role, last_response).await;
     }
 
-    if !state.pieces.is_empty() {
-        let futures: Vec<_> = state
-            .pieces
-            .iter()
-            .map(|piece| {
-                let messages =
-                    build_single_piece_messages(piece, &state.input_content, &state.verified);
-                llm.chat(role, messages)
-            })
-            .collect();
-        try_join_all(futures).await
-    } else {
-        let messages = crate::agent::build_generation_messages(
-            &state.input_content,
-            &state.verified,
-            &state.open,
-        );
+    assert!(!state.pieces.is_empty(), "must have pieces");
+
+    let futures: Vec<_> = state
+        .pieces
+        .iter()
+        .map(|piece| generate_one_formula(piece, &state.input_content, &state.verified, llm, role))
+        .collect();
+    let formulas: Vec<String> = try_join_all(futures).await?;
+
+    let results: Vec<PieceFormula> = state
+        .pieces
+        .iter()
+        .zip(formulas)
+        .map(|(piece, formula)| PieceFormula {
+            piece: piece.clone(),
+            formula,
+        })
+        .collect();
+    Ok(results)
+}
+
+async fn generate_one_formula(
+    piece: &CodePiece,
+    input_content: &str,
+    verified: &[VerifiedPiece],
+    llm: &dyn LlmProvider,
+    role: LlmRole,
+) -> Result<String> {
+    let mut last_response = String::new();
+    let mut attempt = 0;
+
+    loop {
+        attempt += 1;
+        let messages = if attempt == 1 {
+            build_single_piece_messages(piece, input_content, verified)
+        } else {
+            build_single_piece_insist(piece, &last_response, input_content)
+        };
         let response = llm.chat(role, messages).await?;
-        Ok(vec![response])
+        let mut formulas = extract_all_formulas(&response);
+
+        if formulas.len() == 1 {
+            return Ok(formulas.remove(0));
+        }
+
+        warn!(
+            piece_id = piece.id,
+            label = %piece.label,
+            count = formulas.len(),
+            attempt,
+            "piece produced != 1 formula, retrying"
+        );
+        last_response = response;
+
+        if attempt >= 5 {
+            return Err(anyhow::anyhow!(
+                "failed to produce exactly 1 formula for piece {} #{} after 5 attempts",
+                piece.label,
+                piece.id,
+            ));
+        }
     }
+}
+
+async fn generate_insist(
+    state: &WaitForGeneration,
+    llm: &dyn LlmProvider,
+    role: LlmRole,
+    last_response: &str,
+) -> Result<Vec<PieceFormula>> {
+    let pieces_text: String = state
+        .pieces
+        .iter()
+        .enumerate()
+        .fold(String::new(), |mut s, (i, piece)| {
+            let _ = std::fmt::Write::write_fmt(
+                &mut s,
+                format_args!(
+                    "Piece {}: {} #{} (BEFORE: {}, AFTER: {})\n",
+                    i + 1, piece.label, piece.id, piece.before, piece.after,
+                ),
+            );
+            s
+        });
+
+    let messages = vec![
+        crate::llm::system_message(&format!(
+            "You MUST output exactly ONE SMT-LIB2 formula per piece in a ```smt2 code block. \
+             Output exactly {n} formulas, one per piece, in order.",
+            n = state.pieces.len(),
+        )),
+        crate::llm::user_message(&format!(
+            "Original refactoring context:\n\n{ctx}\n\n\
+             {pieces}\n\
+             Your previous response did not contain valid formulas. \
+             Here was your previous response:\n\n{last_response}\n\n\
+             Please try again. Output exactly {n} formulas, one per piece, \
+             each in a ```smt2 code block.",
+            n = state.pieces.len(),
+            ctx = state.input_content,
+            pieces = pieces_text,
+        )),
+    ];
+
+    let response = llm.chat(role, messages).await?;
+    let mut formulas = extract_all_formulas(&response);
+
+    if formulas.len() != state.pieces.len() {
+        return Ok(Vec::new());
+    }
+
+    let results: Vec<PieceFormula> = state
+        .pieces
+        .iter()
+        .zip(formulas.drain(..))
+        .map(|(piece, formula)| PieceFormula {
+            piece: piece.clone(),
+            formula,
+        })
+        .collect();
+    Ok(results)
 }
 
 fn build_single_piece_messages(
@@ -86,15 +154,16 @@ fn build_single_piece_messages(
 ) -> Vec<crate::llm::Message> {
     let mut messages = Vec::new();
 
-    messages.push(crate::llm::system_message(
-        "You are an expert in formal verification. Generate ONE complete SMT-LIB2 formula \
+    messages.push(crate::llm::system_message(&format!(
+        "Piece ID: {id}\n\
+         You are an expert in formal verification. Generate ONE complete SMT-LIB2 formula \
          to verify equivalence of this BEFORE/AFTER pair. \
-         \n\nRules:\n\
-         - Output exactly ONE formula in a single ```smt2 code block.\n\
-         - The formula must be complete (include set-logic, declarations, assertions, check-sat).\n\
-         - If the before/after are equivalent, the formula should be unsatisfiable.\n\
-         - If the formula is satisfiable, the code is NOT equivalent.",
-    ));
+         \nOutput exactly ONE formula in a single ```smt2 code block.\n\
+         The formula must be complete (include set-logic, declarations, assertions, check-sat).\n\
+         If the before/after are equivalent, the formula should be unsatisfiable.\n\
+         If the formula is satisfiable, the code is NOT equivalent.",
+        id = piece.id,
+    )));
 
     let mut content = format!(
         "Verify this piece:\nLabel: {}\nBEFORE:\n{}\nAFTER:\n{}\n",
@@ -115,7 +184,31 @@ fn build_single_piece_messages(
     messages
 }
 
-// Keep old builder for backward compat (no pieces case)
+fn build_single_piece_insist(
+    piece: &CodePiece,
+    last_response: &str,
+    input_content: &str,
+) -> Vec<crate::llm::Message> {
+    vec![
+        crate::llm::system_message(&format!(
+            "Piece ID: {id}\n\
+             You MUST output exactly ONE SMT-LIB2 formula for this piece in a single ```smt2 code block. \
+             No explanations, no extra text.",
+            id = piece.id,
+        )),
+        crate::llm::user_message(&format!(
+            "Original refactoring context:\n\n{ctx}\n\n\
+             Piece {label} #BEFORE:\n{before}\n#AFTER:\n{after}\n\n\
+             Your previous response:\n\n{last_response}\n\n\
+             Did not contain exactly one formula. Output exactly ONE formula in a ```smt2 code block.",
+            ctx = input_content,
+            label = piece.label,
+            before = piece.before,
+            after = piece.after,
+        )),
+    ]
+}
+
 pub fn build_retry_messages(
     piece: &CodePiece,
     formula: &str,

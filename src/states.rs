@@ -74,7 +74,6 @@ pub struct WaitForExplanation {
 
 pub enum TransitionFromSplit {
     Generate(WaitForGeneration),
-    Open(Vec<OpenItem>, WaitForGeneration),
 }
 
 pub enum TransitionFromGeneration {
@@ -87,6 +86,12 @@ pub enum TransitionFromResults {
     Explain(WaitForExplanation),
     Done(AgentResult),
     Resplit(WaitForSplit),
+}
+
+#[derive(Debug, Clone)]
+pub struct PieceFormula {
+    pub piece: CodePiece,
+    pub formula: String,
 }
 
 #[derive(Debug, Clone)]

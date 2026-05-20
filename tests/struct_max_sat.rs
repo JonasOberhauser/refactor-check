@@ -61,14 +61,29 @@ fn struct_max_formula_response() -> String {
 ```"#.to_string()
 }
 
-/// Bug reproduction: judge overrules a spurious SAT result.
+fn struct_max_split() -> String {
+    "\
+Piece: max_of_three
+---- BEFORE ----
+(declare-fun max_of_three_before (Entry Entry Entry) Entry)
+(assert (forall ((a Entry) (b Entry) (c Entry))
+  (let ((m (ite (> (key b) (key a)) b a)))
+    (let ((m2 (ite (> (key c) (key m)) c m)))
+      (= (max_of_three_before a b c) m2)))))
+---- AFTER ----
+(declare-fun max_of_three_after (Entry Entry Entry) Entry)
+(assert (forall ((a Entry) (b Entry) (c Entry))
+  (= (max_of_three_after a b c)
+     (max_entry (max_entry a b) c))))"
+        .to_string()
+}
 #[test_log::test(tokio::test)]
 async fn test_sat_judge_overrules() {
     let llm = SequenceLlm::new(
         vec![struct_max_formula_response()],
         vec![],
         vec![JUDGE_REASONABLE.to_string()],
-        vec!["".to_string()],
+        vec![struct_max_split()],
     );
     let solver = FakeSolver {
         outcome: SolverOutcome::Sat,

@@ -1,9 +1,9 @@
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::consts::{JUDGE_REASONABLE, MAX_BRANCH_RETRIES, MAX_INSIST_ATTEMPTS, MAX_SPLIT_DEPTH};
 use crate::provider::{AgentResult, FormulaResult};
-use crate::smt::{SolverOutcome, SolverResult, extract_all_formulas};
+use crate::smt::{SolverOutcome, SolverResult};
 use crate::states::*;
 
 // ===== Global transitions =====
@@ -14,30 +14,11 @@ impl WaitForSplit {
         self,
         pieces: Vec<CodePiece>,
     ) -> TransitionFromSplit {
-        let input_content = self.input_content;
-        let verified = self.verified;
-        let open = self.open;
-        let iteration = self.iteration;
-
-        if pieces.is_empty() {
-            return TransitionFromSplit::Open(
-                open.clone(),
-                WaitForGeneration {
-                    input_content,
-                    verified,
-                    open,
-                    iteration,
-                    insist: InsistState::Idle,
-                    pieces: Vec::new(),
-                },
-            );
-        }
-
         TransitionFromSplit::Generate(WaitForGeneration {
-            input_content,
-            verified,
-            open,
-            iteration,
+            input_content: self.input_content,
+            verified: self.verified,
+            open: self.open,
+            iteration: self.iteration,
             insist: InsistState::Idle,
             pieces,
         })
@@ -46,11 +27,7 @@ impl WaitForSplit {
 
 impl WaitForGeneration {
     #[must_use]
-    pub fn transition(self, responses: Vec<String>) -> TransitionFromGeneration {
-        let formulas: Vec<String> = responses
-            .iter()
-            .flat_map(|r| extract_all_formulas(r))
-            .collect();
+    pub fn transition(self, formula_pairs: Vec<PieceFormula>) -> TransitionFromGeneration {
         let input_content = self.input_content;
         let verified = self.verified;
         let open = self.open;
@@ -58,85 +35,42 @@ impl WaitForGeneration {
         let insist = self.insist;
         let pieces = self.pieces;
 
-        if formulas.is_empty() {
-            let joined = responses.join("\n---\n");
+        if formula_pairs.is_empty() {
             return TransitionFromGeneration::Insist(WaitForGeneration {
                 input_content,
                 verified,
                 open,
                 iteration,
                 insist: InsistState::Insisting {
-                    last_response: joined,
+                    last_response: String::new(),
                     attempt: insist.attempt() + 1,
                 },
                 pieces,
             });
         }
 
-        let branches: Vec<FormulaBranch> = if pieces.is_empty() {
-            formulas
-                .into_iter()
-                .map(|formula| {
-                    let p = CodePiece {
-                        id: next_piece_id(),
-                        label: "whole".to_string(),
-                        before: (*input_content).clone(),
-                        after: (*input_content).clone(),
-                    };
-                    debug!(piece_id = p.id, label = %p.label, "created branch (no-split)");
-                    FormulaBranch {
-                        piece: p,
-                        input_content: Arc::clone(&input_content),
-                        verified: verified.clone(),
-                        formula: formula.clone(),
-                        phase: BranchPhase::WaitForSolver { formula },
-                        retry_count: 0,
-                    }
-                })
-                .collect()
-        } else if formulas.len() != pieces.len() {
-            warn!(
-                pieces = pieces.len(),
-                formulas = formulas.len(),
-                "formula/piece count mismatch, truncating"
-            );
-            pieces
-                .clone()
-                .into_iter()
-                .zip(formulas)
-                .map(|(piece, formula)| {
-                    debug!(piece_id = piece.id, label = %piece.label, "paired piece with formula (mismatch)");
-                    FormulaBranch {
-                        piece: piece.clone(),
-                        input_content: Arc::clone(&input_content),
-                        verified: verified.clone(),
-                        formula: formula.clone(),
-                        phase: BranchPhase::WaitForSolver { formula },
-                        retry_count: 0,
-                    }
-                })
-                .collect()
-        } else {
-            let expected = pieces.len();
-            let branches: Vec<_> = pieces
-                .clone()
-                .into_iter()
-                .zip(formulas)
-                .map(|(piece, formula)| {
-                    debug!(piece_id = piece.id, label = %piece.label, "paired piece with formula");
-                    FormulaBranch {
-                        piece: piece.clone(),
-                        input_content: Arc::clone(&input_content),
-                        verified: verified.clone(),
-                        formula: formula.clone(),
-                        phase: BranchPhase::WaitForSolver { formula },
-                        retry_count: 0,
-                    }
-                })
-                .collect();
-            assert_eq!(branches.len(), expected, "zip must not truncate");
-            branches
-        };
+        let branches: Vec<FormulaBranch> = formula_pairs
+            .into_iter()
+            .map(|pf| {
+                assert!(
+                    pf.piece.id != 0,
+                    "piece {} #{} has invalid id",
+                    pf.piece.label,
+                    pf.piece.id,
+                );
+                debug!(piece_id = pf.piece.id, label = %pf.piece.label, "paired piece with formula");
+                FormulaBranch {
+                    piece: pf.piece,
+                    input_content: Arc::clone(&input_content),
+                    verified: verified.clone(),
+                    formula: pf.formula.clone(),
+                    phase: BranchPhase::WaitForSolver {
+                        formula: pf.formula,
+                    },
+                    retry_count: 0,
+                }
+            })
+            .collect();
 
         TransitionFromGeneration::Results(WaitForResults {
             input_content,

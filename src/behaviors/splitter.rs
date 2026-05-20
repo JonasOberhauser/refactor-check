@@ -8,22 +8,20 @@ pub async fn execute(
     state: &WaitForSplit,
     llm: &dyn LlmProvider,
 ) -> Result<Vec<CodePiece>> {
-    let messages = build_split_messages(state);
-    let response = llm.chat(LlmRole::Splitter, messages).await?;
-    let pieces = extract_split_pieces(&response);
+    for attempt in 0..3 {
+        let messages = build_split_messages(state);
+        let response = llm.chat(LlmRole::Splitter, messages).await?;
+        let pieces = extract_split_pieces(&response);
 
-    if pieces.is_empty() {
-        if state.pieces_to_resplit.is_empty() {
-            debug!("splitter produced no pieces, falling back to full generation");
-            Ok(vec![])
-        } else {
-            warn!("splitter produced no valid pieces for re-split");
-            Err(anyhow::anyhow!("splitter produced no valid pieces for re-split"))
+        if !pieces.is_empty() {
+            debug!(count = pieces.len(), attempt = attempt + 1, "splitter produced pieces");
+            return Ok(pieces);
         }
-    } else {
-        debug!(count = pieces.len(), "splitter produced pieces");
-        Ok(pieces)
+        warn!(attempt = attempt + 1, "splitter produced no valid pieces, retrying");
     }
+    Err(anyhow::anyhow!(
+        "splitter failed to produce valid pieces after 3 attempts"
+    ))
 }
 
 fn build_split_messages(state: &WaitForSplit) -> Vec<crate::llm::Message> {

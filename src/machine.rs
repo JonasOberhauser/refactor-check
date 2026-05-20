@@ -28,10 +28,10 @@ pub async fn run(
             AlgorithmState::WaitForSplit(s) => {
                 let pieces = behaviors::splitter::execute(&s, llm).await;
                 match pieces {
-                    Ok(pcs) => match s.transition(pcs) {
-                        TransitionFromSplit::Generate(next) => AlgorithmState::WaitForGeneration(next),
-                        TransitionFromSplit::Open(_open_items, next) => AlgorithmState::WaitForGeneration(next),
-                    },
+                    Ok(pcs) => {
+                    let TransitionFromSplit::Generate(next) = s.transition(pcs);
+                    AlgorithmState::WaitForGeneration(next)
+                }
                     Err(e) => return Err(e),
                 }
             }
