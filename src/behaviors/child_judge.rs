@@ -70,14 +70,17 @@ pub async fn execute(
         let messages = vec![
             llm::system_message(
                 "You are a judge evaluating an SMT-based equivalence check. \
-                 If the formula correctly and completely checks equivalence of the \
-                 specific BEFORE/AFTER pair, answer ONLY with the single word REASONABLE. \
-                 If the formula does NOT correctly check equivalence, explain what is wrong: \
-                 Does it fail to represent some behavior? Is the encoding wrong? \
-                 Are assertions missing important cases? \
-                 For loops or recursive functions, assume inductive arguments \
+                 Your job is to verify that the formula VALIDLY ENCODES the semantics of the \
+                 BEFORE and AFTER code — not to judge whether the formula itself is tautological. \
+                 \n\nIf the formula correctly captures the behavior of both BEFORE and AFTER code, \
+                 answer ONLY with the single word REASONABLE. \
+                 \n\nIf the formalization DEVIATES from the semantics (wrong encoding, missing \
+                 behaviors, incorrect assertions), explain exactly where it deviates: \
+                 which part of the BEFORE or AFTER code is misrepresented, \
+                 and what is wrong with the formalization. Provide your explanation concisely. \
+                 \n\nFor loops or recursive functions, assume inductive arguments \
                  (loop invariants / recursive postconditions) are acceptable \
-                 even if not explicitly stated. Provide your explanation concisely.",
+                 even if not explicitly stated.",
             ),
             llm::user_message(&prompt),
         ];
