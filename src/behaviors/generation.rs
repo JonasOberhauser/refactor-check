@@ -1,6 +1,6 @@
 use anyhow::Result;
 use futures::future::try_join_all;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::provider::{LlmProvider, LlmRole};
 use crate::smt::extract_all_formulas;
@@ -29,17 +29,24 @@ pub async fn execute(
     let futures: Vec<_> = state
         .pieces
         .iter()
-        .map(|piece| generate_one_formula(piece, &state.input_content, &state.verified, llm, role))
+        .map(|piece| {
+            debug!(piece_id = piece.id, label = %piece.label, "dispatching generation for piece");
+            generate_one_formula(piece, &state.input_content, &state.verified, llm, role)
+        })
         .collect();
     let formulas: Vec<String> = try_join_all(futures).await?;
+    debug!(count = formulas.len(), "generation complete for all pieces");
 
     let results: Vec<PieceFormula> = state
         .pieces
         .iter()
         .zip(formulas)
-        .map(|(piece, formula)| PieceFormula {
-            piece: piece.clone(),
-            formula,
+        .map(|(piece, formula)| {
+            debug!(piece_id = piece.id, label = %piece.label, "collected formula for piece");
+            PieceFormula {
+                piece: piece.clone(),
+                formula,
+            }
         })
         .collect();
     Ok(results)
@@ -132,6 +139,11 @@ async fn generate_insist(
     let mut formulas = extract_all_formulas(&response);
 
     if formulas.len() != state.pieces.len() {
+        warn!(
+            expected = state.pieces.len(),
+            got = formulas.len(),
+            "insist generation produced wrong number of formulas"
+        );
         return Ok(Vec::new());
     }
 
@@ -139,9 +151,12 @@ async fn generate_insist(
         .pieces
         .iter()
         .zip(formulas.drain(..))
-        .map(|(piece, formula)| PieceFormula {
-            piece: piece.clone(),
-            formula,
+        .map(|(piece, formula)| {
+            debug!(piece_id = piece.id, label = %piece.label, "collected insist formula for piece");
+            PieceFormula {
+                piece: piece.clone(),
+                formula,
+            }
         })
         .collect();
     Ok(results)

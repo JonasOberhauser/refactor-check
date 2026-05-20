@@ -1,5 +1,6 @@
 use anyhow::Result;
 use futures::future;
+use tracing::debug;
 
 use crate::provider::{LlmProvider, LlmRole, SolverProvider};
 use crate::smt::extract_all_formulas;
@@ -35,7 +36,9 @@ async fn run_branch(
     loop {
         match phase {
             BranchPhase::WaitForSolver { formula } => {
+                debug!(piece_id = piece.id, label = %piece.label, "running solver");
                 let result = solver.run(&formula).await?;
+                debug!(piece_id = piece.id, label = %piece.label, outcome = ?result.outcome, "solver done");
                 match transitions::transition_solver(formula.clone(), result) {
                     BranchFromSolver::Judge(f, r) => {
                         phase = BranchPhase::WaitForJudge {
@@ -44,6 +47,7 @@ async fn run_branch(
                         };
                     }
                     BranchFromSolver::Error(f, r) => {
+                        debug!(piece_id = piece.id, label = %piece.label, "solver error");
                         return Ok(vec![ChildDone::Open(OpenItem {
                             piece,
                             formula: f,
@@ -53,6 +57,7 @@ async fn run_branch(
                         })]);
                     }
                     BranchFromSolver::Resplit(f, r) => {
+                        debug!(piece_id = piece.id, label = %piece.label, "solver timeout, requesting resplit");
                         return Ok(vec![ChildDone::NeedsResplit {
                             piece,
                             formula: f,
@@ -125,6 +130,7 @@ async fn run_branch(
 
                 let response = if insist_pending {
                     let prev = last_response.as_deref().unwrap_or("");
+                    debug!(piece_id = piece.id, label = %piece.label, "insist fixer retry for piece");
                     llm.chat(
                         role,
                         generation::build_retry_insist_messages(
@@ -133,6 +139,7 @@ async fn run_branch(
                     )
                     .await?
                 } else {
+                    debug!(piece_id = piece.id, label = %piece.label, "fixer retry for piece");
                     llm.chat(
                         role,
                         generation::build_retry_messages(
@@ -159,6 +166,7 @@ async fn run_branch(
                         };
                     }
                     BranchFromNeedFormula::Exhausted(reason) => {
+                        debug!(piece_id = piece.id, label = %piece.label, "need formula exhausted");
                         return Ok(vec![ChildDone::Open(OpenItem {
                             piece,
                             formula: current_formula,

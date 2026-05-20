@@ -14,7 +14,8 @@ pub async fn execute(
         let pieces = extract_split_pieces(&response);
 
         if !pieces.is_empty() {
-            debug!(count = pieces.len(), attempt = attempt + 1, "splitter produced pieces");
+            let ids: Vec<u64> = pieces.iter().map(|p| p.id).collect();
+            debug!(count = pieces.len(), ids = ?ids, attempt = attempt + 1, "splitter produced pieces");
             return Ok(pieces);
         }
         warn!(attempt = attempt + 1, "splitter produced no valid pieces, retrying");
@@ -86,8 +87,10 @@ fn extract_split_pieces(response: &str) -> Vec<CodePiece> {
         if trimmed.starts_with("Piece:") || trimmed.starts_with("Piece ") {
             if let Some(label) = current_label.take() {
                 if !before_buf.trim().is_empty() || !after_buf.trim().is_empty() {
+                    let id = next_piece_id();
+                    debug!(piece_id = id, label = %label, "extracted piece");
                     pieces.push(CodePiece {
-                        id: next_piece_id(),
+                        id,
                         label,
                         before: before_buf.trim().to_string(),
                         after: after_buf.trim().to_string(),
@@ -125,8 +128,10 @@ fn extract_split_pieces(response: &str) -> Vec<CodePiece> {
 
     if let Some(label) = current_label {
         if !before_buf.trim().is_empty() || !after_buf.trim().is_empty() {
+            let id = next_piece_id();
+            debug!(piece_id = id, label = %label, "extracted final piece");
             pieces.push(CodePiece {
-                id: next_piece_id(),
+                id,
                 label,
                 before: before_buf.trim().to_string(),
                 after: after_buf.trim().to_string(),
