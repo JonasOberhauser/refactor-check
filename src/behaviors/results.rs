@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use futures::future;
 use tracing::debug;
@@ -11,34 +13,34 @@ use super::child_judge;
 use super::generation;
 
 pub async fn execute_all(
-    state: &WaitForResults,
+    branches: Vec<FormulaBranch>,
     llm: &dyn LlmProvider,
     solver: &dyn SolverProvider,
 ) -> Result<Vec<ChildDone>> {
-    let futures = state
-        .branches
-        .iter()
+    let futures = branches
+        .into_iter()
         .map(|branch| run_branch(branch, llm, solver));
     let results: Vec<Vec<ChildDone>> = future::try_join_all(futures).await?;
     Ok(results.into_iter().flatten().collect())
 }
 
 async fn run_branch(
-    branch: &FormulaBranch,
+    branch: FormulaBranch,
     llm: &dyn LlmProvider,
     solver: &dyn SolverProvider,
 ) -> Result<Vec<ChildDone>> {
-    let piece = branch.piece.clone();
+    let piece = branch.piece;
     let mut retry_count = branch.retry_count;
     let mut phase = branch.phase.clone();
     let mut current_formula = branch.formula.clone();
+    let input_content = branch.input_content;
 
     loop {
         match phase {
             BranchPhase::WaitForSolver { formula } => {
-                debug!(piece_id = piece.id, label = %piece.label, "running solver");
+                debug!(piece_id = piece.id(), label = %piece.label(), "running solver");
                 let result = solver.run(&formula, Some(&piece)).await?;
-                debug!(piece_id = piece.id, label = %piece.label, outcome = ?result.outcome, "solver done");
+                debug!(piece_id = piece.id(), label = %piece.label(), outcome = ?result.outcome, "solver done");
                 match transitions::transition_solver(formula.clone(), result) {
                     BranchFromSolver::Judge(f, r) => {
                         phase = BranchPhase::WaitForJudge {
@@ -47,9 +49,9 @@ async fn run_branch(
                         };
                     }
                     BranchFromSolver::Error(f, r) => {
-                        debug!(piece_id = piece.id, label = %piece.label, "solver error");
+                        debug!(piece_id = piece.id(), label = %piece.label(), "solver error");
                         return Ok(vec![ChildDone::Open(OpenItem {
-                            piece,
+                            piece: Arc::clone(&piece),
                             formula: f,
                             reason: format!("Solver error: {}", r.stdout),
                             solver_stdout: r.stdout,
@@ -57,9 +59,9 @@ async fn run_branch(
                         })]);
                     }
                     BranchFromSolver::Resplit(f, r) => {
-                        debug!(piece_id = piece.id, label = %piece.label, "solver timeout, requesting resplit");
+                        debug!(piece_id = piece.id(), label = %piece.label(), "solver timeout, requesting resplit");
                         return Ok(vec![ChildDone::NeedsResplit {
-                            piece,
+                            piece: Arc::clone(&piece),
                             formula: f,
                             reason: r.stdout,
                         }]);
@@ -71,12 +73,12 @@ async fn run_branch(
                 solver_result,
             } => {
                 let verdict = child_judge::execute(
-                    &piece, &formula, &solver_result, llm, &branch.input_content,
+                    &piece, &formula, &solver_result, llm, &input_content,
                 ).await?;
                 current_formula = formula.clone();
                 match transitions::transition_judge(
                     formula,
-                    piece.clone(),
+                    Arc::clone(&piece),
                     solver_result,
                     verdict,
                     retry_count,
@@ -130,22 +132,22 @@ async fn run_branch(
 
                 let response = if insist_pending {
                     let prev = last_response.as_deref().unwrap_or("");
-                    debug!(piece_id = piece.id, label = %piece.label, "insist fixer retry for piece");
+                    debug!(piece_id = piece.id(), label = %piece.label(), "insist fixer retry for piece");
                     llm.chat(
                         role,
                         generation::build_retry_insist_messages(
-                            &piece, fb, prev, &branch.input_content,
+                            &piece, fb, prev, &input_content,
                         ),
                         Some(&piece),
                     )
                     .await?
                 } else {
-                    debug!(piece_id = piece.id, label = %piece.label, "fixer retry for piece");
+                    debug!(piece_id = piece.id(), label = %piece.label(), "fixer retry for piece");
                     llm.chat(
                         role,
                         generation::build_retry_messages(
                             &piece, &current_formula, fb,
-                            solver_stdout, solver_stderr, &branch.input_content,
+                            solver_stdout, solver_stderr, &input_content,
                         ),
                         Some(&piece),
                     )
@@ -168,9 +170,9 @@ async fn run_branch(
                         };
                     }
                     BranchFromNeedFormula::Exhausted(reason) => {
-                        debug!(piece_id = piece.id, label = %piece.label, "need formula exhausted");
+                        debug!(piece_id = piece.id(), label = %piece.label(), "need formula exhausted");
                         return Ok(vec![ChildDone::Open(OpenItem {
-                            piece,
+                            piece: Arc::clone(&piece),
                             formula: current_formula,
                             reason,
                             solver_stdout: solver_stdout.clone(),

@@ -4,7 +4,7 @@ use tracing::{debug, warn};
 
 use crate::provider::{LlmProvider, LlmRole};
 use crate::smt::{extract_all_formulas, extract_single_formula};
-use crate::states::{CodePiece, InsistState, PieceFormula, VerifiedPiece, WaitForGeneration};
+use crate::states::{CodePiece, InsistState, VerifiedPiece, WaitForGeneration};
 
 pub fn role_for_iteration(iteration: usize) -> LlmRole {
     if iteration == 0 {
@@ -17,7 +17,7 @@ pub fn role_for_iteration(iteration: usize) -> LlmRole {
 pub async fn execute(
     state: &WaitForGeneration,
     llm: &dyn LlmProvider,
-) -> Result<Vec<PieceFormula>> {
+) -> Result<Vec<String>> {
     let role = role_for_iteration(state.iteration);
 
     if let InsistState::Insisting { ref last_response, .. } = &state.insist {
@@ -30,26 +30,13 @@ pub async fn execute(
         .pieces
         .iter()
         .map(|piece| {
-            debug!(piece_id = piece.id, label = %piece.label, "dispatching generation for piece");
+            debug!(piece_id = piece.id(), label = %piece.label(), "dispatching generation for piece");
             generate_one_formula(piece, &state.input_content, &state.verified, llm, role)
         })
         .collect();
     let formulas: Vec<String> = try_join_all(futures).await?;
     debug!(count = formulas.len(), "generation complete for all pieces");
-
-    let results: Vec<PieceFormula> = state
-        .pieces
-        .iter()
-        .zip(formulas)
-        .map(|(piece, formula)| {
-            debug!(piece_id = piece.id, label = %piece.label, "collected formula for piece");
-            PieceFormula {
-                piece: piece.clone(),
-                formula,
-            }
-        })
-        .collect();
-    Ok(results)
+    Ok(formulas)
 }
 
 async fn generate_one_formula(
@@ -62,7 +49,7 @@ async fn generate_one_formula(
     let messages = build_single_piece_messages(piece, input_content, verified);
     let response = llm.chat(role, messages, Some(piece)).await?;
     let formula = extract_single_formula(&response);
-    debug!(piece_id = piece.id, label = %piece.label, bytes = formula.len(), "extracted formula for piece");
+    debug!(piece_id = piece.id(), label = %piece.label(), bytes = formula.len(), "extracted formula for piece");
     Ok(formula)
 }
 
@@ -71,7 +58,7 @@ async fn generate_insist(
     llm: &dyn LlmProvider,
     role: LlmRole,
     last_response: &str,
-) -> Result<Vec<PieceFormula>> {
+) -> Result<Vec<String>> {
     let pieces_text: String = state
         .pieces
         .iter()
@@ -81,7 +68,7 @@ async fn generate_insist(
                 &mut s,
                 format_args!(
                     "Piece {}: {} #{} (BEFORE: {}, AFTER: {})\n",
-                    i + 1, piece.label, piece.id, piece.before, piece.after,
+                    i + 1, piece.label(), piece.id(), piece.before(), piece.after(),
                 ),
             );
             s
@@ -118,16 +105,13 @@ async fn generate_insist(
         return Ok(Vec::new());
     }
 
-    let results: Vec<PieceFormula> = state
+    let results: Vec<String> = state
         .pieces
         .iter()
         .zip(formulas.drain(..))
         .map(|(piece, formula)| {
-            debug!(piece_id = piece.id, label = %piece.label, "collected insist formula for piece");
-            PieceFormula {
-                piece: piece.clone(),
-                formula,
-            }
+            debug!(piece_id = piece.id(), label = %piece.label(), "collected insist formula for piece");
+            formula
         })
         .collect();
     Ok(results)
@@ -148,12 +132,12 @@ fn build_single_piece_messages(
          The formula must be complete (include set-logic, declarations, assertions, check-sat).\n\
          If the before/after are equivalent, the formula should be unsatisfiable.\n\
          If the formula is satisfiable, the code is NOT equivalent.",
-        id = piece.id,
+        id = piece.id(),
     )));
 
     let mut content = format!(
         "Verify this piece:\nLabel: {}\nBEFORE:\n{}\nAFTER:\n{}\n",
-        piece.label, piece.before, piece.after,
+        piece.label(), piece.before(), piece.after(),
     );
     if !input_content.is_empty() {
         content = format!("Original refactoring context:\n\n{}\n\n{}", input_content, content);
@@ -161,7 +145,7 @@ fn build_single_piece_messages(
     if !verified.is_empty() {
         content.push_str("Already verified pieces:\n");
         for v in verified {
-            content.push_str(&format!("  {}: {:?}\n", v.piece.label, v.outcome));
+            content.push_str(&format!("  {}: {:?}\n", v.piece.label(), v.outcome));
         }
         content.push('\n');
     }
@@ -193,9 +177,9 @@ pub fn build_retry_messages(
         solver_stdout,
         solver_stderr,
         ctx = input_content,
-        label = piece.label,
-        before = piece.before,
-        after = piece.after,
+        label = piece.label(),
+        before = piece.before(),
+        after = piece.after(),
     );
 
     vec![
@@ -230,9 +214,9 @@ pub fn build_retry_insist_messages(
              Feedback: {feedback}\n\n\
              Try again. ONE complete formula in a ```smt2 code block.",
             ctx = input_content,
-            label = piece.label,
-            before = piece.before,
-            after = piece.after,
+            label = piece.label(),
+            before = piece.before(),
+            after = piece.after(),
         )),
     ]
 }

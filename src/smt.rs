@@ -143,14 +143,15 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
 
 pub const DEFAULT_SOLVER_TIMEOUT_SECS: u64 = 60;
 
-#[instrument(skip_all, fields(solver_path))]
+#[instrument(skip_all, fields(solver_path, piece_id = ?piece_id))]
 pub async fn run_solver(
     solver_path: &str,
     solver_args: &[String],
     timeout: Duration,
     formula: &str,
+    piece_id: Option<u64>,
 ) -> Result<SolverResult> {
-    info!(formula_bytes = formula.len(), ?timeout, "running SMT solver");
+    info!(formula_bytes = formula.len(), ?timeout, piece_id = ?piece_id, "running SMT solver");
     let start = std::time::Instant::now();
 
     let mut child = tokio::process::Command::new(solver_path)
@@ -187,7 +188,7 @@ pub async fn run_solver(
 let status = tokio::select! {
         status = async move { child_for_wait.lock().await.wait().await } => Some(status),
         () = tokio::time::sleep(timeout) => {
-            warn!(elapsed_ms = start.elapsed().as_millis(), "solver timed out, killing process");
+            warn!(elapsed_ms = start.elapsed().as_millis(), piece_id = ?piece_id, "solver timed out, killing process");
             {
                 let mut guard = child.lock().await;
                 let _ = guard.kill().await;
@@ -221,12 +222,13 @@ let status = tokio::select! {
     let stdout = bytes_to_string(stdout);
     let stderr = bytes_to_string(stderr);
     let outcome = parse_solver_outcome(status.code(), &stdout, &stderr);
-    debug!(%stdout, %stderr, "solver raw output");
+    debug!(%stdout, %stderr, piece_id = ?piece_id, "solver raw output");
     info!(
         ?outcome,
         elapsed_ms = elapsed.as_millis(),
         stdout_bytes = stdout.len(),
         stderr_bytes = stderr.len(),
+        piece_id = ?piece_id,
         "solver finished"
     );
 
@@ -257,8 +259,8 @@ impl Z3Solver {
 
 #[async_trait]
 impl SolverProvider for Z3Solver {
-    async fn run(&self, formula: &str, _piece: Option<&crate::states::CodePiece>) -> Result<SolverResult> {
-        run_solver(&self.solver_path, &self.solver_args, self.timeout, formula).await
+    async fn run(&self, formula: &str, piece: Option<&crate::states::CodePiece>) -> Result<SolverResult> {
+        run_solver(&self.solver_path, &self.solver_args, self.timeout, formula, piece.map(|p| p.id())).await
     }
 }
 

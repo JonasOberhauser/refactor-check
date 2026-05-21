@@ -183,7 +183,7 @@ impl<'a> StreamHandler<'a> {
                 ..Default::default()
             };
 
-            debug!(%self.label, attempt, "sending LLM streaming request");
+            debug!(%self.label, piece_id = self.piece_id, attempt, "sending LLM streaming request");
 
             let mut stream = match self.client.chat().create_stream(request).await {
                 Ok(s) => s,
@@ -356,7 +356,7 @@ impl LlmClient {
         piece: Option<&crate::states::CodePiece>,
         is_partial_valid: impl Fn(&str) -> bool,
     ) -> Result<String> {
-        let pid = piece.map(|p| p.id);
+        let pid = piece.map(|p| p.id());
         for msg in &messages {
             if !matches!(msg.role, Role::System) {
                 let prefixed: String = msg.content.lines().map(|l| format!(">\t{l}")).collect::<Vec<_>>().join("\n");

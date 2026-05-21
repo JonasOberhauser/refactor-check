@@ -8,16 +8,42 @@ use crate::smt::{SolverOutcome, SolverResult};
 
 static NEXT_PIECE_ID: AtomicU64 = AtomicU64::new(1);
 
-pub fn next_piece_id() -> u64 {
+fn next_piece_id() -> u64 {
     NEXT_PIECE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct CodePiece {
-    pub id: u64,
-    pub label: String,
-    pub before: String,
-    pub after: String,
+    id: u64,
+    label: String,
+    before: String,
+    after: String,
+}
+
+impl CodePiece {
+    pub fn new(label: &str, before: &str, after: &str) -> Self {
+        Self {
+            id: next_piece_id(),
+            label: label.to_string(),
+            before: before.to_string(),
+            after: after.to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_id(id: u64, label: &str, before: &str, after: &str) -> Self {
+        Self {
+            id,
+            label: label.to_string(),
+            before: before.to_string(),
+            after: after.to_string(),
+        }
+    }
+
+    pub fn id(&self) -> u64 { self.id }
+    pub fn label(&self) -> &str { &self.label }
+    pub fn before(&self) -> &str { &self.before }
+    pub fn after(&self) -> &str { &self.after }
 }
 
 pub enum Step {
@@ -50,7 +76,7 @@ impl InsistState {
 
 pub struct WaitForSplit {
     pub input_content: Arc<String>,
-    pub pieces_to_resplit: Vec<(CodePiece, String)>,
+    pub pieces_to_resplit: Vec<(Arc<CodePiece>, String)>,
     pub verified: Vec<VerifiedPiece>,
     pub open: Vec<OpenItem>,
     pub iteration: usize,
@@ -63,7 +89,7 @@ pub struct WaitForGeneration {
     pub open: Vec<OpenItem>,
     pub iteration: usize,
     pub insist: InsistState,
-    pub pieces: Vec<CodePiece>,
+    pub pieces: Vec<Arc<CodePiece>>,
 }
 
 pub struct WaitForResults {
@@ -80,28 +106,22 @@ pub struct WaitForExplanation {
     pub result: AgentResult,
 }
 
-#[derive(Debug, Clone)]
-pub struct PieceFormula {
-    pub piece: CodePiece,
-    pub formula: String,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VerifiedPiece {
-    pub piece: CodePiece,
+    pub piece: Arc<CodePiece>,
     pub formula: String,
     pub outcome: SolverOutcome,
 }
 
 impl std::fmt::Display for VerifiedPiece {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{} #{}] {} ({:?})", self.piece.label, self.piece.id, self.formula, self.outcome)
+        write!(f, "[{} #{}] {} ({:?})", self.piece.label(), self.piece.id(), self.formula, self.outcome)
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct OpenItem {
-    pub piece: CodePiece,
+    pub piece: Arc<CodePiece>,
     pub formula: String,
     pub reason: String,
     pub solver_stdout: String,
@@ -115,9 +135,8 @@ pub enum JudgeVerdict {
 }
 
 pub struct FormulaBranch {
-    pub piece: CodePiece,
+    pub piece: Arc<CodePiece>,
     pub input_content: Arc<String>,
-    pub verified: Vec<VerifiedPiece>,
     pub formula: String,
     pub phase: BranchPhase,
     pub retry_count: usize,
@@ -164,7 +183,7 @@ pub enum BranchFromJudge {
     },
     Exhausted {
         formula: String,
-        piece: CodePiece,
+        piece: Arc<CodePiece>,
         feedback: String,
         solver_stdout: String,
         solver_stderr: String,
@@ -175,7 +194,7 @@ pub enum ChildDone {
     Verified(VerifiedPiece),
     Open(OpenItem),
     NeedsResplit {
-        piece: CodePiece,
+        piece: Arc<CodePiece>,
         formula: String,
         reason: String,
     },

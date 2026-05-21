@@ -2,7 +2,7 @@ use anyhow::Result;
 use tracing::{debug, warn};
 
 use crate::provider::{LlmProvider, LlmRole};
-use crate::states::{next_piece_id, CodePiece, WaitForSplit};
+use crate::states::{CodePiece, WaitForSplit};
 
 pub async fn execute(
     state: &WaitForSplit,
@@ -14,7 +14,7 @@ pub async fn execute(
         let pieces = extract_split_pieces(&response);
 
         if !pieces.is_empty() {
-            let ids: Vec<u64> = pieces.iter().map(|p| p.id).collect();
+            let ids: Vec<u64> = pieces.iter().map(|p| p.id()).collect();
             debug!(count = pieces.len(), ids = ?ids, attempt = attempt + 1, "splitter produced pieces");
             return Ok(pieces);
         }
@@ -62,9 +62,9 @@ fn build_split_messages(state: &WaitForSplit) -> Vec<crate::llm::Message> {
             prompt.push_str(&format!(
                 "Timeout piece {}:\nLabel: {}\nBefore:\n{}\nAfter:\n{}\nReason: {}\n\n",
                 i + 1,
-                piece.label,
-                piece.before,
-                piece.after,
+                piece.label(),
+                piece.before(),
+                piece.after(),
                 reason,
             ));
         }
@@ -76,7 +76,7 @@ fn build_split_messages(state: &WaitForSplit) -> Vec<crate::llm::Message> {
 
 fn extract_split_pieces(response: &str) -> Vec<CodePiece> {
     let mut pieces = Vec::new();
-    let mut current_label = None;
+    let mut current_label: Option<String> = None;
     let mut current_section: Option<&mut String> = None;
     let mut before_buf = String::new();
     let mut after_buf = String::new();
@@ -87,14 +87,13 @@ fn extract_split_pieces(response: &str) -> Vec<CodePiece> {
         if trimmed.starts_with("Piece:") || trimmed.starts_with("Piece ") {
             if let Some(label) = current_label.take() {
                 if !before_buf.trim().is_empty() || !after_buf.trim().is_empty() {
-                    let id = next_piece_id();
-                    debug!(piece_id = id, label = %label, "extracted piece");
-                    pieces.push(CodePiece {
-                        id,
-                        label,
-                        before: before_buf.trim().to_string(),
-                        after: after_buf.trim().to_string(),
-                    });
+                    let p = CodePiece::new(
+                        &label,
+                        before_buf.trim(),
+                        after_buf.trim(),
+                    );
+                    debug!(piece_id = p.id(), label = %p.label(), "extracted piece");
+                    pieces.push(p);
                 }
                 before_buf = String::new();
                 after_buf = String::new();
@@ -128,14 +127,13 @@ fn extract_split_pieces(response: &str) -> Vec<CodePiece> {
 
     if let Some(label) = current_label {
         if !before_buf.trim().is_empty() || !after_buf.trim().is_empty() {
-            let id = next_piece_id();
-            debug!(piece_id = id, label = %label, "extracted final piece");
-            pieces.push(CodePiece {
-                id,
-                label,
-                before: before_buf.trim().to_string(),
-                after: after_buf.trim().to_string(),
-            });
+            let p = CodePiece::new(
+                &label,
+                before_buf.trim(),
+                after_buf.trim(),
+            );
+            debug!(piece_id = p.id(), label = %p.label(), "extracted final piece");
+            pieces.push(p);
         }
     }
 
@@ -156,9 +154,9 @@ fn before() { x + 1 }
 fn after() { x + 1 }";
         let pieces = extract_split_pieces(response);
         assert_eq!(pieces.len(), 1);
-        assert_eq!(pieces[0].label, "main");
-        assert!(pieces[0].before.contains("fn before"));
-        assert!(pieces[0].after.contains("fn after"));
+        assert_eq!(pieces[0].label(), "main");
+        assert!(pieces[0].before().contains("fn before"));
+        assert!(pieces[0].after().contains("fn after"));
     }
 
     #[test]
@@ -183,9 +181,9 @@ cleanup(x);
 cleanup(x);";
         let pieces = extract_split_pieces(response);
         assert_eq!(pieces.len(), 3);
-        assert_eq!(pieces[0].label, "prelude");
-        assert_eq!(pieces[1].label, "loop_body");
-        assert_eq!(pieces[2].label, "postlude");
+        assert_eq!(pieces[0].label(), "prelude");
+        assert_eq!(pieces[1].label(), "loop_body");
+        assert_eq!(pieces[2].label(), "postlude");
     }
 
     #[test]
@@ -198,6 +196,6 @@ let x = 0;
 let x = 0;";
         let pieces = extract_split_pieces(response);
         assert_eq!(pieces.len(), 1);
-        assert_eq!(pieces[0].before, "let x = 0;");
+        assert_eq!(pieces[0].before(), "let x = 0;");
     }
 }

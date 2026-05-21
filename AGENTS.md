@@ -47,3 +47,20 @@ Every new feature branch must be based off of main, and previous feature branche
 ### Build habit
 
 Always run `cargo build --release` after making a change. This ensures the release binary is up to date for manual testing and prevents stale artifacts.
+
+## Design Decisions
+
+### CodePiece encapsulation (2026-05-21)
+
+- `CodePiece` has **private fields** and **no `Clone`/`Copy`**. It can only be constructed via `CodePiece::new(label, before, after)` which internally assigns a monotonically increasing `id` from a global `AtomicU64`.
+- `CodePiece::with_id(...)` is available under `#[cfg(test)]` only.
+- All consumers hold `&CodePiece` (never clone). Structs that need to own a piece use `Arc<CodePiece>` for cheap shared-ownership without cloning the underlying struct.
+- `PieceFormula` struct was removed. Generation returns `Vec<String>` (formulas), and the caller (`WaitForGeneration::execute`) zips formulas with owned `Arc<CodePiece>` from `self.pieces`.
+- `FormulaBranch.verified` field was removed (unused in Results phase).
+- State structs carrying pieces use `Vec<Arc<CodePiece>>` — state is moved between phases, never cloned.
+
+### Piece tracing (2026-05-21)
+
+- Every LLM call carries `piece: Option<&CodePiece>` for `piece_id` in trace spans.
+- Solver calls (`run_solver`) now thread `piece_id: Option<u64>` through to all internal logs (start, timeout, finished, raw output).
+- `StreamHandler` emits `piece_id` in both `sending LLM streaming request` and `full LLM response` events.

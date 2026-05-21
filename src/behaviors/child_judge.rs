@@ -18,10 +18,10 @@ pub async fn execute(
     let mut last_response = String::new();
 
     assert!(
-        !piece.before.is_empty() && !piece.after.is_empty(),
+        !piece.before().is_empty() && !piece.after().is_empty(),
         "piece {} #{} must have non-empty BEFORE and AFTER",
-        piece.label,
-        piece.id,
+        piece.label(),
+        piece.id(),
     );
 
     loop {
@@ -30,7 +30,7 @@ pub async fn execute(
             anyhow::bail!("Judge failed to give a clear verdict after {MAX_JUDGE_ATTEMPTS} attempts");
         }
 
-        debug!(attempt = attempts, piece_id = piece.id, label = %piece.label, "asking judge for verdict");
+        debug!(attempt = attempts, piece_id = piece.id(), label = %piece.label(), "asking judge for verdict");
 
         let prompt = if attempts == 1 {
             format!(
@@ -45,9 +45,9 @@ pub async fn execute(
                  Otherwise explain what is wrong with the formula.",
                 solver_result.stdout,
                 ctx = input_content,
-                label = piece.label,
-                before = piece.before,
-                after = piece.after,
+                label = piece.label(),
+                before = piece.before(),
+                after = piece.after(),
             )
         } else {
             format!(
@@ -61,9 +61,9 @@ pub async fn execute(
                  You MUST answer ONLY with REASONABLE or explain what is wrong.",
                 solver_result.stdout,
                 ctx = input_content,
-                label = piece.label,
-                before = piece.before,
-                after = piece.after,
+                label = piece.label(),
+                before = piece.before(),
+                after = piece.after(),
             )
         };
 

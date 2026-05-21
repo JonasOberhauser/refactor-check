@@ -18,7 +18,8 @@ impl AlgorithmState for WaitForSplit {
         llm: &dyn LlmProvider,
         _solver: &dyn SolverProvider,
     ) -> anyhow::Result<Step> {
-        let pieces = behaviors::splitter::execute(&self, llm).await?;
+        let raw_pieces = behaviors::splitter::execute(&self, llm).await?;
+        let pieces: Vec<Arc<CodePiece>> = raw_pieces.into_iter().map(Arc::new).collect();
         Ok(Step::State(Box::new(WaitForGeneration {
             input_content: self.input_content,
             verified: self.verified,
@@ -42,8 +43,8 @@ impl AlgorithmState for WaitForGeneration {
                 anyhow::bail!("failed to extract any SMT formula after {MAX_INSIST_ATTEMPTS} insist attempts");
             }
         }
-        let formula_pairs = generation::execute(&self, llm).await?;
-        if formula_pairs.is_empty() {
+        let formulas = generation::execute(&self, llm).await?;
+        if formulas.is_empty() {
             return Ok(Step::State(Box::new(WaitForGeneration {
                 input_content: self.input_content,
                 verified: self.verified,
@@ -57,23 +58,23 @@ impl AlgorithmState for WaitForGeneration {
             })));
         }
 
-        let branches: Vec<FormulaBranch> = formula_pairs
+        let branches: Vec<FormulaBranch> = self.pieces
             .into_iter()
-            .map(|pf| {
+            .zip(formulas)
+            .map(|(piece, formula)| {
                 assert!(
-                    pf.piece.id != 0,
+                    piece.id() != 0,
                     "piece {} #{} has invalid id",
-                    pf.piece.label,
-                    pf.piece.id,
+                    piece.label(),
+                    piece.id(),
                 );
-                debug!(piece_id = pf.piece.id, label = %pf.piece.label, "paired piece with formula");
+                debug!(piece_id = piece.id(), label = %piece.label(), "paired piece with formula");
                 FormulaBranch {
-                    piece: pf.piece,
+                    piece,
                     input_content: Arc::clone(&self.input_content),
-                    verified: self.verified.clone(),
-                    formula: pf.formula.clone(),
+                    formula: formula.clone(),
                     phase: BranchPhase::WaitForSolver {
-                        formula: pf.formula,
+                        formula,
                     },
                     retry_count: 0,
                 }
@@ -98,11 +99,12 @@ impl AlgorithmState for WaitForResults {
         llm: &dyn LlmProvider,
         solver: &dyn SolverProvider,
     ) -> anyhow::Result<Step> {
-        let done = behaviors::results::execute_all(&self, llm, solver).await?;
+        let WaitForResults { input_content, verified, open, iteration, branches, split_depth } = *self;
+        let done = behaviors::results::execute_all(branches, llm, solver).await?;
 
-        let mut verified = self.verified;
-        let mut open = self.open;
-        let mut needs_resplit: Vec<(CodePiece, String)> = Vec::new();
+        let mut verified = verified;
+        let mut open = open;
+        let mut needs_resplit: Vec<(Arc<CodePiece>, String)> = Vec::new();
 
         for cd in done {
             match cd {
@@ -115,7 +117,7 @@ impl AlgorithmState for WaitForResults {
         }
 
         if !needs_resplit.is_empty() {
-            let new_depth = self.split_depth + 1;
+            let new_depth = split_depth + 1;
             if new_depth >= MAX_SPLIT_DEPTH {
                 for (piece, reason) in needs_resplit {
                     open.push(OpenItem {
@@ -128,11 +130,11 @@ impl AlgorithmState for WaitForResults {
                 }
             } else {
                 return Ok(Step::State(Box::new(WaitForSplit {
-                    input_content: Arc::clone(&self.input_content),
+                    input_content: Arc::clone(&input_content),
                     pieces_to_resplit: needs_resplit,
                     verified,
                     open,
-                    iteration: self.iteration,
+                    iteration,
                     split_depth: new_depth,
                 })));
             }
@@ -143,17 +145,17 @@ impl AlgorithmState for WaitForResults {
         if open.is_empty() {
             if counts.needs_explanation() {
                 return Ok(Step::State(Box::new(WaitForExplanation {
-                    input_content: self.input_content,
+                    input_content,
                     result: build_result(&verified, 0, &counts),
                 })));
             }
             return Ok(Step::Result(build_result(&verified, 0, &counts)));
         }
 
-        let next_iteration = self.iteration + 1;
-        let pieces: Vec<CodePiece> = open.iter().map(|o| o.piece.clone()).collect();
+        let next_iteration = iteration + 1;
+        let pieces: Vec<Arc<CodePiece>> = open.iter().map(|o| Arc::clone(&o.piece)).collect();
         let next = WaitForGeneration {
-            input_content: self.input_content,
+            input_content,
             verified,
             open,
             iteration: next_iteration,
@@ -217,7 +219,7 @@ pub fn transition_solver(formula: String, result: SolverResult) -> BranchFromSol
 
 pub fn transition_judge(
     formula: String,
-    piece: CodePiece,
+    piece: Arc<CodePiece>,
     solver_result: SolverResult,
     verdict: JudgeVerdict,
     retry_count: usize,
@@ -259,8 +261,8 @@ pub fn build_result(
             .iter()
             .map(|v| FormulaResult {
                 formula: v.formula.clone(),
-                piece_id: v.piece.id,
-                piece_label: v.piece.label.clone(),
+                piece_id: v.piece.id(),
+                piece_label: v.piece.label().to_string(),
                 outcome: v.outcome.clone(),
                 verdict: JUDGE_REASONABLE.to_string(),
                 explanation: None,
