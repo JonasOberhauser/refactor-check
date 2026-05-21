@@ -26,38 +26,44 @@ pub struct SolverResult {
 
 pub fn extract_smt_formula(response: &str) -> Option<String> {
     trace!("extracting SMT formula from LLM response");
-    let formulas = collect_smt_formulas(response);
-    debug!(count = formulas.len(), "SMT formula candidates found");
-    if formulas.len() == 1 {
-        Some(formulas.into_iter().next().unwrap())
-    } else {
+    let formula = extract_single_formula(response);
+    debug!(bytes = formula.len(), "SMT formula extracted");
+    if formula.is_empty() {
         None
+    } else {
+        Some(formula)
     }
 }
 
 pub fn extract_all_formulas(response: &str) -> Vec<String> {
     trace!("extracting all SMT formulas from LLM response");
-    let formulas = collect_smt_formulas(response);
+    let formulas = find_fenced_smt_blocks(response);
     debug!(count = formulas.len(), "SMT formula candidates found");
-    formulas
-}
-
-fn backtick_count(line: &str) -> usize {
-    let trimmed = line.trim();
-    let mut count = 0;
-    for ch in trimmed.chars() {
-        if ch == '`' {
-            count += 1;
+    if formulas.is_empty() {
+        let trimmed = response.trim().to_string();
+        if trimmed.is_empty() {
+            Vec::new()
         } else {
-            break;
+            vec![trimmed]
         }
+    } else {
+        formulas
     }
-    count
 }
 
-fn collect_smt_formulas(text: &str) -> Vec<String> {
-    let mut formulas = Vec::new();
+pub fn extract_single_formula(response: &str) -> String {
+    let blocks = find_fenced_smt_blocks(response);
+    if blocks.len() == 1 {
+        blocks.into_iter().next().unwrap()
+    } else if blocks.is_empty() {
+        response.trim().to_string()
+    } else {
+        blocks.into_iter().next().unwrap()
+    }
+}
 
+fn find_fenced_smt_blocks(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
     let mut in_fence = false;
     let mut fence_backticks: usize = 0;
     let mut fence_buf = String::new();
@@ -74,8 +80,8 @@ fn collect_smt_formulas(text: &str) -> Vec<String> {
         if in_fence && bt_count >= 3 && bt_count >= fence_backticks {
             in_fence = false;
             let candidate = fence_buf.trim().to_string();
-            if looks_like_smt(&candidate) {
-                formulas.push(candidate);
+            if !candidate.is_empty() {
+                blocks.push(candidate);
             }
             continue;
         }
@@ -85,72 +91,20 @@ fn collect_smt_formulas(text: &str) -> Vec<String> {
         }
     }
 
-    if !formulas.is_empty() {
-        return formulas;
-    }
-
-    let mut current_block = String::new();
-    let mut in_block = false;
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if is_smt_line(trimmed) {
-            if !in_block {
-                in_block = true;
-            }
-            current_block.push_str(line);
-            current_block.push('\n');
-        } else if in_block {
-            in_block = false;
-            let candidate = current_block.trim().to_string();
-            if looks_like_smt(&candidate) {
-                formulas.push(candidate);
-            }
-            current_block.clear();
-        }
-    }
-
-    if in_block {
-        let candidate = current_block.trim().to_string();
-        if looks_like_smt(&candidate) {
-            formulas.push(candidate);
-        }
-    }
-
-    formulas
+    blocks
 }
 
-fn is_smt_line(line: &str) -> bool {
-    let line = line.trim();
-    line.starts_with("(set-logic")
-        || line.starts_with("(declare-")
-        || line.starts_with("(assert")
-        || line.starts_with("(check-sat")
-        || line.starts_with("(get-model)")
-        || line.starts_with("(get-value")
-        || line.starts_with("(define-fun")
-        || line.starts_with("(push)")
-        || line.starts_with("(pop)")
-        || line.starts_with("(exit)")
-        || line.starts_with(';')
-        || line.is_empty()
-        || line.starts_with("(set-option")
-        || line.starts_with("(set-info")
-}
-
-fn looks_like_smt(text: &str) -> bool {
-    let text = text.trim();
-    if text.is_empty() {
-        return false;
+fn backtick_count(line: &str) -> usize {
+    let trimmed = line.trim();
+    let mut count = 0;
+    for ch in trimmed.chars() {
+        if ch == '`' {
+            count += 1;
+        } else {
+            break;
+        }
     }
-    text.starts_with('(')
-        && (text.contains("(set-logic")
-            || text.contains("(check-sat")
-            || text.contains("(declare-")
-            || text.contains("(define-fun")
-            || text.contains("(assert")
-            || text.contains("(forall")
-            || text.contains("(exists"))
+    count
 }
 
 fn parse_solver_outcome(exit_code: Option<i32>, stdout: &str, stderr: &str) -> SolverOutcome {

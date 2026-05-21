@@ -320,14 +320,14 @@ impl LlmClient {
     #[instrument(skip_all, fields(model = %self.config.formalizer_model))]
     pub async fn chat_formalizer(&self, messages: Vec<Message>, piece: Option<&crate::states::CodePiece>) -> Result<String> {
         self.chat_inner("formalizer", &self.formalizer_client, &self.config.formalizer_model, messages, piece, |content| {
-            crate::smt::extract_smt_formula(content).is_some()
+            !content.trim().is_empty()
         }).await
     }
 
     #[instrument(skip_all, fields(model = %self.config.fixer_model))]
     pub async fn chat_fixer(&self, messages: Vec<Message>, piece: Option<&crate::states::CodePiece>) -> Result<String> {
         self.chat_inner("fixer", &self.fixer_client, &self.config.fixer_model, messages, piece, |content| {
-            crate::smt::extract_smt_formula(content).is_some()
+            !content.trim().is_empty()
         }).await
     }
 

@@ -3,7 +3,7 @@ use futures::future::try_join_all;
 use tracing::{debug, warn};
 
 use crate::provider::{LlmProvider, LlmRole};
-use crate::smt::extract_all_formulas;
+use crate::smt::{extract_all_formulas, extract_single_formula};
 use crate::states::{CodePiece, InsistState, PieceFormula, VerifiedPiece, WaitForGeneration};
 
 pub fn role_for_iteration(iteration: usize) -> LlmRole {
@@ -59,40 +59,11 @@ async fn generate_one_formula(
     llm: &dyn LlmProvider,
     role: LlmRole,
 ) -> Result<String> {
-    let mut last_response = String::new();
-    let mut attempt = 0;
-
-    loop {
-        attempt += 1;
-        let messages = if attempt == 1 {
-            build_single_piece_messages(piece, input_content, verified)
-        } else {
-            build_single_piece_insist(piece, &last_response, input_content)
-        };
-let response = llm.chat(role, messages, Some(piece)).await?;
-        let mut formulas = extract_all_formulas(&response);
-
-        if formulas.len() == 1 {
-            return Ok(formulas.remove(0));
-        }
-
-        warn!(
-            piece_id = piece.id,
-            label = %piece.label,
-            count = formulas.len(),
-            attempt,
-            "piece produced != 1 formula, retrying"
-        );
-        last_response = response;
-
-        if attempt >= 5 {
-            return Err(anyhow::anyhow!(
-                "failed to produce exactly 1 formula for piece {} #{} after 5 attempts",
-                piece.label,
-                piece.id,
-            ));
-        }
-    }
+    let messages = build_single_piece_messages(piece, input_content, verified);
+    let response = llm.chat(role, messages, Some(piece)).await?;
+    let formula = extract_single_formula(&response);
+    debug!(piece_id = piece.id, label = %piece.label, bytes = formula.len(), "extracted formula for piece");
+    Ok(formula)
 }
 
 async fn generate_insist(
@@ -197,31 +168,6 @@ fn build_single_piece_messages(
 
     messages.push(crate::llm::user_message(&content));
     messages
-}
-
-fn build_single_piece_insist(
-    piece: &CodePiece,
-    last_response: &str,
-    input_content: &str,
-) -> Vec<crate::llm::Message> {
-    vec![
-        crate::llm::system_message(&format!(
-            "Piece ID: {id}\n\
-             You MUST output exactly ONE SMT-LIB2 formula for this piece in a single ```smt2 code block. \
-             No explanations, no extra text.",
-            id = piece.id,
-        )),
-        crate::llm::user_message(&format!(
-            "Original refactoring context:\n\n{ctx}\n\n\
-             Piece {label} #BEFORE:\n{before}\n#AFTER:\n{after}\n\n\
-             Your previous response:\n\n{last_response}\n\n\
-             Did not contain exactly one formula. Output exactly ONE formula in a ```smt2 code block.",
-            ctx = input_content,
-            label = piece.label,
-            before = piece.before,
-            after = piece.after,
-        )),
-    ]
 }
 
 pub fn build_retry_messages(
