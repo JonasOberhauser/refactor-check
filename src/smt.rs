@@ -140,10 +140,17 @@ fn is_smt_line(line: &str) -> bool {
 
 fn looks_like_smt(text: &str) -> bool {
     let text = text.trim();
-    text.contains("(set-logic")
-        && text.contains("(check-sat")
-        && (text.contains("(declare-") || text.contains("(define-fun"))
-        && text.contains("(assert")
+    if text.is_empty() {
+        return false;
+    }
+    text.starts_with('(')
+        && (text.contains("(set-logic")
+            || text.contains("(check-sat")
+            || text.contains("(declare-")
+            || text.contains("(define-fun")
+            || text.contains("(assert")
+            || text.contains("(forall")
+            || text.contains("(exists"))
 }
 
 fn parse_solver_outcome(exit_code: Option<i32>, stdout: &str, stderr: &str) -> SolverOutcome {
