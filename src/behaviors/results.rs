@@ -4,6 +4,7 @@ use anyhow::Result;
 use futures::future;
 use tracing::debug;
 
+use crate::phase::{self, PiecePhase};
 use crate::provider::{LlmProvider, LlmRole, SolverProvider};
 use crate::smt::extract_all_formulas;
 use crate::states::*;
@@ -38,17 +39,20 @@ async fn run_branch(
     loop {
         match phase {
             BranchPhase::WaitForSolver { formula } => {
+                phase::expect_any_and_set(piece.id(), &[PiecePhase::Forming, PiecePhase::Fixing], PiecePhase::Solving);
                 debug!(piece_id = piece.id(), label = %piece.label(), "running solver");
                 let result = solver.run(&formula, Some(&piece)).await?;
                 debug!(piece_id = piece.id(), label = %piece.label(), outcome = ?result.outcome, "solver done");
                 match transitions::transition_solver(formula.clone(), result) {
                     BranchFromSolver::Judge(f, r) => {
+                        phase::advance(piece.id(), Some(PiecePhase::Solving), PiecePhase::Judging);
                         phase = BranchPhase::WaitForJudge {
                             formula: f,
                             solver_result: r,
                         };
                     }
                     BranchFromSolver::Error(f, r) => {
+                        phase::advance(piece.id(), Some(PiecePhase::Solving), PiecePhase::Open);
                         debug!(piece_id = piece.id(), label = %piece.label(), "solver error");
                         return Ok(vec![ChildDone::Open(OpenItem {
                             piece: Arc::clone(&piece),
@@ -59,6 +63,7 @@ async fn run_branch(
                         })]);
                     }
                     BranchFromSolver::Resplit(f, r) => {
+                        phase::advance(piece.id(), Some(PiecePhase::Solving), PiecePhase::Resplitting);
                         debug!(piece_id = piece.id(), label = %piece.label(), "solver timeout, requesting resplit");
                         return Ok(vec![ChildDone::NeedsResplit {
                             piece: Arc::clone(&piece),
@@ -84,6 +89,7 @@ async fn run_branch(
                     retry_count,
                 ) {
                     BranchFromJudge::Verified(verified) => {
+                        phase::advance(piece.id(), Some(PiecePhase::Judging), PiecePhase::Verified);
                         return Ok(vec![ChildDone::Verified(verified)]);
                     }
                     BranchFromJudge::Retry {
@@ -92,6 +98,7 @@ async fn run_branch(
                         solver_stdout,
                         solver_stderr,
                     } => {
+                        phase::advance(piece.id(), Some(PiecePhase::Judging), PiecePhase::Fixing);
                         retry_count += 1;
                         phase = BranchPhase::NeedFormula {
                             feedback: Some(feedback),
