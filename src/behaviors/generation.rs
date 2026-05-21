@@ -20,10 +20,9 @@ pub async fn execute(
     llm: &dyn LlmProvider,
 ) -> Result<Vec<String>> {
     let role = role_for_iteration(state.iteration);
-    let prev = if state.iteration == 0 { None } else { Some(PiecePhase::Open) };
     let new_phase = if role == LlmRole::Formalizer { PiecePhase::Forming } else { PiecePhase::Fixing };
     for piece in &state.pieces {
-        phase::advance(piece.id(), prev, new_phase);
+        phase::enter_generation(piece.id(), new_phase);
     }
 
     if let InsistState::Insisting { ref last_response, .. } = &state.insist {

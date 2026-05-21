@@ -54,3 +54,16 @@ pub fn expect_any_and_set(piece_id: u64, valid_from: &[PiecePhase], to: PiecePha
             );
         });
 }
+
+pub fn enter_generation(piece_id: u64, to: PiecePhase) {
+    PHASES
+        .entry(piece_id)
+        .and_modify(|phase| {
+            assert!(
+                matches!(*phase, PiecePhase::Open | PiecePhase::Forming | PiecePhase::Fixing),
+                "piece {piece_id} expected Open/Forming/Fixing but was {phase:?} when entering generation",
+            );
+            *phase = to;
+        })
+        .or_insert_with(|| to);
+}
