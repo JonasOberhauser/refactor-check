@@ -34,6 +34,10 @@ For `feature/<name>/<wip>` branch:
 
 - The `version` field in `Cargo.toml` must match the git release tag. When creating a release tag `vX.Y.Z`, first update `Cargo.toml` to `version = "X.Y.Z"` and commit it. The tag should point to that commit.
 
+### Pre-release checklist
+
+- **Before every release**, `README.md` must be updated to reflect the current state: CLI flags, architecture, usage instructions, and any new features.
+
 ## Important!
 
 Every new feature branch must be based off of main, and previous feature branches either explicitly abandoned by the user (you can ask them whether a feature branch should be abandoned when they ask for a new feature) or merged into main.
@@ -58,6 +62,22 @@ Always run `cargo build --release` after making a change. This ensures the relea
 - `PieceFormula` struct was removed. Generation returns `Vec<String>` (formulas), and the caller (`WaitForGeneration::execute`) zips formulas with owned `Arc<CodePiece>` from `self.pieces`.
 - `FormulaBranch.verified` field was removed (unused in Results phase).
 - State structs carrying pieces use `Vec<Arc<CodePiece>>` — state is moved between phases, never cloned.
+
+### PieceManager (2026-05-22)
+
+- All piece ID generation and phase tracking is behind the `PieceManager` trait (see `src/piece_manager.rs`).
+- `DefaultPieceManager` owns an `AtomicU64` counter and a `DashMap<u64, PiecePhase>` as normal fields — no global statics.
+- `CodePiece::new(label, before, after)` was removed. Pieces are created via `pm.new_piece(label, before, after)`.
+- `CodePiece::with_id(...)` is `pub(crate)` so `DefaultPieceManager` can assign deterministic IDs; it is NOT available to external crate consumers.
+- The `AlgorithmState` trait accepts `pm: &dyn PieceManager`. All state transitions thread the PieceManager.
+- Tests create their own `DefaultPieceManager` via `test_pm()`, ensuring isolated ID counters and phase maps per test.
+- Mock providers (`LogReplayLlm`, `LogReplaySolver`) support per-pieceid message/outcome queues for replay-based testing.
+
+### Phase tracking (2026-05-22)
+
+- `src/phase.rs` now only contains the `PiecePhase` enum. All tracking logic lives in `DefaultPieceManager`.
+- `enter_generation(piece_id, to)` allows entering generation from `absent | Open | Forming | Fixing` — absent handles fresh pieces from resplit, Open handles re-processing after solver errors.
+- Open items in `WaitForResults::execute` are cleared (`open: Vec::new()`) when transitioning to `WaitForGeneration` — prevents accumulated open items from re-entering generation after they were already handled (e.g., resplit).
 
 ### Piece tracing (2026-05-21)
 

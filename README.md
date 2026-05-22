@@ -44,15 +44,21 @@ cargo build --release
 | `--solver-path` | `z3` | Path to the SMT solver binary |
 | `--solver-args` | `-in` | Arguments passed to the solver |
 | `--solver-timeout-secs` | `60` | Max seconds per solver invocation |
-| `--primary-model` | `qwen/qwen3-coder:free` | LLM that generates SMT formulas |
-| `--judge-model` | `google/gemma-3-4b-it:free` | LLM that evaluates results |
+| `--api-model` | `openrouter/free` | Default LLM model |
+| `--splitter-model` | (same as api-model) | Model for code decomposition |
+| `--formalizer-model` | (same as api-model) | Model for SMT formula generation |
+| `--fixer-model` | (same as api-model) | Model for formula correction |
+| `--judge-model` | (same as api-model) | Model for result evaluation |
 | `--api-base` | `https://openrouter.ai/api/v1` | API endpoint |
 | `--stream-timeout-ms` | `3000` | Per-chunk stream timeout |
 | `--max-stream-retries` | `5` | Retries on stream errors |
+| `--service-tier` | `priority` | API service tier (auto/default/flex/scale/priority) |
+
+Role-specific API keys can be set via env vars: `JUDGE_API_KEY`, `FORMALIZER_API_KEY`, `FIXER_API_KEY`, `SPLITTER_API_KEY`.
 
 ## Example input file
 
-See [`example_input.txt`](example_input.txt) for a minimal example. The format is a plain-text before/after function comparison. Any human-readable format works — the LLM parses it.
+The format is a plain-text before/after function comparison. Any human-readable format works — the LLM parses it.
 
 ```
 --- BEFORE ---
@@ -84,7 +90,20 @@ Open Pieces: 0
 
 ## Architecture
 
-- `src/llm.rs` — async streaming LLM client (async-openai)
-- `src/smt.rs` — solver subprocess manager (tokio::process)
-- `src/agent.rs` — compositional verification loop: batch generation → parallel solving → parallel judging
-- `src/provider.rs` — trait abstractions for LLM and solver backends
+- `src/llm.rs` — async streaming LLM client (async-openai), per-role models and API keys, retry with partial content tolerance
+- `src/smt.rs` — SMT solver subprocess manager with timeout support, per-piece tracing
+- `src/agent.rs` — compositional verification entry point
+- `src/machine.rs` — state machine orchestrating split → generate → solve → judge → result
+- `src/transitions.rs` — state machine transitions for all phases
+- `src/states.rs` — state structs: `WaitForSplit`, `WaitForGeneration`, `WaitForResults`, `WaitForExplanation`
+- `src/behaviors/` — per-phase logic: `splitter`, `generation`, `results`, `child_judge`, `explain`
+- `src/piece_manager.rs` — `PieceManager` trait for piece lifecycle (ID assignment, phase tracking)
+- `src/provider.rs` — trait abstractions for `LlmProvider` and `SolverProvider`
+
+### Testing
+
+- `tests/agent_integration.rs` — integration tests with `SequenceLlm` and `FakeSolver`
+- `tests/struct_max_sat.rs` — SAT detection regression test
+- `tests/log_replay.rs` — replay-based tests using `LogReplayLlm` and `LogReplaySolver` mocks with per-pieceid message queues
+- `tests/e2e_api.rs` — end-to-end tests against live API
+- `parse_log.rb` — Ruby script to convert a refactor-check trace log into a Rust test case
