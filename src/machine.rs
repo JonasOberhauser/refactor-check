@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 
+use crate::piece_manager::PieceManager;
 use crate::provider::{AgentResult, LlmProvider, SolverProvider};
 use crate::states::*;
 
@@ -8,6 +9,7 @@ pub async fn run(
     input_content: &str,
     llm: &dyn LlmProvider,
     solver: &dyn SolverProvider,
+    pm: &dyn PieceManager,
 ) -> Result<AgentResult> {
     let input_arc = Arc::new(input_content.to_string());
     let mut state: Box<dyn AlgorithmState> = Box::new(WaitForSplit {
@@ -20,7 +22,7 @@ pub async fn run(
     });
 
     loop {
-        state = match state.execute(llm, solver).await? {
+        state = match state.execute(llm, solver, pm).await? {
             Step::State(next) => next,
             Step::Result(result) => return Ok(result),
         };

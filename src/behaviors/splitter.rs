@@ -1,17 +1,19 @@
 use anyhow::Result;
 use tracing::{debug, warn};
 
+use crate::piece_manager::PieceManager;
 use crate::provider::{LlmProvider, LlmRole};
 use crate::states::{CodePiece, WaitForSplit};
 
 pub async fn execute(
     state: &WaitForSplit,
     llm: &dyn LlmProvider,
+    pm: &dyn PieceManager,
 ) -> Result<Vec<CodePiece>> {
     for attempt in 0..3 {
         let messages = build_split_messages(state);
         let response = llm.chat(LlmRole::Splitter, messages, None).await?;
-        let pieces = extract_split_pieces(&response);
+        let pieces = extract_split_pieces(&response, pm);
 
         if !pieces.is_empty() {
             let ids: Vec<u64> = pieces.iter().map(|p| p.id()).collect();
@@ -74,7 +76,7 @@ fn build_split_messages(state: &WaitForSplit) -> Vec<crate::llm::Message> {
     vec![system, crate::llm::user_message(&prompt)]
 }
 
-fn extract_split_pieces(response: &str) -> Vec<CodePiece> {
+fn extract_split_pieces(response: &str, pm: &dyn PieceManager) -> Vec<CodePiece> {
     let mut pieces = Vec::new();
     let mut current_label: Option<String> = None;
     let mut current_section: Option<&mut String> = None;
@@ -87,7 +89,7 @@ fn extract_split_pieces(response: &str) -> Vec<CodePiece> {
         if trimmed.starts_with("Piece:") || trimmed.starts_with("Piece ") {
             if let Some(label) = current_label.take() {
                 if !before_buf.trim().is_empty() || !after_buf.trim().is_empty() {
-                    let p = CodePiece::new(
+                    let p = pm.new_piece(
                         &label,
                         before_buf.trim(),
                         after_buf.trim(),
@@ -127,7 +129,7 @@ fn extract_split_pieces(response: &str) -> Vec<CodePiece> {
 
     if let Some(label) = current_label {
         if !before_buf.trim().is_empty() || !after_buf.trim().is_empty() {
-            let p = CodePiece::new(
+            let p = pm.new_piece(
                 &label,
                 before_buf.trim(),
                 after_buf.trim(),
@@ -143,16 +145,18 @@ fn extract_split_pieces(response: &str) -> Vec<CodePiece> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::piece_manager::DefaultPieceManager;
 
     #[test]
     fn test_extract_single_piece() {
+        let pm = DefaultPieceManager::new();
         let response = "\
 Piece: main
 ---- BEFORE ----
 fn before() { x + 1 }
 ---- AFTER ----
 fn after() { x + 1 }";
-        let pieces = extract_split_pieces(response);
+        let pieces = extract_split_pieces(response, &pm);
         assert_eq!(pieces.len(), 1);
         assert_eq!(pieces[0].label(), "main");
         assert!(pieces[0].before().contains("fn before"));
@@ -161,6 +165,7 @@ fn after() { x + 1 }";
 
     #[test]
     fn test_extract_multiple_pieces() {
+        let pm = DefaultPieceManager::new();
         let response = "\
 Piece: prelude
 ---- BEFORE ----
@@ -179,7 +184,7 @@ Piece: postlude
 cleanup(x);
 ---- AFTER ----
 cleanup(x);";
-        let pieces = extract_split_pieces(response);
+        let pieces = extract_split_pieces(response, &pm);
         assert_eq!(pieces.len(), 3);
         assert_eq!(pieces[0].label(), "prelude");
         assert_eq!(pieces[1].label(), "loop_body");
@@ -188,13 +193,14 @@ cleanup(x);";
 
     #[test]
     fn test_extract_nested_piece_names() {
+        let pm = DefaultPieceManager::new();
         let response = "\
 Piece: init
 ---- BEFORE ----
 let x = 0;
 ---- AFTER ----
 let x = 0;";
-        let pieces = extract_split_pieces(response);
+        let pieces = extract_split_pieces(response, &pm);
         assert_eq!(pieces.len(), 1);
         assert_eq!(pieces[0].before(), "let x = 0;");
     }

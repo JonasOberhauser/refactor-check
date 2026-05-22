@@ -1,6 +1,7 @@
 use anyhow::Context;
 
 use crate::llm::{LlmConfig, Message, system_message, user_message};
+use crate::piece_manager::DefaultPieceManager;
 use crate::smt::SolverOutcome;
 
 pub use crate::smt::DEFAULT_SOLVER_TIMEOUT_SECS;
@@ -22,8 +23,9 @@ pub async fn run(input_file: &str, config: AgentConfig) -> anyhow::Result<()> {
         config.solver_args.clone(),
         std::time::Duration::from_secs(config.solver_timeout_secs),
     );
+    let pm = DefaultPieceManager::new();
 
-    let result = crate::machine::run(&input_content, &llm, &solver).await?;
+    let result = crate::machine::run(&input_content, &llm, &solver, &pm).await?;
     println!(
         "=== Overall Equivalent ===\n{}\n",
         result.overall_equivalent

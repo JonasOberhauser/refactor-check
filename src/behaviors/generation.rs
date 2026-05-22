@@ -2,7 +2,8 @@ use anyhow::Result;
 use futures::future::try_join_all;
 use tracing::{debug, warn};
 
-use crate::phase::{self, PiecePhase};
+use crate::phase::PiecePhase;
+use crate::piece_manager::PieceManager;
 use crate::provider::{LlmProvider, LlmRole};
 use crate::smt::{extract_all_formulas, extract_single_formula};
 use crate::states::{CodePiece, InsistState, VerifiedPiece, WaitForGeneration};
@@ -18,11 +19,12 @@ pub fn role_for_iteration(iteration: usize) -> LlmRole {
 pub async fn execute(
     state: &WaitForGeneration,
     llm: &dyn LlmProvider,
+    pm: &dyn PieceManager,
 ) -> Result<Vec<String>> {
     let role = role_for_iteration(state.iteration);
     let new_phase = if role == LlmRole::Formalizer { PiecePhase::Forming } else { PiecePhase::Fixing };
     for piece in &state.pieces {
-        phase::enter_generation(piece.id(), new_phase);
+        pm.enter_generation(piece.id(), new_phase);
     }
 
     if let InsistState::Insisting { ref last_response, .. } = &state.insist {

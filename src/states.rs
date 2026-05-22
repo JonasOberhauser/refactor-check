@@ -1,16 +1,10 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 
+use crate::piece_manager::PieceManager;
 use crate::provider::{AgentResult, LlmProvider, SolverProvider};
 use crate::smt::{SolverOutcome, SolverResult};
-
-static NEXT_PIECE_ID: AtomicU64 = AtomicU64::new(1);
-
-fn next_piece_id() -> u64 {
-    NEXT_PIECE_ID.fetch_add(1, Ordering::Relaxed)
-}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct CodePiece {
@@ -21,17 +15,7 @@ pub struct CodePiece {
 }
 
 impl CodePiece {
-    pub fn new(label: &str, before: &str, after: &str) -> Self {
-        Self {
-            id: next_piece_id(),
-            label: label.to_string(),
-            before: before.to_string(),
-            after: after.to_string(),
-        }
-    }
-
-    #[cfg(test)]
-    pub fn with_id(id: u64, label: &str, before: &str, after: &str) -> Self {
+    pub(crate) fn with_id(id: u64, label: &str, before: &str, after: &str) -> Self {
         Self {
             id,
             label: label.to_string(),
@@ -57,6 +41,7 @@ pub trait AlgorithmState: Send + Sync {
         self: Box<Self>,
         llm: &dyn LlmProvider,
         solver: &dyn SolverProvider,
+        pm: &dyn PieceManager,
     ) -> anyhow::Result<Step>;
 }
 

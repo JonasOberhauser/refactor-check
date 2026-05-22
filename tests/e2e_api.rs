@@ -2,6 +2,7 @@ use std::sync::OnceLock;
 
 use refactor_check::llm::{LlmClient, LlmConfig, ServiceTier};
 use refactor_check::machine;
+use refactor_check::piece_manager::DefaultPieceManager;
 use refactor_check::provider::AgentResult;
 use refactor_check::smt::Z3Solver;
 
@@ -40,7 +41,8 @@ async fn check_equivalent(input: &str) -> AgentResult {
     let api_key = get_api_key();
     let llm = LlmClient::new(free_models_config(api_key));
     let solver = Z3Solver::new("z3".to_string());
-    machine::run(input, &llm, &solver).await.expect("agent should succeed")
+    let pm = DefaultPieceManager::new();
+    machine::run(input, &llm, &solver, &pm).await.expect("agent should succeed")
 }
 
 fn print_result(label: &str, result: &AgentResult) {

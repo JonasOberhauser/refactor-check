@@ -3,7 +3,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use common::{FakeSolver, SequenceLlm};
+use common::{FakeSolver, SequenceLlm, test_pm};
 use refactor_check::consts::JUDGE_REASONABLE;
 use refactor_check::machine;
 use refactor_check::provider::SolverProvider;
@@ -91,7 +91,8 @@ async fn test_split_no_split_happy_path() {
         outcome: SolverOutcome::Unsat,
     };
 
-    let result = machine::run("refactoring desc", &llm, &solver)
+    let pm = test_pm();
+    let result = machine::run("refactoring desc", &llm, &solver, &pm)
         .await
         .expect("agent should succeed");
 
@@ -117,7 +118,8 @@ async fn test_split_two_pieces() {
         outcome: SolverOutcome::Unsat,
     };
 
-    let result = machine::run("refactoring desc", &llm, &solver)
+    let pm = test_pm();
+    let result = machine::run("refactoring desc", &llm, &solver, &pm)
         .await
         .expect("agent should succeed");
 
@@ -157,7 +159,8 @@ Piece 4:\n```smt2\n(set-logic QF_LIA)\n(declare-fun e () Int)\n(declare-fun f ()
         outcome: SolverOutcome::Unsat,
     };
 
-    let result = machine::run("refactoring desc", &llm, &solver)
+    let pm = test_pm();
+    let result = machine::run("refactoring desc", &llm, &solver, &pm)
         .await
         .expect("agent should succeed");
 
@@ -219,7 +222,8 @@ large code"
         call_count: Arc::new(Mutex::new(0)),
     };
 
-    let result = machine::run("refactoring desc", &llm, &solver)
+    let pm = test_pm();
+    let result = machine::run("refactoring desc", &llm, &solver, &pm)
         .await
         .expect("agent should succeed");
 
@@ -241,7 +245,8 @@ async fn test_split_sat_result() {
         outcome: SolverOutcome::Sat,
     };
 
-    let result = machine::run("refactoring desc", &llm, &solver)
+    let pm = test_pm();
+    let result = machine::run("refactoring desc", &llm, &solver, &pm)
         .await
         .expect("agent should succeed");
 
@@ -263,7 +268,8 @@ async fn test_split_generator_insist_then_ok() {
         outcome: SolverOutcome::Unsat,
     };
 
-    let result = machine::run("refactoring desc", &llm, &solver)
+    let pm = test_pm();
+    let result = machine::run("refactoring desc", &llm, &solver, &pm)
         .await
         .expect("agent should succeed");
 
@@ -284,7 +290,8 @@ async fn test_split_one_piece_unsat() {
         outcome: SolverOutcome::Unsat,
     };
 
-    let result = machine::run("refactoring desc", &llm, &solver)
+    let pm = test_pm();
+    let result = machine::run("refactoring desc", &llm, &solver, &pm)
         .await
         .expect("agent should succeed");
 
@@ -309,7 +316,8 @@ async fn test_split_one_piece_judge_retry_then_verified() {
         outcome: SolverOutcome::Unsat,
     };
 
-    let result = machine::run("refactoring desc", &llm, &solver)
+    let pm = test_pm();
+    let result = machine::run("refactoring desc", &llm, &solver, &pm)
         .await
         .expect("agent should succeed");
 
@@ -331,7 +339,8 @@ async fn test_split_sat_piece_detected() {
         outcome: SolverOutcome::Sat,
     };
 
-    let result = machine::run("refactoring desc", &llm, &solver)
+    let pm = test_pm();
+    let result = machine::run("refactoring desc", &llm, &solver, &pm)
         .await
         .expect("agent should succeed");
 

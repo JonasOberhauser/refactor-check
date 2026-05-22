@@ -1,6 +1,6 @@
 mod common;
 
-use common::{FakeSolver, SequenceLlm};
+use common::{FakeSolver, SequenceLlm, test_pm};
 use refactor_check::consts::JUDGE_REASONABLE;
 use refactor_check::machine;
 use refactor_check::smt::SolverOutcome;
@@ -89,7 +89,8 @@ async fn test_sat_judge_overrules() {
         outcome: SolverOutcome::Sat,
     };
 
-    let result = machine::run("max_of_three struct refactoring", &llm, &solver)
+    let pm = test_pm();
+    let result = machine::run("max_of_three struct refactoring", &llm, &solver, &pm)
         .await
         .expect("agent should succeed (bug: judge overruled)");
 

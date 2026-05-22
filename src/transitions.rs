@@ -5,6 +5,7 @@ use tracing::debug;
 
 use crate::behaviors::{self, generation};
 use crate::consts::{JUDGE_REASONABLE, MAX_BRANCH_RETRIES, MAX_GLOBAL_CYCLES, MAX_INSIST_ATTEMPTS, MAX_SPLIT_DEPTH};
+use crate::piece_manager::PieceManager;
 use crate::provider::{AgentResult, FormulaResult, LlmProvider, SolverProvider};
 use crate::smt::{SolverOutcome, SolverResult};
 use crate::states::*;
@@ -17,8 +18,9 @@ impl AlgorithmState for WaitForSplit {
         self: Box<Self>,
         llm: &dyn LlmProvider,
         _solver: &dyn SolverProvider,
+        pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
-        let raw_pieces = behaviors::splitter::execute(&self, llm).await?;
+        let raw_pieces = behaviors::splitter::execute(&self, llm, pm).await?;
         let pieces: Vec<Arc<CodePiece>> = raw_pieces.into_iter().map(Arc::new).collect();
         Ok(Step::State(Box::new(WaitForGeneration {
             input_content: self.input_content,
@@ -37,13 +39,14 @@ impl AlgorithmState for WaitForGeneration {
         self: Box<Self>,
         llm: &dyn LlmProvider,
         _solver: &dyn SolverProvider,
+        pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
         if let InsistState::Insisting { attempt, .. } = &self.insist {
             if *attempt >= MAX_INSIST_ATTEMPTS {
                 anyhow::bail!("failed to extract any SMT formula after {MAX_INSIST_ATTEMPTS} insist attempts");
             }
         }
-        let formulas = generation::execute(&self, llm).await?;
+        let formulas = generation::execute(&self, llm, pm).await?;
         if formulas.is_empty() {
             return Ok(Step::State(Box::new(WaitForGeneration {
                 input_content: self.input_content,
@@ -98,9 +101,10 @@ impl AlgorithmState for WaitForResults {
         self: Box<Self>,
         llm: &dyn LlmProvider,
         solver: &dyn SolverProvider,
+        pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
         let WaitForResults { input_content, verified, open, iteration, branches, split_depth } = *self;
-        let done = behaviors::results::execute_all(branches, llm, solver).await?;
+        let done = behaviors::results::execute_all(branches, llm, solver, pm).await?;
 
         let mut verified = verified;
         let mut open = open;
@@ -157,7 +161,7 @@ impl AlgorithmState for WaitForResults {
         let next = WaitForGeneration {
             input_content,
             verified,
-            open,
+            open: Vec::new(),
             iteration: next_iteration,
             insist: InsistState::Idle,
             pieces,
@@ -182,6 +186,7 @@ impl AlgorithmState for WaitForExplanation {
         self: Box<Self>,
         llm: &dyn LlmProvider,
         _solver: &dyn SolverProvider,
+        _pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
         let explanations = behaviors::explain::execute(&self, llm).await?;
         let mut result = self.result;
