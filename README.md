@@ -78,13 +78,23 @@ int abs(int x) {
 ## How to read the output
 
 ```
-Overall Equivalent: true
-Verified Formulas: 1/1 reasonable (SAT: 0, UNSAT: 1, UNKNOWN: 0)
-Open Pieces: 0
+=== Overall Equivalent ===
+true
+
+=== Verified Formulas ===
+1/1 reasonable (SAT: 0, UNSAT: 1, UNKNOWN: 0)
+
+=== Open Pieces ===
+0
+
+--- Formula ---
+[abs #1]
+(declare-fun ...)
+Outcome: Unsat, Verdict: REASONABLE
 ```
 
-- **UNSAT**: the SMT solver proved no counterexample exists → this piece is equivalent
 - **SAT**: the solver found a counterexample → this piece is NOT equivalent
+- **UNSAT**: the SMT solver proved no counterexample exists → this piece is equivalent
 - **UNKNOWN**: the solver couldn't decide → inconclusive, may need manual review
 - **Open Pieces**: formulas that timed out or were rejected by the judge — not fully resolved
 
