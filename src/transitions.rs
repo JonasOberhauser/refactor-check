@@ -133,7 +133,7 @@ impl AlgorithmState for WaitForResults {
                     input_content: Arc::clone(&input_content),
                     pieces_to_resplit: needs_resplit,
                     verified,
-                    open,
+open: Vec::new(),
                     iteration,
                     split_depth: new_depth,
                 })));
@@ -157,7 +157,7 @@ impl AlgorithmState for WaitForResults {
         let next = WaitForGeneration {
             input_content,
             verified,
-            open,
+            open: Vec::new(),
             iteration: next_iteration,
             insist: InsistState::Idle,
             pieces,
