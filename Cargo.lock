@@ -344,6 +344,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "deductive-check"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-openai",
+ "async-trait",
+ "clap",
+ "dashmap",
+ "futures",
+ "refactor-check-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "derive_builder"
 version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1226,6 +1244,7 @@ dependencies = [
  "clap",
  "dashmap",
  "futures",
+ "refactor-check-core",
  "refactor-check-test-helpers",
  "serde",
  "serde_json",
@@ -1233,6 +1252,21 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "refactor-check-core"
+version = "4.0.0"
+dependencies = [
+ "anyhow",
+ "async-openai",
+ "async-trait",
+ "dashmap",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

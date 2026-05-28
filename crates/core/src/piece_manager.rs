@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use dashmap::DashMap;
 
 use crate::phase::PiecePhase;
-use crate::states::CodePiece;
+use crate::piece::CodePiece;
 
 pub trait PieceManager: Send + Sync {
     fn new_piece(&self, label: &str, before: &str, after: &str) -> CodePiece;

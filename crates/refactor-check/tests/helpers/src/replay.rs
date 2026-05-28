@@ -17,6 +17,12 @@ pub struct LogReplayLlm {
     splitting_judge: Arc<Mutex<Vec<String>>>,
 }
 
+impl Default for LogReplayLlm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LogReplayLlm {
     pub fn new() -> Self {
         Self {
@@ -108,6 +114,12 @@ impl LlmProvider for LogReplayLlm {
 
 pub struct LogReplaySolver {
     runs: Arc<Mutex<HashMap<u64, Vec<SolverResult>>>>,
+}
+
+impl Default for LogReplaySolver {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LogReplaySolver {

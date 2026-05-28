@@ -1,8 +1,8 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PiecePhase {
     Forming,
-    Fixing,
     Solving,
+    Fixing,
     Judging,
     Verified,
     Open,

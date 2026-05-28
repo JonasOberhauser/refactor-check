@@ -7,6 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, trace, warn};
 
+use crate::piece::CodePiece;
 use crate::provider::SolverProvider;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,7 +261,7 @@ impl Z3Solver {
 
 #[async_trait]
 impl SolverProvider for Z3Solver {
-    async fn run(&self, formula: &str, piece: Option<&crate::states::CodePiece>) -> Result<SolverResult> {
+    async fn run(&self, formula: &str, piece: Option<&CodePiece>) -> Result<SolverResult> {
         run_solver(&self.solver_path, &self.solver_args, self.timeout, formula, piece.map(|p| p.id())).await
     }
 }

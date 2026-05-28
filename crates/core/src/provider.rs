@@ -2,8 +2,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::llm::Message;
+use crate::piece::CodePiece;
 use crate::smt::{SolverOutcome, SolverResult};
-use crate::states::CodePiece;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmRole {

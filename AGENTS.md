@@ -51,13 +51,25 @@ No code duplication. Use good abstractions and put common code into logically se
 
 ## Commands
 
-- Build: `cargo build`
-- Build release: `cargo build --release`
-- Lint: `cargo clippy -- -W clippy::all`
+- Build: `cargo build --workspace`
+- Build release: `cargo build --release --workspace`
+- Test: `cargo test --workspace`
+- Lint: `cargo clippy --workspace -- -W clippy::all`
 
 ### Build habit
 
-Always run `cargo build --release` after making a change. This ensures the release binary is up to date for manual testing and prevents stale artifacts.
+Always run `cargo build --release --workspace` after making a change. This ensures the release binaries are up to date for manual testing and prevents stale artifacts.
+
+## Workspace Structure
+
+```
+refactor-check/
+  Cargo.toml              ← workspace root
+  crates/
+    core/                  ← refactor-check-core (shared infrastructure)
+    refactor-check/        ← refactor-check binary (split/judge/fix workflow)
+    deductive-check/       ← deductive-check binary (new workflow, stub)
+```
 
 ## Design Decisions
 
