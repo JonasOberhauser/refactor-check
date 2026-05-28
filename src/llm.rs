@@ -14,6 +14,7 @@ use std::time::Duration;
 use tracing::{debug, info, instrument, trace, warn};
 
 use crate::provider::{LlmProvider, LlmRole};
+use crate::states::CodePiece;
 
 #[derive(Debug)]
 pub enum Role {
@@ -38,10 +39,14 @@ pub struct LlmConfig {
     pub fixer_api_key: Option<String>,
     #[serde(default)]
     pub splitter_api_key: Option<String>,
+    #[serde(default)]
+    pub splitting_judge_api_key: Option<String>,
     pub api_base: String,
     pub formalizer_model: String,
     pub fixer_model: String,
     pub judge_model: String,
+    #[serde(default)]
+    pub splitting_judge_model: String,
     #[serde(default)]
     pub splitter_model: String,
     #[serde(default = "default_stream_timeout_ms")]
@@ -72,10 +77,12 @@ impl Default for LlmConfig {
             formalizer_api_key: None,
             fixer_api_key: None,
             splitter_api_key: None,
+            splitting_judge_api_key: None,
             api_base: String::new(),
             formalizer_model: String::new(),
             fixer_model: String::new(),
             judge_model: String::new(),
+            splitting_judge_model: String::new(),
             splitter_model: String::new(),
             stream_timeout_ms: default_stream_timeout_ms(),
             max_stream_retries: default_max_stream_retries(),
@@ -92,10 +99,12 @@ impl fmt::Debug for LlmConfig {
             .field("formalizer_api_key", &self.formalizer_api_key.as_ref().map(|_| "[REDACTED]"))
             .field("fixer_api_key", &self.fixer_api_key.as_ref().map(|_| "[REDACTED]"))
             .field("splitter_api_key", &self.splitter_api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("splitting_judge_api_key", &self.splitting_judge_api_key.as_ref().map(|_| "[REDACTED]"))
             .field("api_base", &self.api_base)
             .field("formalizer_model", &self.formalizer_model)
             .field("fixer_model", &self.fixer_model)
             .field("judge_model", &self.judge_model)
+            .field("splitting_judge_model", &self.splitting_judge_model)
             .field("splitter_model", &self.splitter_model)
             .field("stream_timeout_ms", &self.stream_timeout_ms)
             .field("max_stream_retries", &self.max_stream_retries)
@@ -108,6 +117,7 @@ pub struct LlmClient {
     formalizer_client: async_openai::Client<async_openai::config::OpenAIConfig>,
     fixer_client: async_openai::Client<async_openai::config::OpenAIConfig>,
     judge_client: async_openai::Client<async_openai::config::OpenAIConfig>,
+    splitting_judge_client: async_openai::Client<async_openai::config::OpenAIConfig>,
     splitter_client: async_openai::Client<async_openai::config::OpenAIConfig>,
     config: LlmConfig,
 }
@@ -308,13 +318,19 @@ impl LlmClient {
         let fixer_client = async_openai::Client::with_config(fixer_config);
         let judge_client = async_openai::Client::with_config(judge_config);
 
+        let splitting_judge_key = config.splitting_judge_api_key.as_deref().unwrap_or(judge_key);
+        let splitting_judge_config = async_openai::config::OpenAIConfig::new()
+            .with_api_key(splitting_judge_key)
+            .with_api_base(&config.api_base);
+        let splitting_judge_client = async_openai::Client::with_config(splitting_judge_config);
+
         let splitter_key = config.splitter_api_key.as_deref().unwrap_or(&config.api_key);
         let splitter_config = async_openai::config::OpenAIConfig::new()
             .with_api_key(splitter_key)
             .with_api_base(&config.api_base);
         let splitter_client = async_openai::Client::with_config(splitter_config);
 
-        Self { formalizer_client, fixer_client, judge_client, splitter_client, config }
+        Self { formalizer_client, fixer_client, judge_client, splitting_judge_client, splitter_client, config }
     }
 
     #[instrument(skip_all, fields(model = %self.config.formalizer_model))]
@@ -344,6 +360,15 @@ impl LlmClient {
     pub async fn chat_splitter(&self, messages: Vec<Message>, piece: Option<&crate::states::CodePiece>) -> Result<String> {
         self.chat_inner("splitter", &self.splitter_client, &self.config.splitter_model, messages, piece, |content| {
             !content.trim().is_empty()
+        }).await
+    }
+
+    #[instrument(skip_all, fields(model = %self.config.splitting_judge_model))]
+    pub async fn chat_splitting_judge(&self, messages: Vec<Message>, piece: Option<&crate::states::CodePiece>) -> Result<String> {
+        self.chat_inner("splitting_judge", &self.splitting_judge_client, &self.config.splitting_judge_model, messages, piece, |content| {
+            let upper = content.trim().to_uppercase();
+            let trimmed = upper.trim_start_matches(|c: char| !c.is_alphabetic());
+            trimmed.starts_with("REASONABLE") || trimmed.starts_with("RETRY")
         }).await
     }
 
@@ -438,10 +463,11 @@ impl LlmProvider for LlmClient {
         &self,
         role: LlmRole,
         messages: Vec<Message>,
-        piece: Option<&crate::states::CodePiece>,
+        piece: Option<&CodePiece>,
     ) -> Result<String> {
         match role {
             LlmRole::Splitter => self.chat_splitter(messages, piece).await,
+            LlmRole::SplittingJudge => self.chat_splitting_judge(messages, piece).await,
             LlmRole::Formalizer => self.chat_formalizer(messages, piece).await,
             LlmRole::Fixer => self.chat_fixer(messages, piece).await,
             LlmRole::Judge => self.chat_judge(messages, piece).await,

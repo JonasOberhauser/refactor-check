@@ -66,7 +66,7 @@ async fn run_branch(
                         })]);
                     }
                     BranchFromSolver::Resplit(f, r) => {
-                        pm.advance(piece.id(), Some(PiecePhase::Solving), PiecePhase::Resplitting);
+                        pm.advance(piece.id(), Some(PiecePhase::Solving), PiecePhase::Open);
                         debug!(piece_id = piece.id(), label = %piece.label(), "solver timeout, requesting resplit");
                         return Ok(vec![ChildDone::NeedsResplit {
                             piece: Arc::clone(&piece),

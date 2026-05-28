@@ -66,6 +66,17 @@ pub struct WaitForSplit {
     pub open: Vec<OpenItem>,
     pub iteration: usize,
     pub split_depth: u32,
+    pub judge_feedback: Option<String>,
+}
+
+pub struct WaitForSplittingJudge {
+    pub input_content: Arc<String>,
+    pub pieces: Vec<Arc<CodePiece>>,
+    pub pieces_to_resplit: Vec<(Arc<CodePiece>, String)>,
+    pub verified: Vec<VerifiedPiece>,
+    pub open: Vec<OpenItem>,
+    pub iteration: usize,
+    pub split_depth: u32,
 }
 
 pub struct WaitForGeneration {
@@ -83,7 +94,6 @@ pub struct WaitForResults {
     pub open: Vec<OpenItem>,
     pub iteration: usize,
     pub branches: Vec<FormulaBranch>,
-    pub split_depth: u32,
 }
 
 pub struct WaitForExplanation {

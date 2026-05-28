@@ -6,5 +6,4 @@ pub enum PiecePhase {
     Judging,
     Verified,
     Open,
-    Resplitting,
 }

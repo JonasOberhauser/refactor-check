@@ -42,6 +42,10 @@ pub async fn execute(
         })
         .collect();
     let formulas: Vec<String> = try_join_all(futures).await?;
+    if formulas.iter().any(|f| f.is_empty()) {
+        warn!("one or more pieces produced no valid formula, entering insist loop");
+        return Ok(Vec::new());
+    }
     debug!(count = formulas.len(), "generation complete for all pieces");
     Ok(formulas)
 }

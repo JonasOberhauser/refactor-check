@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tracing::debug;
+use tracing::warn;
 
 use crate::behaviors::{self, generation};
 use crate::consts::{JUDGE_REASONABLE, MAX_BRANCH_RETRIES, MAX_GLOBAL_CYCLES, MAX_INSIST_ATTEMPTS, MAX_SPLIT_DEPTH};
@@ -22,14 +23,94 @@ impl AlgorithmState for WaitForSplit {
     ) -> anyhow::Result<Step> {
         let raw_pieces = behaviors::splitter::execute(&self, llm, pm).await?;
         let pieces: Vec<Arc<CodePiece>> = raw_pieces.into_iter().map(Arc::new).collect();
-        Ok(Step::State(Box::new(WaitForGeneration {
+        Ok(Step::State(Box::new(WaitForSplittingJudge {
             input_content: self.input_content,
+            pieces,
+            pieces_to_resplit: self.pieces_to_resplit,
             verified: self.verified,
             open: self.open,
             iteration: self.iteration,
-            insist: InsistState::Idle,
-            pieces,
+            split_depth: self.split_depth,
         })))
+    }
+}
+
+#[async_trait]
+impl AlgorithmState for WaitForSplittingJudge {
+    async fn execute(
+        self: Box<Self>,
+        llm: &dyn LlmProvider,
+        _solver: &dyn SolverProvider,
+        _pm: &dyn PieceManager,
+    ) -> anyhow::Result<Step> {
+        let verdict = behaviors::splitting_judge::execute(&self, llm).await?;
+        match verdict {
+            behaviors::splitting_judge::SplittingJudgeVerdict::Accept => {
+                debug!("splitting judge accepted the decomposition");
+                Ok(Step::State(Box::new(WaitForGeneration {
+                    input_content: self.input_content,
+                    verified: self.verified,
+                    open: self.open,
+                    iteration: self.iteration,
+                    insist: InsistState::Idle,
+                    pieces: self.pieces,
+                })))
+            }
+            behaviors::splitting_judge::SplittingJudgeVerdict::Retry(feedback) => {
+                let new_depth = self.split_depth + 1;
+                if new_depth >= MAX_SPLIT_DEPTH {
+                    warn!(depth = new_depth, "split depth exhausted, pieces become open");
+                    let mut open = self.open;
+                    for piece in self.pieces {
+                        open.push(OpenItem {
+                            piece,
+                            formula: String::new(),
+                            reason: format!("split depth exhausted ({MAX_SPLIT_DEPTH}): {feedback}"),
+                            solver_stdout: String::new(),
+                            solver_stderr: String::new(),
+                        });
+                    }
+                    let counts = OutcomeCounts::from_verified(&self.verified);
+                    if open.is_empty() {
+                        if counts.needs_explanation() {
+                            return Ok(Step::State(Box::new(WaitForExplanation {
+                                input_content: self.input_content,
+                                result: build_result(&self.verified, 0, &counts),
+                            })));
+                        }
+                        return Ok(Step::Result(build_result(&self.verified, 0, &counts)));
+                    }
+                    let iteration = self.iteration;
+                    if iteration >= MAX_GLOBAL_CYCLES {
+                        let counts = OutcomeCounts::from_verified(&self.verified);
+                        return Ok(Step::Result(build_result(
+                            &self.verified,
+                            open.len(),
+                            &counts,
+                        )));
+                    }
+                    let pieces: Vec<Arc<CodePiece>> = open.iter().map(|o| Arc::clone(&o.piece)).collect();
+                    return Ok(Step::State(Box::new(WaitForGeneration {
+                        input_content: self.input_content,
+                        verified: self.verified,
+                        open: Vec::new(),
+                        iteration,
+                        insist: InsistState::Idle,
+                        pieces,
+                    })));
+                }
+                debug!(depth = new_depth, feedback = %feedback, "splitting judge rejected, re-splitting");
+                Ok(Step::State(Box::new(WaitForSplit {
+                    input_content: self.input_content,
+                    pieces_to_resplit: self.pieces_to_resplit,
+                    verified: self.verified,
+                    open: self.open,
+                    iteration: self.iteration,
+                    split_depth: new_depth,
+                    judge_feedback: Some(feedback),
+                })))
+            }
+        }
     }
 }
 
@@ -90,7 +171,6 @@ impl AlgorithmState for WaitForGeneration {
             open: self.open,
             iteration: self.iteration,
             branches,
-            split_depth: 0,
         })))
     }
 }
@@ -103,7 +183,7 @@ impl AlgorithmState for WaitForResults {
         solver: &dyn SolverProvider,
         pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
-        let WaitForResults { input_content, verified, open, iteration, branches, split_depth } = *self;
+        let WaitForResults { input_content, verified, open, iteration, branches } = *self;
         let done = behaviors::results::execute_all(branches, llm, solver, pm).await?;
 
         let mut verified = verified;
@@ -121,27 +201,15 @@ impl AlgorithmState for WaitForResults {
         }
 
         if !needs_resplit.is_empty() {
-            let new_depth = split_depth + 1;
-            if new_depth >= MAX_SPLIT_DEPTH {
-                for (piece, reason) in needs_resplit {
-                    open.push(OpenItem {
-                        piece,
-                        formula: String::new(),
-                        reason: format!("split depth exhausted ({MAX_SPLIT_DEPTH}): {reason}"),
-                        solver_stdout: String::new(),
-                        solver_stderr: String::new(),
-                    });
-                }
-            } else {
-                return Ok(Step::State(Box::new(WaitForSplit {
-                    input_content: Arc::clone(&input_content),
-                    pieces_to_resplit: needs_resplit,
-                    verified,
-                    open,
-                    iteration,
-                    split_depth: new_depth,
-                })));
-            }
+            return Ok(Step::State(Box::new(WaitForSplit {
+                input_content: Arc::clone(&input_content),
+                pieces_to_resplit: needs_resplit,
+                verified,
+                open,
+                iteration,
+                split_depth: 0,
+                judge_feedback: None,
+            })));
         }
 
         let counts = OutcomeCounts::from_verified(&verified);

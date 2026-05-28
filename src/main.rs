@@ -34,6 +34,9 @@ struct Cli {
     #[arg(long)]
     judge_model: Option<String>,
 
+    #[arg(long)]
+    splitting_judge_model: Option<String>,
+
     #[arg(long, default_value = "https://openrouter.ai/api/v1")]
     api_base: String,
 
@@ -51,6 +54,9 @@ struct Cli {
 
     #[arg(long, env = "SPLITTER_API_KEY")]
     splitter_api_key: Option<String>,
+
+    #[arg(long, env = "SPLITTING_JUDGE_API_KEY")]
+    splitting_judge_api_key: Option<String>,
 
     #[arg(long, default_value = "3000")]
     stream_timeout_ms: u64,
@@ -88,6 +94,8 @@ async fn main() -> Result<()> {
 
     let api_model = cli.api_model;
 
+    let judge_model = cli.judge_model.unwrap_or_else(|| api_model.clone());
+
     let config = AgentConfig {
         llm_config: LlmConfig {
             api_key,
@@ -95,11 +103,13 @@ async fn main() -> Result<()> {
             formalizer_api_key: cli.formalizer_api_key,
             fixer_api_key: cli.fixer_api_key,
             splitter_api_key: cli.splitter_api_key,
+            splitting_judge_api_key: cli.splitting_judge_api_key,
             api_base: cli.api_base,
             splitter_model: cli.splitter_model.unwrap_or_else(|| api_model.clone()),
             formalizer_model: cli.formalizer_model.unwrap_or_else(|| api_model.clone()),
             fixer_model: cli.fixer_model.unwrap_or_else(|| api_model.clone()),
-            judge_model: cli.judge_model.unwrap_or_else(|| api_model.clone()),
+            judge_model: judge_model.clone(),
+            splitting_judge_model: cli.splitting_judge_model.unwrap_or(judge_model),
             stream_timeout_ms: cli.stream_timeout_ms,
             max_stream_retries: cli.max_stream_retries,
             service_tier,

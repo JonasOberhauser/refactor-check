@@ -1,8 +1,7 @@
-mod common;
-
-use common::{LogReplayLlm, LogReplaySolver, test_pm};
 use refactor_check::machine;
 use refactor_check::smt::SolverOutcome;
+use refactor_check_test_helpers::replay::{LogReplayLlm, LogReplaySolver};
+use refactor_check_test_helpers::test_pm;
 
 fn smt_formula_response() -> String {
     format!(
@@ -23,6 +22,7 @@ async fn test_replay_simple_happy() {
     llm.splitter_push(
         "Piece: whole\n---- BEFORE ----\na\n---- AFTER ----\na\n".to_string(),
     );
+    llm.splitting_judge_push("REASONABLE".to_string());
     llm.formalizer_push(1, smt_formula_response());
     llm.judge_push(1, "REASONABLE".to_string());
 
@@ -51,6 +51,7 @@ async fn test_replay_resplit_at_iteration_one() {
     llm.splitter_push(
         "Piece: big\n---- BEFORE ----\nbig before\n---- AFTER ----\nbig after\n".to_string(),
     );
+    llm.splitting_judge_push("REASONABLE".to_string());
     // Formalizer for piece 1 at iteration 0
     llm.formalizer_push(1, smt_formula_response());
 
@@ -73,6 +74,7 @@ sub2 before
 sub2 after"
             .to_string(),
     );
+    llm.splitting_judge_push("REASONABLE".to_string());
     // Resplit at iteration=1, so new pieces use Fixer role
     llm.fixer_push(2, smt_formula_response());
     llm.fixer_push(3, smt_formula_response());
@@ -100,5 +102,54 @@ sub2 after"
 
     assert_eq!(result.formulas.len(), 2);
     assert_eq!(result.reasonable_unsat, 2);
+    assert!(result.overall_equivalent);
+}
+
+/// Splitting judge rejects splits until depth exhausted → pieces become open
+/// and are re-processed without phase mismatch panic.
+#[test_log::test(tokio::test)]
+async fn test_replay_split_depth_exhausted_via_judge() {
+    let mut llm = LogReplayLlm::new();
+
+    // Split 1 (depth 0): accepted
+    llm.splitter_push(
+        "Piece: big\n---- BEFORE ----\nbig before\n---- AFTER ----\nbig after\n".to_string(),
+    );
+    llm.splitting_judge_push("REASONABLE".to_string());
+    llm.formalizer_push(1, smt_formula_response());
+
+    // Solver Unknown → resplit
+    // Split 2 (depth 1): rejected by judge
+    llm.splitter_push(
+        "Piece: sub1\n---- BEFORE ----\nsub1 before\n---- AFTER ----\nsub1 after\n".to_string(),
+    );
+    llm.splitting_judge_push("pieces too large, split further".to_string());
+
+    // Split 3 (depth 2): rejected by judge
+    llm.splitter_push(
+        "Piece: sub2\n---- BEFORE ----\nsub2 before\n---- AFTER ----\nsub2 after\n".to_string(),
+    );
+    llm.splitting_judge_push("still too large, split further".to_string());
+
+    // Split 4 (depth 3): rejected → depth exhausted → piece becomes open
+    llm.splitter_push(
+        "Piece: sub3\n---- BEFORE ----\nsub3 before\n---- AFTER ----\nsub3 after\n".to_string(),
+    );
+    llm.splitting_judge_push("still too large, split further".to_string());
+
+    // Open piece (id=4, "sub3") re-enters generation at iteration 0 → Formalizer, then Judge
+    llm.formalizer_push(4, smt_formula_response());
+    llm.judge_push(4, "REASONABLE".to_string());
+
+    let mut solver = LogReplaySolver::new();
+    solver.push(1, SolverOutcome::Unknown, "unknown".into(), String::new());
+    solver.push(4, SolverOutcome::Unsat, "unsat".into(), String::new());
+
+    let pm = test_pm();
+    let result = machine::run("test", &llm, &solver, &pm)
+        .await
+        .expect("agent should succeed despite split depth exhaustion");
+
+    assert_eq!(result.reasonable_unsat, 1);
     assert!(result.overall_equivalent);
 }

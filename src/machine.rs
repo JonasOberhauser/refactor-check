@@ -19,6 +19,7 @@ pub async fn run(
         open: Vec::new(),
         iteration: 0,
         split_depth: 0,
+        judge_feedback: None,
     });
 
     loop {

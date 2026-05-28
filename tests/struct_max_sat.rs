@@ -1,9 +1,8 @@
-mod common;
-
-use common::{FakeSolver, SequenceLlm, test_pm};
 use refactor_check::consts::JUDGE_REASONABLE;
 use refactor_check::machine;
 use refactor_check::smt::SolverOutcome;
+use refactor_check_test_helpers::sequence::{FakeSolver, SequenceLlm};
+use refactor_check_test_helpers::test_pm;
 
 fn struct_max_formula_response() -> String {
     r#"```smt2
@@ -79,7 +78,7 @@ Piece: max_of_three
 }
 #[test_log::test(tokio::test)]
 async fn test_sat_judge_overrules() {
-    let llm = SequenceLlm::new(
+    let llm = SequenceLlm::with_accepting_judge(
         vec![struct_max_formula_response()],
         vec![],
         vec![JUDGE_REASONABLE.to_string()],

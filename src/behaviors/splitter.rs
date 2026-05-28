@@ -51,10 +51,19 @@ fn build_split_messages(state: &WaitForSplit) -> Vec<crate::llm::Message> {
     );
 
     let prompt = if state.pieces_to_resplit.is_empty() {
-        format!(
-            "Split this refactoring into independently verifiable pieces:\n\n{}",
-            state.input_content
-        )
+        if let Some(ref feedback) = state.judge_feedback {
+            format!(
+                "Split this refactoring into independently verifiable pieces.\n\n\
+                 The previous split was rejected by the judge:\n{feedback}\n\n\
+                 Please produce a better decomposition.\n\n{}",
+                state.input_content
+            )
+        } else {
+            format!(
+                "Split this refactoring into independently verifiable pieces:\n\n{}",
+                state.input_content
+            )
+        }
     } else {
         let mut prompt = String::from(
             "The following pieces timed out during SMT verification. Split each piece \
@@ -88,7 +97,7 @@ fn extract_split_pieces(response: &str, pm: &dyn PieceManager) -> Vec<CodePiece>
 
         if trimmed.starts_with("Piece:") || trimmed.starts_with("Piece ") {
             if let Some(label) = current_label.take() {
-                if !before_buf.trim().is_empty() || !after_buf.trim().is_empty() {
+                if !before_buf.trim().is_empty() && !after_buf.trim().is_empty() {
                     let p = pm.new_piece(
                         &label,
                         before_buf.trim(),
@@ -128,7 +137,7 @@ fn extract_split_pieces(response: &str, pm: &dyn PieceManager) -> Vec<CodePiece>
     }
 
     if let Some(label) = current_label {
-        if !before_buf.trim().is_empty() || !after_buf.trim().is_empty() {
+        if !before_buf.trim().is_empty() && !after_buf.trim().is_empty() {
             let p = pm.new_piece(
                 &label,
                 before_buf.trim(),
@@ -203,5 +212,29 @@ let x = 0;";
         let pieces = extract_split_pieces(response, &pm);
         assert_eq!(pieces.len(), 1);
         assert_eq!(pieces[0].before(), "let x = 0;");
+    }
+
+    #[test]
+    fn test_extract_piece_missing_after_is_rejected() {
+        let pm = DefaultPieceManager::new();
+        let response = "\
+Piece: broken
+---- BEFORE ----
+fn before() { x + 1 }
+---- AFTER ----";
+        let pieces = extract_split_pieces(response, &pm);
+        assert!(pieces.is_empty(), "piece with empty AFTER should be rejected");
+    }
+
+    #[test]
+    fn test_extract_piece_missing_before_is_rejected() {
+        let pm = DefaultPieceManager::new();
+        let response = "\
+Piece: broken
+---- BEFORE ----
+---- AFTER ----
+fn after() { x + 1 }";
+        let pieces = extract_split_pieces(response, &pm);
+        assert!(pieces.is_empty(), "piece with empty BEFORE should be rejected");
     }
 }

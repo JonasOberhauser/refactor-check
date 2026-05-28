@@ -1,0 +1,9 @@
+[package]
+name = "refactor-check-test-helpers"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+refactor-check = { path = "../.." }
+anyhow = "1"
+async-trait = "0.1"

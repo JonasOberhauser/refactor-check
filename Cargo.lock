@@ -1218,7 +1218,7 @@ dependencies = [
 
 [[package]]
 name = "refactor-check"
-version = "3.3.2"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -1226,12 +1226,22 @@ dependencies = [
  "clap",
  "dashmap",
  "futures",
+ "refactor-check-test-helpers",
  "serde",
  "serde_json",
  "test-log",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "refactor-check-test-helpers"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "refactor-check",
 ]
 
 [[package]]

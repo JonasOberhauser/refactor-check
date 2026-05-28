@@ -1,14 +1,13 @@
-mod common;
-
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use common::{FakeSolver, SequenceLlm, test_pm};
 use refactor_check::consts::JUDGE_REASONABLE;
 use refactor_check::machine;
 use refactor_check::provider::SolverProvider;
 use refactor_check::smt::{SolverOutcome, SolverResult};
 use refactor_check::states::CodePiece;
+use refactor_check_test_helpers::sequence::{FakeSolver, SequenceLlm};
+use refactor_check_test_helpers::test_pm;
 
 fn smt_formula_single() -> String {
     "\
@@ -81,7 +80,7 @@ fn d() { 4 }"
 /// No-split: splitter says one piece, happy path.
 #[test_log::test(tokio::test)]
 async fn test_split_no_split_happy_path() {
-    let llm = SequenceLlm::new(
+    let llm = SequenceLlm::with_accepting_judge(
         vec![formula_response_single()],
         vec![],
         vec![JUDGE_REASONABLE.to_string()],
@@ -105,7 +104,7 @@ async fn test_split_no_split_happy_path() {
 /// Splitter gives 2 pieces, each generates one formula.
 #[test_log::test(tokio::test)]
 async fn test_split_two_pieces() {
-    let llm = SequenceLlm::new(
+    let llm = SequenceLlm::with_accepting_judge(
         vec![formula_response_single(), formula_response_single()],
         vec![],
         vec![
@@ -131,7 +130,7 @@ async fn test_split_two_pieces() {
 /// Splitter gives 4 pieces, all verified.
 #[test_log::test(tokio::test)]
 async fn test_split_four_pieces() {
-    let llm = SequenceLlm::new(
+    let llm = SequenceLlm::with_accepting_judge(
         vec![
             "\
 Piece 1:\n```smt2\n(set-logic QF_LIA)\n(declare-fun x () Int)\n(declare-fun y () Int)\n(assert (= x y))\n(check-sat)\n```"
@@ -196,7 +195,7 @@ async fn test_split_timeout_resplit() {
         }
     }
 
-    let llm = SequenceLlm::new(
+    let llm = SequenceLlm::with_accepting_judge(
         vec![
             formula_response_single(),
             formula_response_single(),
@@ -235,7 +234,7 @@ large code"
 /// SAT result should be detected and not-equivalent reported.
 #[test_log::test(tokio::test)]
 async fn test_split_sat_result() {
-    let llm = SequenceLlm::new(
+    let llm = SequenceLlm::with_accepting_judge(
         vec![formula_response_single()],
         vec![],
         vec![JUDGE_REASONABLE.to_string()],
@@ -258,7 +257,7 @@ async fn test_split_sat_result() {
 /// Per-piece generator retries on empty response.
 #[test_log::test(tokio::test)]
 async fn test_split_generator_insist_then_ok() {
-    let llm = SequenceLlm::new(
+    let llm = SequenceLlm::with_accepting_judge(
         vec!["no formula here".to_string(), formula_response_single()],
         vec![],
         vec![JUDGE_REASONABLE.to_string()],
@@ -280,7 +279,7 @@ async fn test_split_generator_insist_then_ok() {
 /// Simple 1-piece verification with UNSAT.
 #[test_log::test(tokio::test)]
 async fn test_split_one_piece_unsat() {
-    let llm = SequenceLlm::new(
+    let llm = SequenceLlm::with_accepting_judge(
         vec![formula_response_single()],
         vec![],
         vec![JUDGE_REASONABLE.to_string()],
@@ -302,7 +301,7 @@ async fn test_split_one_piece_unsat() {
 /// Judge says retry for one piece of a split → generator fixes → verified.
 #[test_log::test(tokio::test)]
 async fn test_split_one_piece_judge_retry_then_verified() {
-    let llm = SequenceLlm::new(
+    let llm = SequenceLlm::with_accepting_judge(
         vec![formula_response_single(), formula_response_single()],
         vec![formula_response_single()],
         vec![
@@ -329,7 +328,7 @@ async fn test_split_one_piece_judge_retry_then_verified() {
 /// SAT piece with judge verifying it's a spurious SAT → overall not-equivalent.
 #[test_log::test(tokio::test)]
 async fn test_split_sat_piece_detected() {
-    let llm = SequenceLlm::new(
+    let llm = SequenceLlm::with_accepting_judge(
         vec![formula_response_single()],
         vec![],
         vec![JUDGE_REASONABLE.to_string()],

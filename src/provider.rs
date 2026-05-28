@@ -8,6 +8,7 @@ use crate::states::CodePiece;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmRole {
     Splitter,
+    SplittingJudge,
     Formalizer,
     Fixer,
     Judge,

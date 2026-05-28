@@ -58,7 +58,8 @@ pub fn extract_single_formula(response: &str) -> String {
     } else if blocks.is_empty() {
         response.trim().to_string()
     } else {
-        blocks.into_iter().next().unwrap()
+        warn!(count = blocks.len(), "LLM returned multiple SMT formulas where one was expected");
+        String::new()
     }
 }
 
@@ -372,4 +373,47 @@ mod tests {
         assert!(extracted.contains("(declare-sort Emitter 0)"));
         assert!(extracted.contains("(check-sat)"));
     }
+
+    #[test]
+    fn test_extract_single_formula_rejects_multiple_blocks() {
+        let formula_a = "(set-logic QF_LIA)\n(declare-fun x () Int)\n(assert (= x 0))\n(check-sat)";
+        let formula_b = "(set-logic QF_LIA)\n(declare-fun y () Int)\n(assert (> y 5))\n(check-sat)";
+        let response = format!(
+            "Here are two formulas:\n\n```smt2\n{a}\n```\n\nAnd the second:\n\n```smt2\n{b}\n```",
+            a = formula_a,
+            b = formula_b,
+        );
+        let result = extract_single_formula(&response);
+        assert!(result.is_empty(), "should return empty string when multiple blocks found, got: {result}");
+    }
+
+    #[test]
+    fn test_extract_all_formulas_multiple_blocks() {
+        let formula_a = "(set-logic QF_LIA)\n(declare-fun x () Int)\n(assert (= x 0))\n(check-sat)";
+        let formula_b = "(set-logic QF_LIA)\n(declare-fun y () Int)\n(assert (> y 5))\n(check-sat)";
+        let response = format!(
+            "```smt2\n{a}\n```\nSome text\n\n```smt2\n{b}\n```",
+            a = formula_a,
+            b = formula_b,
+        );
+        let formulas = extract_all_formulas(&response);
+        assert_eq!(formulas.len(), 2);
+        assert!(formulas[0].contains("(assert (= x 0))"));
+        assert!(formulas[1].contains("(assert (> y 5))"));
+    }
+
+    #[test]
+    fn test_extract_all_formulas_no_blocks_returns_bare_text() {
+        let bare = "(set-logic QF_LIA)\n(check-sat)";
+        let formulas = extract_all_formulas(bare);
+        assert_eq!(formulas.len(), 1);
+        assert_eq!(formulas[0], bare.trim());
+    }
+
+    #[test]
+    fn test_extract_all_formulas_empty_response() {
+        let formulas = extract_all_formulas("   ");
+        assert!(formulas.is_empty());
+    }
 }
+

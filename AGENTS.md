@@ -12,6 +12,7 @@
 For merge into `main` branch:
 - `cargo clippy -- -W clippy::all` passes
 - `cargo build` succeeds
+- `cargo test` passes with zero warnings
 - 100 randomized test runs pass
 - Critical code review from agent must pass
 - Must fully implement at least one fix or feature without degrading other features or code quality
@@ -42,6 +43,12 @@ For `feature/<name>/<wip>` branch:
 
 Every new feature branch must be based off of main, and previous feature branches either explicitly abandoned by the user (you can ask them whether a feature branch should be abandoned when they ask for a new feature) or merged into main.
 
+Tests must never document or assert known buggy behavior. If a test reveals a bug, fix the code rather than encoding the buggy behavior as an expected result.
+
+Never bypass compiler warnings with `#[allow(...)]` or similar suppression attributes. If code is only used in some scenarios, use feature flags or restructure into submodules so items are only compiled where they are used.
+
+No code duplication. Use good abstractions and put common code into logically self-contained submodules.
+
 ## Commands
 
 - Build: `cargo build`
@@ -53,6 +60,24 @@ Every new feature branch must be based off of main, and previous feature branche
 Always run `cargo build --release` after making a change. This ensures the release binary is up to date for manual testing and prevents stale artifacts.
 
 ## Design Decisions
+
+### WaitForSplittingJudge (2026-05-27)
+
+- After the splitter produces code pieces, a `WaitForSplittingJudge` state evaluates the decomposition before proceeding to `WaitForGeneration`.
+- The splitting judge uses the judge LLM role (`LlmRole::SplittingJudge`) to determine if the decomposition is sound.
+- If rejected, the judge's feedback is passed to `WaitForSplit` for re-splitting, and `split_depth` is incremented.
+- If `split_depth >= MAX_SPLIT_DEPTH`, pieces become open instead of re-splitting.
+- `split_depth` only lives in the split-judge loop (`WaitForSplit` → `WaitForSplittingJudge`). It does not appear in `WaitForGeneration` or `WaitForResults`.
+- `PiecePhase::Resplitting` was removed. Solver Unknown transitions `Solving → Open` instead.
+
+### Splitter validation (2026-05-27)
+
+- `extract_split_pieces` now requires **both** BEFORE and AFTER to be non-empty (`&&` not `||`). Pieces missing either side are rejected.
+
+### SMT formula extraction (2026-05-27)
+
+- `extract_single_formula` returns empty string + warns when multiple fenced SMT blocks are found, instead of silently keeping the first.
+- Generation treats empty formulas as invalid, entering the insist loop to request exactly one formula per piece.
 
 ### CodePiece encapsulation (2026-05-21)
 
