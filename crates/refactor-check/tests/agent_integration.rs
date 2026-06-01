@@ -5,7 +5,6 @@ use refactor_check::consts::JUDGE_REASONABLE;
 use refactor_check::machine;
 use refactor_check::provider::SolverProvider;
 use refactor_check::smt::{SolverOutcome, SolverResult};
-use refactor_check::states::CodePiece;
 use refactor_check_test_helpers::sequence::{FakeSolver, SequenceLlm};
 use refactor_check_test_helpers::test_pm;
 
@@ -176,7 +175,7 @@ async fn test_split_timeout_resplit() {
     }
     #[async_trait]
     impl SolverProvider for ToggleSolver {
-        async fn run(&self, _formula: &str, _piece: Option<&CodePiece>) -> anyhow::Result<SolverResult> {
+        async fn run(&self, _formula: &str, _piece_id: Option<u64>) -> anyhow::Result<SolverResult> {
             let mut count = self.call_count.lock().expect("lock poisoned");
             *count += 1;
             if *count == 1 {

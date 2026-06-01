@@ -1,10 +1,12 @@
 pub use refactor_check_core::{
-    consts, llm, phase, piece, piece_manager, provider, smt,
+    consts, llm, phase_tracker, provider, smt, state,
 };
 
 pub mod agent;
+pub mod behaviors;
 pub mod machine;
+pub mod phase;
+pub mod piece;
+pub mod piece_manager;
 pub mod states;
 pub mod transitions;
-
-pub mod behaviors;

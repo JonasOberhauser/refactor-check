@@ -13,7 +13,6 @@ use std::fmt;
 use std::time::Duration;
 use tracing::{debug, info, instrument, trace, warn};
 
-use crate::piece::CodePiece;
 use crate::provider::{LlmProvider, LlmRole};
 
 #[derive(Debug)]
@@ -334,21 +333,21 @@ impl LlmClient {
     }
 
     #[instrument(skip_all, fields(model = %self.config.formalizer_model))]
-    pub async fn chat_formalizer(&self, messages: Vec<Message>, piece: Option<&CodePiece>) -> Result<String> {
+    pub async fn chat_formalizer(&self, messages: Vec<Message>, piece: Option<u64>) -> Result<String> {
         self.chat_inner("formalizer", &self.formalizer_client, &self.config.formalizer_model, messages, piece, |content| {
             !content.trim().is_empty()
         }).await
     }
 
     #[instrument(skip_all, fields(model = %self.config.fixer_model))]
-    pub async fn chat_fixer(&self, messages: Vec<Message>, piece: Option<&CodePiece>) -> Result<String> {
+    pub async fn chat_fixer(&self, messages: Vec<Message>, piece: Option<u64>) -> Result<String> {
         self.chat_inner("fixer", &self.fixer_client, &self.config.fixer_model, messages, piece, |content| {
             !content.trim().is_empty()
         }).await
     }
 
     #[instrument(skip_all, fields(model = %self.config.judge_model))]
-    pub async fn chat_judge(&self, messages: Vec<Message>, piece: Option<&CodePiece>) -> Result<String> {
+    pub async fn chat_judge(&self, messages: Vec<Message>, piece: Option<u64>) -> Result<String> {
         self.chat_inner("judge", &self.judge_client, &self.config.judge_model, messages, piece, |content| {
             let upper = content.trim().to_uppercase();
             let trimmed = upper.trim_start_matches(|c: char| !c.is_alphabetic());
@@ -357,14 +356,14 @@ impl LlmClient {
     }
 
     #[instrument(skip_all, fields(model = %self.config.splitter_model))]
-    pub async fn chat_splitter(&self, messages: Vec<Message>, piece: Option<&CodePiece>) -> Result<String> {
+    pub async fn chat_splitter(&self, messages: Vec<Message>, piece: Option<u64>) -> Result<String> {
         self.chat_inner("splitter", &self.splitter_client, &self.config.splitter_model, messages, piece, |content| {
             !content.trim().is_empty()
         }).await
     }
 
     #[instrument(skip_all, fields(model = %self.config.splitting_judge_model))]
-    pub async fn chat_splitting_judge(&self, messages: Vec<Message>, piece: Option<&CodePiece>) -> Result<String> {
+    pub async fn chat_splitting_judge(&self, messages: Vec<Message>, piece: Option<u64>) -> Result<String> {
         self.chat_inner("splitting_judge", &self.splitting_judge_client, &self.config.splitting_judge_model, messages, piece, |content| {
             let upper = content.trim().to_uppercase();
             let trimmed = upper.trim_start_matches(|c: char| !c.is_alphabetic());
@@ -378,10 +377,10 @@ impl LlmClient {
         client: &async_openai::Client<async_openai::config::OpenAIConfig>,
         model: &str,
         messages: Vec<Message>,
-        piece: Option<&CodePiece>,
+        piece: Option<u64>,
         is_partial_valid: impl Fn(&str) -> bool,
     ) -> Result<String> {
-        let pid = piece.map(|p| p.id());
+        let pid = piece;
         for msg in &messages {
             if !matches!(msg.role, Role::System) {
                 let prefixed: String = msg.content.lines().map(|l| format!(">\t{l}")).collect::<Vec<_>>().join("\n");
@@ -463,7 +462,7 @@ impl LlmProvider for LlmClient {
         &self,
         role: LlmRole,
         messages: Vec<Message>,
-        piece: Option<&CodePiece>,
+        piece: Option<u64>,
     ) -> Result<String> {
         match role {
             LlmRole::Splitter => self.chat_splitter(messages, piece).await,

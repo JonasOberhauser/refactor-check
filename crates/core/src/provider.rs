@@ -2,7 +2,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::llm::Message;
-use crate::piece::CodePiece;
 use crate::smt::{SolverOutcome, SolverResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,13 +19,13 @@ pub trait LlmProvider: Send + Sync {
         &self,
         role: LlmRole,
         messages: Vec<Message>,
-        piece: Option<&CodePiece>,
+        piece_id: Option<u64>,
     ) -> Result<String>;
 }
 
 #[async_trait]
 pub trait SolverProvider: Send + Sync {
-    async fn run(&self, formula: &str, piece: Option<&CodePiece>) -> Result<SolverResult>;
+    async fn run(&self, formula: &str, piece_id: Option<u64>) -> Result<SolverResult>;
 }
 
 pub struct FormulaResult {

@@ -58,7 +58,7 @@ async fn generate_one_formula(
     role: LlmRole,
 ) -> Result<String> {
     let messages = build_single_piece_messages(piece, input_content, verified);
-    let response = llm.chat(role, messages, Some(piece)).await?;
+    let response = llm.chat(role, messages, Some(piece.id())).await?;
     let formula = extract_single_formula(&response);
     debug!(piece_id = piece.id(), label = %piece.label(), bytes = formula.len(), "extracted formula for piece");
     Ok(formula)

@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use refactor_check::llm::Message;
 use refactor_check::provider::{LlmProvider, LlmRole, SolverProvider};
 use refactor_check::smt::{SolverOutcome, SolverResult};
-use refactor_check::states::CodePiece;
 
 pub struct LogReplayLlm {
     formalizer: Arc<Mutex<HashMap<u64, Vec<String>>>>,
@@ -61,7 +60,7 @@ impl LlmProvider for LogReplayLlm {
         &self,
         role: LlmRole,
         _messages: Vec<Message>,
-        piece: Option<&refactor_check::states::CodePiece>,
+        piece_id: Option<u64>,
     ) -> Result<String> {
         match role {
             LlmRole::Splitter => {
@@ -79,7 +78,7 @@ impl LlmProvider for LogReplayLlm {
                 Ok(q.remove(0))
             }
             LlmRole::Formalizer => {
-                let pid = piece.expect("formalizer must have piece_id").id();
+                let pid = piece_id.expect("formalizer must have piece_id");
                 let mut map = self.formalizer.lock().expect("lock poisoned");
                 let q = map.get_mut(&pid)
                     .ok_or_else(|| anyhow::anyhow!("LogReplayLlm: no Formalizer entry for piece_id={pid}"))?;
@@ -89,7 +88,7 @@ impl LlmProvider for LogReplayLlm {
                 Ok(q.remove(0))
             }
             LlmRole::Fixer => {
-                let pid = piece.expect("fixer must have piece_id").id();
+                let pid = piece_id.expect("fixer must have piece_id");
                 let mut map = self.fixer.lock().expect("lock poisoned");
                 let q = map.get_mut(&pid)
                     .ok_or_else(|| anyhow::anyhow!("LogReplayLlm: no Fixer entry for piece_id={pid}"))?;
@@ -99,7 +98,7 @@ impl LlmProvider for LogReplayLlm {
                 Ok(q.remove(0))
             }
             LlmRole::Judge => {
-                let pid = piece.expect("judge must have piece_id").id();
+                let pid = piece_id.expect("judge must have piece_id");
                 let mut map = self.judge.lock().expect("lock poisoned");
                 let q = map.get_mut(&pid)
                     .ok_or_else(|| anyhow::anyhow!("LogReplayLlm: no Judge entry for piece_id={pid}"))?;
@@ -140,8 +139,8 @@ impl LogReplaySolver {
 
 #[async_trait]
 impl SolverProvider for LogReplaySolver {
-    async fn run(&self, _formula: &str, piece: Option<&CodePiece>) -> Result<SolverResult> {
-        let pid = piece.expect("solver must have piece_id").id();
+    async fn run(&self, _formula: &str, piece_id: Option<u64>) -> Result<SolverResult> {
+        let pid = piece_id.expect("solver must have piece_id");
         let mut map = self.runs.lock().expect("lock poisoned");
         let q = map.get_mut(&pid)
             .ok_or_else(|| anyhow::anyhow!("LogReplaySolver: no entry for piece_id={pid}"))?;

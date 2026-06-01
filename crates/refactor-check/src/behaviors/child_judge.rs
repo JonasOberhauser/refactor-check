@@ -85,7 +85,7 @@ pub async fn execute(
             llm::user_message(&prompt),
         ];
 
-        let response = llm.chat(LlmRole::Judge, messages, Some(piece)).await?;
+        let response = llm.chat(LlmRole::Judge, messages, Some(piece.id())).await?;
         let trimmed = response.trim().to_string();
         let upper = trimmed.to_uppercase();
 
