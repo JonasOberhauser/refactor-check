@@ -7,7 +7,8 @@ use tracing::warn;
 use crate::behaviors::{self, generation};
 use crate::consts::{JUDGE_REASONABLE, MAX_BRANCH_RETRIES, MAX_GLOBAL_CYCLES, MAX_INSIST_ATTEMPTS, MAX_SPLIT_DEPTH};
 use crate::piece_manager::PieceManager;
-use crate::provider::{AgentResult, FormulaResult, LlmProvider, SolverProvider};
+use crate::result::{AgentResult, FormulaResult};
+use crate::provider::{DynLlmProvider, DynSolverProvider};
 use crate::smt::{SolverOutcome, SolverResult};
 use crate::states::*;
 
@@ -17,8 +18,8 @@ use crate::states::*;
 impl AlgorithmState for WaitForSplit {
     async fn execute(
         self: Box<Self>,
-        llm: &dyn LlmProvider,
-        _solver: &dyn SolverProvider,
+        llm: &DynLlmProvider,
+        _solver: &DynSolverProvider,
         pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
         let raw_pieces = behaviors::splitter::execute(&self, llm, pm).await?;
@@ -39,8 +40,8 @@ impl AlgorithmState for WaitForSplit {
 impl AlgorithmState for WaitForSplittingJudge {
     async fn execute(
         self: Box<Self>,
-        llm: &dyn LlmProvider,
-        _solver: &dyn SolverProvider,
+        llm: &DynLlmProvider,
+        _solver: &DynSolverProvider,
         _pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
         let verdict = behaviors::splitting_judge::execute(&self, llm).await?;
@@ -118,8 +119,8 @@ impl AlgorithmState for WaitForSplittingJudge {
 impl AlgorithmState for WaitForGeneration {
     async fn execute(
         self: Box<Self>,
-        llm: &dyn LlmProvider,
-        _solver: &dyn SolverProvider,
+        llm: &DynLlmProvider,
+        _solver: &DynSolverProvider,
         pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
         if let InsistState::Insisting { attempt, .. } = &self.insist {
@@ -179,8 +180,8 @@ impl AlgorithmState for WaitForGeneration {
 impl AlgorithmState for WaitForResults {
     async fn execute(
         self: Box<Self>,
-        llm: &dyn LlmProvider,
-        solver: &dyn SolverProvider,
+        llm: &DynLlmProvider,
+        solver: &DynSolverProvider,
         pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
         let WaitForResults { input_content, verified, open, iteration, branches } = *self;
@@ -252,8 +253,8 @@ impl AlgorithmState for WaitForResults {
 impl AlgorithmState for WaitForExplanation {
     async fn execute(
         self: Box<Self>,
-        llm: &dyn LlmProvider,
-        _solver: &dyn SolverProvider,
+        llm: &DynLlmProvider,
+        _solver: &DynSolverProvider,
         _pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
         let explanations = behaviors::explain::execute(&self, llm).await?;

@@ -3,7 +3,7 @@ use tracing::{debug, warn};
 
 use crate::consts::{JUDGE_REASONABLE, MAX_JUDGE_ATTEMPTS};
 use crate::llm;
-use crate::provider::{LlmProvider, LlmRole};
+use crate::provider::{DynLlmProvider, LlmRequest, LlmRole};
 use crate::states::WaitForSplittingJudge;
 
 pub enum SplittingJudgeVerdict {
@@ -13,7 +13,7 @@ pub enum SplittingJudgeVerdict {
 
 pub async fn execute(
     state: &WaitForSplittingJudge,
-    llm: &dyn LlmProvider,
+    llm: &DynLlmProvider,
 ) -> Result<SplittingJudgeVerdict> {
     let mut attempts = 0;
     let mut last_response = String::new();
@@ -78,7 +78,7 @@ pub async fn execute(
             llm::user_message(&prompt),
         ];
 
-        let response = llm.chat(LlmRole::SplittingJudge, messages, None).await?;
+        let response = llm.invoke(LlmRequest { role: LlmRole::SplittingJudge, messages, piece_id: None }).await?;
         let trimmed = response.trim().to_string();
         let upper = trimmed.to_uppercase();
 

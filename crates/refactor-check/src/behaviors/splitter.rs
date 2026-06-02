@@ -2,17 +2,17 @@ use anyhow::Result;
 use tracing::{debug, warn};
 
 use crate::piece_manager::PieceManager;
-use crate::provider::{LlmProvider, LlmRole};
+use crate::provider::{DynLlmProvider, LlmRequest, LlmRole};
 use crate::states::{CodePiece, WaitForSplit};
 
 pub async fn execute(
     state: &WaitForSplit,
-    llm: &dyn LlmProvider,
+    llm: &DynLlmProvider,
     pm: &dyn PieceManager,
 ) -> Result<Vec<CodePiece>> {
     for attempt in 0..3 {
         let messages = build_split_messages(state);
-        let response = llm.chat(LlmRole::Splitter, messages, None).await?;
+        let response = llm.invoke(LlmRequest { role: LlmRole::Splitter, messages, piece_id: None }).await?;
         let pieces = extract_split_pieces(&response, pm);
 
         if !pieces.is_empty() {

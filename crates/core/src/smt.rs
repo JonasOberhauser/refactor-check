@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, trace, warn};
 
-use crate::provider::SolverProvider;
+use crate::provider::{IOProvider, SolverRequest};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SolverOutcome {
@@ -259,9 +259,9 @@ impl Z3Solver {
 }
 
 #[async_trait]
-impl SolverProvider for Z3Solver {
-    async fn run(&self, formula: &str, piece_id: Option<u64>) -> Result<SolverResult> {
-        run_solver(&self.solver_path, &self.solver_args, self.timeout, formula, piece_id).await
+impl IOProvider<SolverRequest, SolverResult> for Z3Solver {
+    async fn invoke(&self, input: SolverRequest) -> Result<SolverResult> {
+        run_solver(&self.solver_path, &self.solver_args, self.timeout, &input.formula, input.piece_id).await
     }
 }
 

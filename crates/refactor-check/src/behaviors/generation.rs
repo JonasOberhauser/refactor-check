@@ -4,7 +4,7 @@ use tracing::{debug, warn};
 
 use crate::phase::PiecePhase;
 use crate::piece_manager::PieceManager;
-use crate::provider::{LlmProvider, LlmRole};
+use crate::provider::{DynLlmProvider, LlmRequest, LlmRole};
 use crate::smt::{extract_all_formulas, extract_single_formula};
 use crate::states::{CodePiece, InsistState, VerifiedPiece, WaitForGeneration};
 
@@ -18,7 +18,7 @@ pub fn role_for_iteration(iteration: usize) -> LlmRole {
 
 pub async fn execute(
     state: &WaitForGeneration,
-    llm: &dyn LlmProvider,
+    llm: &DynLlmProvider,
     pm: &dyn PieceManager,
 ) -> Result<Vec<String>> {
     let role = role_for_iteration(state.iteration);
@@ -54,11 +54,11 @@ async fn generate_one_formula(
     piece: &CodePiece,
     input_content: &str,
     verified: &[VerifiedPiece],
-    llm: &dyn LlmProvider,
+    llm: &DynLlmProvider,
     role: LlmRole,
 ) -> Result<String> {
     let messages = build_single_piece_messages(piece, input_content, verified);
-    let response = llm.chat(role, messages, Some(piece.id())).await?;
+    let response = llm.invoke(LlmRequest { role, messages, piece_id: Some(piece.id()) }).await?;
     let formula = extract_single_formula(&response);
     debug!(piece_id = piece.id(), label = %piece.label(), bytes = formula.len(), "extracted formula for piece");
     Ok(formula)
@@ -66,7 +66,7 @@ async fn generate_one_formula(
 
 async fn generate_insist(
     state: &WaitForGeneration,
-    llm: &dyn LlmProvider,
+    llm: &DynLlmProvider,
     role: LlmRole,
     last_response: &str,
 ) -> Result<Vec<String>> {
@@ -104,7 +104,7 @@ async fn generate_insist(
         )),
     ];
 
-    let response = llm.chat(role, messages, None).await?;
+    let response = llm.invoke(LlmRequest { role, messages, piece_id: None }).await?;
     let mut formulas = extract_all_formulas(&response);
 
     if formulas.len() != state.pieces.len() {

@@ -4,8 +4,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use async_trait::async_trait;
 
-use refactor_check::llm::Message;
-use refactor_check::provider::{LlmProvider, LlmRole, SolverProvider};
+use refactor_check::provider::{IOProvider, LlmRequest, LlmRole, SolverRequest};
 use refactor_check::smt::{SolverOutcome, SolverResult};
 
 pub struct LogReplayLlm {
@@ -55,14 +54,10 @@ impl LogReplayLlm {
 }
 
 #[async_trait]
-impl LlmProvider for LogReplayLlm {
-    async fn chat(
-        &self,
-        role: LlmRole,
-        _messages: Vec<Message>,
-        piece_id: Option<u64>,
-    ) -> Result<String> {
-        match role {
+impl IOProvider<LlmRequest, String> for LogReplayLlm {
+    async fn invoke(&self, input: LlmRequest) -> Result<String> {
+        let piece_id = input.piece_id;
+        match input.role {
             LlmRole::Splitter => {
                 let mut q = self.splitter.lock().expect("lock poisoned");
                 if q.is_empty() {
@@ -138,9 +133,9 @@ impl LogReplaySolver {
 }
 
 #[async_trait]
-impl SolverProvider for LogReplaySolver {
-    async fn run(&self, _formula: &str, piece_id: Option<u64>) -> Result<SolverResult> {
-        let pid = piece_id.expect("solver must have piece_id");
+impl IOProvider<SolverRequest, SolverResult> for LogReplaySolver {
+    async fn invoke(&self, input: SolverRequest) -> Result<SolverResult> {
+        let pid = input.piece_id.expect("solver must have piece_id");
         let mut map = self.runs.lock().expect("lock poisoned");
         let q = map.get_mut(&pid)
             .ok_or_else(|| anyhow::anyhow!("LogReplaySolver: no entry for piece_id={pid}"))?;

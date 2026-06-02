@@ -3,8 +3,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use async_trait::async_trait;
 
-use refactor_check::llm::Message;
-use refactor_check::provider::{LlmProvider, LlmRole, SolverProvider};
+use refactor_check::provider::{IOProvider, LlmRequest, LlmRole, SolverRequest};
 use refactor_check::smt::{SolverOutcome, SolverResult};
 
 pub struct SequenceLlm {
@@ -62,14 +61,9 @@ impl SequenceLlm {
 }
 
 #[async_trait]
-impl LlmProvider for SequenceLlm {
-    async fn chat(
-        &self,
-        role: LlmRole,
-        _messages: Vec<Message>,
-        _piece_id: Option<u64>,
-    ) -> Result<String> {
-        let queue = match role {
+impl IOProvider<LlmRequest, String> for SequenceLlm {
+    async fn invoke(&self, input: LlmRequest) -> Result<String> {
+        let queue = match input.role {
             LlmRole::Splitter => &self.splitter,
             LlmRole::SplittingJudge => &self.splitting_judge,
             LlmRole::Formalizer => &self.formalizer,
@@ -78,7 +72,7 @@ impl LlmProvider for SequenceLlm {
         };
         let mut responses = queue.lock().expect("lock poisoned");
         if responses.is_empty() {
-            anyhow::bail!("SequenceLlm: no more {role:?} responses available");
+            anyhow::bail!("SequenceLlm: no more {:?} responses available", input.role);
         }
         Ok(responses.remove(0))
     }
@@ -89,8 +83,8 @@ pub struct FakeSolver {
 }
 
 #[async_trait]
-impl SolverProvider for FakeSolver {
-    async fn run(&self, _formula: &str, _piece_id: Option<u64>) -> Result<SolverResult> {
+impl IOProvider<SolverRequest, SolverResult> for FakeSolver {
+    async fn invoke(&self, _input: SolverRequest) -> Result<SolverResult> {
         Ok(SolverResult {
             outcome: self.outcome.clone(),
             stdout: format!("{:?}", self.outcome).to_lowercase(),

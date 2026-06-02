@@ -6,7 +6,7 @@ use tracing::debug;
 
 use crate::phase::PiecePhase;
 use crate::piece_manager::PieceManager;
-use crate::provider::{LlmProvider, LlmRole, SolverProvider};
+use crate::provider::{DynLlmProvider, DynSolverProvider, LlmRequest, LlmRole, SolverRequest};
 use crate::smt::extract_all_formulas;
 use crate::states::*;
 use crate::transitions;
@@ -16,8 +16,8 @@ use super::generation;
 
 pub async fn execute_all(
     branches: Vec<FormulaBranch>,
-    llm: &dyn LlmProvider,
-    solver: &dyn SolverProvider,
+    llm: &DynLlmProvider,
+    solver: &DynSolverProvider,
     pm: &dyn PieceManager,
 ) -> Result<Vec<ChildDone>> {
     let futures = branches
@@ -29,8 +29,8 @@ pub async fn execute_all(
 
 async fn run_branch(
     branch: FormulaBranch,
-    llm: &dyn LlmProvider,
-    solver: &dyn SolverProvider,
+    llm: &DynLlmProvider,
+    solver: &DynSolverProvider,
     pm: &dyn PieceManager,
 ) -> Result<Vec<ChildDone>> {
     let piece = branch.piece;
@@ -44,7 +44,7 @@ async fn run_branch(
             BranchPhase::WaitForSolver { formula } => {
                 pm.expect_any_and_set(piece.id(), &[PiecePhase::Forming, PiecePhase::Fixing], PiecePhase::Solving);
                 debug!(piece_id = piece.id(), label = %piece.label(), "running solver");
-                let result = solver.run(&formula, Some(piece.id())).await?;
+                let result = solver.invoke(SolverRequest { formula: formula.clone(), piece_id: Some(piece.id()) }).await?;
                 debug!(piece_id = piece.id(), label = %piece.label(), outcome = ?result.outcome, "solver done");
                 match transitions::transition_solver(formula.clone(), result) {
                     BranchFromSolver::Judge(f, r) => {
@@ -143,24 +143,24 @@ async fn run_branch(
                 let response = if insist_pending {
                     let prev = last_response.as_deref().unwrap_or("");
                     debug!(piece_id = piece.id(), label = %piece.label(), "insist fixer retry for piece");
-                    llm.chat(
+                    llm.invoke(LlmRequest {
                         role,
-                        generation::build_retry_insist_messages(
+                        messages: generation::build_retry_insist_messages(
                             &piece, fb, prev, &input_content,
                         ),
-                        Some(piece.id()),
-                    )
+                        piece_id: Some(piece.id()),
+                    })
                     .await?
                 } else {
                     debug!(piece_id = piece.id(), label = %piece.label(), "fixer retry for piece");
-                    llm.chat(
+                    llm.invoke(LlmRequest {
                         role,
-                        generation::build_retry_messages(
+                        messages: generation::build_retry_messages(
                             &piece, &current_formula, fb,
                             solver_stdout, solver_stderr, &input_content,
                         ),
-                        Some(piece.id()),
-                    )
+                        piece_id: Some(piece.id()),
+                    })
                     .await?
                 };
 

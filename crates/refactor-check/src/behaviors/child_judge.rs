@@ -3,7 +3,7 @@ use tracing::{debug, warn};
 
 use crate::consts::{JUDGE_REASONABLE, MAX_JUDGE_ATTEMPTS};
 use crate::llm;
-use crate::provider::{LlmProvider, LlmRole};
+use crate::provider::{DynLlmProvider, LlmRequest, LlmRole};
 use crate::smt::SolverResult;
 use crate::states::{CodePiece, JudgeVerdict};
 
@@ -11,7 +11,7 @@ pub async fn execute(
     piece: &CodePiece,
     formula: &str,
     solver_result: &SolverResult,
-    llm: &dyn LlmProvider,
+    llm: &DynLlmProvider,
     input_content: &str,
 ) -> Result<JudgeVerdict> {
     let mut attempts = 0;
@@ -85,7 +85,7 @@ pub async fn execute(
             llm::user_message(&prompt),
         ];
 
-        let response = llm.chat(LlmRole::Judge, messages, Some(piece.id())).await?;
+        let response = llm.invoke(LlmRequest { role: LlmRole::Judge, messages, piece_id: Some(piece.id()) }).await?;
         let trimmed = response.trim().to_string();
         let upper = trimmed.to_uppercase();
 

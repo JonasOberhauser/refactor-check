@@ -4,7 +4,8 @@ use async_trait::async_trait;
 
 pub use crate::piece::CodePiece;
 use crate::piece_manager::PieceManager;
-use crate::provider::{AgentResult, LlmProvider, SolverProvider};
+use crate::result::AgentResult;
+use crate::provider::{DynLlmProvider, DynSolverProvider};
 use crate::smt::{SolverOutcome, SolverResult};
 
 pub enum Step {
@@ -16,8 +17,8 @@ pub enum Step {
 pub trait AlgorithmState: Send + Sync {
     async fn execute(
         self: Box<Self>,
-        llm: &dyn LlmProvider,
-        solver: &dyn SolverProvider,
+        llm: &DynLlmProvider,
+        solver: &DynSolverProvider,
         pm: &dyn PieceManager,
     ) -> anyhow::Result<Step>;
 }

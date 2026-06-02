@@ -1,8 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::llm::Message;
-use crate::smt::{SolverOutcome, SolverResult};
+pub use crate::llm::Message;
+pub use crate::smt::SolverResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmRole {
@@ -13,35 +13,21 @@ pub enum LlmRole {
     Judge,
 }
 
-#[async_trait]
-pub trait LlmProvider: Send + Sync {
-    async fn chat(
-        &self,
-        role: LlmRole,
-        messages: Vec<Message>,
-        piece_id: Option<u64>,
-    ) -> Result<String>;
+pub struct LlmRequest {
+    pub role: LlmRole,
+    pub messages: Vec<Message>,
+    pub piece_id: Option<u64>,
 }
 
-#[async_trait]
-pub trait SolverProvider: Send + Sync {
-    async fn run(&self, formula: &str, piece_id: Option<u64>) -> Result<SolverResult>;
-}
-
-pub struct FormulaResult {
+pub struct SolverRequest {
     pub formula: String,
-    pub piece_id: u64,
-    pub piece_label: String,
-    pub outcome: SolverOutcome,
-    pub verdict: String,
-    pub explanation: Option<String>,
+    pub piece_id: Option<u64>,
 }
 
-pub struct AgentResult {
-    pub formulas: Vec<FormulaResult>,
-    pub overall_equivalent: bool,
-    pub open_count: usize,
-    pub reasonable_sat: usize,
-    pub reasonable_unsat: usize,
-    pub reasonable_unknown: usize,
+#[async_trait]
+pub trait IOProvider<I, O>: Send + Sync {
+    async fn invoke(&self, input: I) -> Result<O>;
 }
+
+pub type DynLlmProvider = dyn IOProvider<LlmRequest, String>;
+pub type DynSolverProvider = dyn IOProvider<SolverRequest, SolverResult>;

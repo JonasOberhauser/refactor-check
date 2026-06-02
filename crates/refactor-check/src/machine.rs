@@ -2,13 +2,14 @@ use anyhow::Result;
 use std::sync::Arc;
 
 use crate::piece_manager::PieceManager;
-use crate::provider::{AgentResult, LlmProvider, SolverProvider};
+use crate::result::AgentResult;
+use crate::provider::{DynLlmProvider, DynSolverProvider};
 use crate::states::*;
 
 pub async fn run(
     input_content: &str,
-    llm: &dyn LlmProvider,
-    solver: &dyn SolverProvider,
+    llm: &DynLlmProvider,
+    solver: &DynSolverProvider,
     pm: &dyn PieceManager,
 ) -> Result<AgentResult> {
     let input_arc = Arc::new(input_content.to_string());

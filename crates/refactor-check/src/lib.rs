@@ -8,5 +8,6 @@ pub mod machine;
 pub mod phase;
 pub mod piece;
 pub mod piece_manager;
+pub mod result;
 pub mod states;
 pub mod transitions;

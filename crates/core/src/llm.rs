@@ -13,7 +13,7 @@ use std::fmt;
 use std::time::Duration;
 use tracing::{debug, info, instrument, trace, warn};
 
-use crate::provider::{LlmProvider, LlmRole};
+use crate::provider::{IOProvider, LlmRequest, LlmRole};
 
 #[derive(Debug)]
 pub enum Role {
@@ -457,19 +457,14 @@ pub fn assistant_message(content: &str) -> Message {
 }
 
 #[async_trait]
-impl LlmProvider for LlmClient {
-    async fn chat(
-        &self,
-        role: LlmRole,
-        messages: Vec<Message>,
-        piece: Option<u64>,
-    ) -> Result<String> {
-        match role {
-            LlmRole::Splitter => self.chat_splitter(messages, piece).await,
-            LlmRole::SplittingJudge => self.chat_splitting_judge(messages, piece).await,
-            LlmRole::Formalizer => self.chat_formalizer(messages, piece).await,
-            LlmRole::Fixer => self.chat_fixer(messages, piece).await,
-            LlmRole::Judge => self.chat_judge(messages, piece).await,
+impl IOProvider<LlmRequest, String> for LlmClient {
+    async fn invoke(&self, input: LlmRequest) -> Result<String> {
+        match input.role {
+            LlmRole::Splitter => self.chat_splitter(input.messages, input.piece_id).await,
+            LlmRole::SplittingJudge => self.chat_splitting_judge(input.messages, input.piece_id).await,
+            LlmRole::Formalizer => self.chat_formalizer(input.messages, input.piece_id).await,
+            LlmRole::Fixer => self.chat_fixer(input.messages, input.piece_id).await,
+            LlmRole::Judge => self.chat_judge(input.messages, input.piece_id).await,
         }
     }
 }
