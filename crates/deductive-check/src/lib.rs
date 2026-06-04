@@ -9,6 +9,7 @@ pub mod formula;
 pub mod machine;
 pub mod phase;
 pub mod piece_manager;
+pub mod prompts;
 pub mod provider;
 pub mod result;
 pub mod states;

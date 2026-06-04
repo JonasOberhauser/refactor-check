@@ -14,7 +14,6 @@ pub trait DeductivePieceManager: Send + Sync {
         start_line: u32,
         end_line: u32,
         code: String,
-        condition_at_start: Option<String>,
     ) -> DeductiveCodePiece;
 
     fn advance_piece(&self, id: u64, from: Option<CodePiecePhase>, to: CodePiecePhase);
@@ -76,7 +75,6 @@ impl DeductivePieceManager for DefaultDeductivePieceManager {
         start_line: u32,
         end_line: u32,
         code: String,
-        condition_at_start: Option<String>,
     ) -> DeductiveCodePiece {
         let id = self.next_piece_id();
         let piece = DeductiveCodePiece::with_id(
@@ -86,7 +84,6 @@ impl DeductivePieceManager for DefaultDeductivePieceManager {
             start_line,
             end_line,
             code,
-            condition_at_start,
         );
         self.piece_tracker.advance(id, None, CodePiecePhase::Open);
         piece
@@ -162,7 +159,6 @@ mod tests {
             1,
             10,
             "code".to_string(),
-            None,
         );
         let id = piece.id();
 
@@ -194,7 +190,6 @@ mod tests {
             1,
             5,
             "code".to_string(),
-            None,
         );
         let id = piece.id();
 
@@ -210,7 +205,6 @@ mod tests {
             1,
             5,
             "code".to_string(),
-            None,
         );
         let formula = pm.new_formula(piece.id(), "(check-sat)".to_string(), FormulaSource::SmtLib, 0);
         let fid = formula.id();
@@ -233,7 +227,6 @@ mod tests {
             1,
             5,
             "code".to_string(),
-            None,
         );
         let formula = pm.new_formula(piece.id(), "(check-sat)".to_string(), FormulaSource::SmtLib, 0);
         let fid = formula.id();
@@ -259,7 +252,6 @@ mod tests {
             1,
             5,
             "code".to_string(),
-            None,
         );
         let id = piece.id();
 

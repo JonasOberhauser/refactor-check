@@ -40,7 +40,6 @@ pub struct DeductiveCodePiece {
     start_line: u32,
     end_line: u32,
     code: String,
-    condition_at_start: Option<String>,
 }
 
 impl DeductiveCodePiece {
@@ -51,7 +50,6 @@ impl DeductiveCodePiece {
         start_line: u32,
         end_line: u32,
         code: String,
-        condition_at_start: Option<String>,
     ) -> Self {
         Self {
             id,
@@ -60,7 +58,6 @@ impl DeductiveCodePiece {
             start_line,
             end_line,
             code,
-            condition_at_start,
         }
     }
 
@@ -86,10 +83,6 @@ impl DeductiveCodePiece {
 
     pub fn code(&self) -> &str {
         &self.code
-    }
-
-    pub fn condition_at_start(&self) -> Option<&str> {
-        self.condition_at_start.as_deref()
     }
 }
 
