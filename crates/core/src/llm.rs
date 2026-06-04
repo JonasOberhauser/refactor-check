@@ -40,6 +40,8 @@ pub struct LlmConfig {
     pub splitter_api_key: Option<String>,
     #[serde(default)]
     pub splitting_judge_api_key: Option<String>,
+    #[serde(default)]
+    pub analyzer_api_key: Option<String>,
     pub api_base: String,
     pub formalizer_model: String,
     pub fixer_model: String,
@@ -48,6 +50,8 @@ pub struct LlmConfig {
     pub splitting_judge_model: String,
     #[serde(default)]
     pub splitter_model: String,
+    #[serde(default)]
+    pub analyzer_model: String,
     #[serde(default = "default_stream_timeout_ms")]
     pub stream_timeout_ms: u64,
     #[serde(default = "default_max_stream_retries")]
@@ -77,12 +81,14 @@ impl Default for LlmConfig {
             fixer_api_key: None,
             splitter_api_key: None,
             splitting_judge_api_key: None,
+            analyzer_api_key: None,
             api_base: String::new(),
             formalizer_model: String::new(),
             fixer_model: String::new(),
             judge_model: String::new(),
             splitting_judge_model: String::new(),
             splitter_model: String::new(),
+            analyzer_model: String::new(),
             stream_timeout_ms: default_stream_timeout_ms(),
             max_stream_retries: default_max_stream_retries(),
             service_tier: default_service_tier(),
@@ -99,12 +105,14 @@ impl fmt::Debug for LlmConfig {
             .field("fixer_api_key", &self.fixer_api_key.as_ref().map(|_| "[REDACTED]"))
             .field("splitter_api_key", &self.splitter_api_key.as_ref().map(|_| "[REDACTED]"))
             .field("splitting_judge_api_key", &self.splitting_judge_api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("analyzer_api_key", &self.analyzer_api_key.as_ref().map(|_| "[REDACTED]"))
             .field("api_base", &self.api_base)
             .field("formalizer_model", &self.formalizer_model)
             .field("fixer_model", &self.fixer_model)
             .field("judge_model", &self.judge_model)
             .field("splitting_judge_model", &self.splitting_judge_model)
             .field("splitter_model", &self.splitter_model)
+            .field("analyzer_model", &self.analyzer_model)
             .field("stream_timeout_ms", &self.stream_timeout_ms)
             .field("max_stream_retries", &self.max_stream_retries)
             .field("service_tier", &self.service_tier)
@@ -118,6 +126,7 @@ pub struct LlmClient {
     judge_client: async_openai::Client<async_openai::config::OpenAIConfig>,
     splitting_judge_client: async_openai::Client<async_openai::config::OpenAIConfig>,
     splitter_client: async_openai::Client<async_openai::config::OpenAIConfig>,
+    analyzer_client: async_openai::Client<async_openai::config::OpenAIConfig>,
     config: LlmConfig,
 }
 
@@ -329,7 +338,13 @@ impl LlmClient {
             .with_api_base(&config.api_base);
         let splitter_client = async_openai::Client::with_config(splitter_config);
 
-        Self { formalizer_client, fixer_client, judge_client, splitting_judge_client, splitter_client, config }
+        let analyzer_key = config.analyzer_api_key.as_deref().unwrap_or(&config.api_key);
+        let analyzer_config = async_openai::config::OpenAIConfig::new()
+            .with_api_key(analyzer_key)
+            .with_api_base(&config.api_base);
+        let analyzer_client = async_openai::Client::with_config(analyzer_config);
+
+        Self { formalizer_client, fixer_client, judge_client, splitting_judge_client, splitter_client, analyzer_client, config }
     }
 
     #[instrument(skip_all, fields(model = %self.config.formalizer_model))]
@@ -368,6 +383,13 @@ impl LlmClient {
             let upper = content.trim().to_uppercase();
             let trimmed = upper.trim_start_matches(|c: char| !c.is_alphabetic());
             trimmed.starts_with("REASONABLE") || trimmed.starts_with("RETRY")
+        }).await
+    }
+
+    #[instrument(skip_all, fields(model = %self.config.analyzer_model))]
+    pub async fn chat_analyzer(&self, messages: Vec<Message>, piece: Option<u64>) -> Result<String> {
+        self.chat_inner("analyzer", &self.analyzer_client, &self.config.analyzer_model, messages, piece, |content| {
+            !content.trim().is_empty()
         }).await
     }
 
@@ -465,6 +487,7 @@ impl IOProvider<LlmRequest, String> for LlmClient {
             LlmRole::Formalizer => self.chat_formalizer(input.messages, input.piece_id).await,
             LlmRole::Fixer => self.chat_fixer(input.messages, input.piece_id).await,
             LlmRole::Judge => self.chat_judge(input.messages, input.piece_id).await,
+            LlmRole::Analyzer => self.chat_analyzer(input.messages, input.piece_id).await,
         }
     }
 }

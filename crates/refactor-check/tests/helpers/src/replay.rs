@@ -13,6 +13,7 @@ pub struct LogReplayLlm {
     judge: Arc<Mutex<HashMap<u64, Vec<String>>>>,
     splitter: Arc<Mutex<Vec<String>>>,
     splitting_judge: Arc<Mutex<Vec<String>>>,
+    analyzer: Arc<Mutex<HashMap<u64, Vec<String>>>>,
 }
 
 impl Default for LogReplayLlm {
@@ -29,6 +30,7 @@ impl LogReplayLlm {
             judge: Arc::new(Mutex::new(HashMap::new())),
             splitter: Arc::new(Mutex::new(Vec::new())),
             splitting_judge: Arc::new(Mutex::new(Vec::new())),
+            analyzer: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -50,6 +52,10 @@ impl LogReplayLlm {
 
     pub fn judge_push(&mut self, piece_id: u64, response: String) {
         self.judge.lock().unwrap().entry(piece_id).or_default().push(response);
+    }
+
+    pub fn analyzer_push(&mut self, piece_id: u64, response: String) {
+        self.analyzer.lock().unwrap().entry(piece_id).or_default().push(response);
     }
 }
 
@@ -99,6 +105,16 @@ impl IOProvider<LlmRequest, String> for LogReplayLlm {
                     .ok_or_else(|| anyhow::anyhow!("LogReplayLlm: no Judge entry for piece_id={pid}"))?;
                 if q.is_empty() {
                     anyhow::bail!("LogReplayLlm: no more Judge responses for piece_id={pid}");
+                }
+                Ok(q.remove(0))
+            }
+            LlmRole::Analyzer => {
+                let pid = piece_id.unwrap_or(0);
+                let mut map = self.analyzer.lock().expect("lock poisoned");
+                let q = map.get_mut(&pid)
+                    .ok_or_else(|| anyhow::anyhow!("LogReplayLlm: no Analyzer entry for piece_id={pid}"))?;
+                if q.is_empty() {
+                    anyhow::bail!("LogReplayLlm: no more Analyzer responses for piece_id={pid}");
                 }
                 Ok(q.remove(0))
             }

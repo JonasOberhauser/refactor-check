@@ -11,6 +11,7 @@ pub enum LlmRole {
     Formalizer,
     Fixer,
     Judge,
+    Analyzer,
 }
 
 pub struct LlmRequest {

@@ -12,6 +12,7 @@ pub struct SequenceLlm {
     judge: Arc<Mutex<Vec<String>>>,
     splitter: Arc<Mutex<Vec<String>>>,
     splitting_judge: Arc<Mutex<Vec<String>>>,
+    analyzer: Arc<Mutex<Vec<String>>>,
 }
 
 impl SequenceLlm {
@@ -21,6 +22,7 @@ impl SequenceLlm {
         judge: Vec<String>,
         splitter: Vec<String>,
         splitting_judge: Vec<String>,
+        analyzer: Vec<String>,
     ) -> Self {
         Self {
             formalizer: Arc::new(Mutex::new(formalizer)),
@@ -28,6 +30,7 @@ impl SequenceLlm {
             judge: Arc::new(Mutex::new(judge)),
             splitter: Arc::new(Mutex::new(splitter)),
             splitting_judge: Arc::new(Mutex::new(splitting_judge)),
+            analyzer: Arc::new(Mutex::new(analyzer)),
         }
     }
 
@@ -44,6 +47,7 @@ impl SequenceLlm {
             judge: Arc::new(Mutex::new(judge)),
             splitter: Arc::new(Mutex::new(splitter)),
             splitting_judge: Arc::new(Mutex::new(vec!["REASONABLE".to_string(); split_count])),
+            analyzer: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -69,6 +73,7 @@ impl IOProvider<LlmRequest, String> for SequenceLlm {
             LlmRole::Formalizer => &self.formalizer,
             LlmRole::Fixer => &self.fixer,
             LlmRole::Judge => &self.judge,
+            LlmRole::Analyzer => &self.analyzer,
         };
         let mut responses = queue.lock().expect("lock poisoned");
         if responses.is_empty() {
