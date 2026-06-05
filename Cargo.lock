@@ -509,28 +509,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "deductive-check-protocol"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "dashmap",
- "refactor-check-core",
- "serde",
-]
-
-[[package]]
-name = "deductive-check-states"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "deductive-check-protocol",
- "tracing",
-]
-
-[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2465,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "refactor-check"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -2485,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "refactor-check-core"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "async-openai",
