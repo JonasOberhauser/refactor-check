@@ -25,6 +25,7 @@ A **Key Line** is one of:
 ## Rules
 
 - When doing the verification, `#[cfg(verification)]` should be considered to be on, and should be passed correctly to rust-analyzer.
+- Use `ra_ap_project_model::ProjectWorkspace` to load the entire Cargo project (not `Analysis::from_single_file`). Configure `CargoConfig` with `set_test: false` and `features: ["verification"]` so that `#[cfg(test)]` items are excluded and `#[cfg(verification)]` items are included. This gives correct cfg-aware parsing without manual `strip_cfg_attribute` hacks.
 - For dynamic trait impls, such as `Box<Trait>`, methods called in that area should have a `const invariant_<method>(&Self, ...) -> bool` function. It should be verified that `invariant_<method>(...) == true` implies that the preconditions of `method(...)` are satisfied for every impl of that trait. This mechanism can be used to state preconditions of a dynamic trait object in the conditions of key lines, such as loop invariants where the loop accesses a dyn trait object.
 - Parameters passed as `&T` to functions should be assumed not to be modified by the function.
 
@@ -221,3 +222,73 @@ then if no unverified pieces remain:
 
 collect these files as modified files. Go to:
 [Function Lister(modified files + list of files that need to be rechecked later)]
+
+---
+
+## Implementation Status & Outstanding Issues
+
+### Completed
+
+- Replaced `Analysis::from_single_file()` with `ProjectWorkspace`-based `CliRustAnalyzerProvider` that loads entire Cargo project via `ra_ap_project_model`
+- Fixed byte offset vs line number bug: `node_range.start()/end()` are `TextSize` (byte offsets), not line numbers — added `byte_offset_to_line()` / `line_to_byte_offset()` conversion helpers with bounds-checking assertions
+- Fixed VFS setup: use `vfs.take_changes()` to get file contents instead of re-reading from disk (was causing rowan "Bad offset" panics)
+- Fixed empty code passed to formalizer/judge: `split_function` retries up to 3 times on empty splitter response, filters out empty-code pieces, skips functions with empty bodies
+- Fixed formula not shown to fixer LLM on solver error: `check_formula` now returns `(Formula, SolverOutcome, String)` where third element is the actual SMT content sent to solver; fix loop passes `current_smt` to `fix_formula` instead of raw `ef.content`
+- Formula summary shown to judge now includes actual formula content (not just outcome)
+- Judge prompt uses `refactor_check_core::consts::JUDGE_REASONABLE` constant instead of hardcoded "REASONABLE"
+- Judge prompt says "reply only REASONABLE and nothing else" so `starts_with(JUDGE_REASONABLE)` check works correctly
+- Added function docs retrieval via `analysis.goto_definition()` → `NavigationTarget.docs` (cloned out of locked scope)
+- Added `docs: String` field to `FunctionInfo`, `GetFunctionDocs`/`FunctionDocs` request/response
+- Added `fetch_docs()` helper using `goto_definition` at function name offset to get docs
+- Docs flow: `FunctionLister` builds `function_docs: HashMap<FunctionId, String>` → `FunctionAnalyzer` → `Splitter` → `FullFormalizer`; `Splitter` stores docs via `pm.store_function_docs()`
+- `gather_context` fetches called functions' docs via `GetFunctionDocs` and includes them
+- `process_piece` builds `own_docs_section` with safety hint, passes to formalizer and judge
+- `formalizer_user`, `judge_user`, `analyzer_user` prompts accept `docs_section: &str` parameter
+- Added `store_function_docs`/`get_function_docs` to `DeductivePieceManager` trait and impl (backed by `DashMap<FunctionId, String>`)
+- Build, clippy, and tests pass
+
+### Outstanding: Postconditions Detection (HIGH PRIORITY)
+
+~~Currently the formalizer only verifies that preconditions of called functions are met.~~ **DONE.**
+
+`has_guarantees` field on `FunctionInfo` detects:
+1. **`unsafe` blocks** in function body (not `unsafe fn` signature) — via `ra_ap_syntax` AST traversal: `fn_ast.body().syntax().descendants_with_tokens()` checking for `T![unsafe]` tokens
+2. **Assertions** — `assert!`, `assert_eq!`, `assert_ne!`, `debug_assert!`, `panic!`, `.unwrap()`, `.expect()`, `unreachable!`, `unimplemented!` — via AST traversal: `MacroCall::cast` + path matching, `MethodCallExpr::cast` + name matching
+3. **Doc sections** — `# Guarantees`, `# Postconditions`, `# Ensures`, `# Safety`
+
+Functions without guarantees are filtered out in `FunctionLister`. When `has_guarantees` is true, the formalizer prompt adds: "You must verify not only that preconditions of called functions are satisfied, but also that this function's own postconditions and safety guarantees hold under the stated preconditions."
+
+**Remaining enhancement:** Detect calls to functions with preconditions (e.g., safe wrappers around unsafe). This requires querying `outgoing_calls` for each function at listing time, which is expensive.
+
+### Outstanding: Cross-Piece Boundary Relations
+
+See `PLAN.md` in the workspace root for the full plan. Summary:
+
+Currently each piece must be strictly equivalent in isolation. This breaks when a refactoring moves a variable across piece boundaries (e.g., `y` in before becomes `z` in after). The fix is to let the splitter annotate **boundary relations** as `/* relation: ... */` comments, the formalizer verifies the relation holds (not strict equivalence), the splitting judge checks relations are consistent across adjacent pieces, and the child judge verifies the formula encodes the relation correctly.
+
+No structural changes needed — relation comments are inline in `before`/`after` text. Changes needed in: `splitter.rs` system prompt, `generation.rs` formalizer/fixer prompts, `splitting_judge.rs`, `child_judge.rs`.
+
+### Outstanding: End-to-End Testing
+
+Test the full pipeline with a real project to verify VFS/offset/docs integration works correctly from start to finish.
+
+### Outstanding: Git Branch Cleanup
+
+Many local git branches exist that are already merged. Clean them up.
+
+### Critical Technical Context
+
+- `CliRustAnalyzerProvider::new()` returns `Result<Self>` (not `Self`) — can fail if Cargo.toml missing or project loading fails
+- `main.rs` calls `CliRustAnalyzerProvider::new(cli.project.clone())?` — removed old `rust_analyzer_path` CLI arg
+- Both `main.rs` files use `fn main()` → `run_with_error_shell(closure)` instead of `#[tokio::main]`. All provider construction happens inside the closure. `agent::run` takes `(input_file, config, Option<Arc<ErrorGate>>)`.
+- `ra_ap_vfs::Vfs::file_id()` returns `Option<(FileId, FileExcluded)>`, not just `Option<FileId>`
+- `ra_ap_vfs::Vfs::set_file_contents()` returns `bool` (whether changed), doesn't return `FileId` — must query with `file_id()` after
+- `ra_ap_vfs::Change::Create(bytes, hash)` / `Modify(bytes, hash)` — bytes available via `vfs.take_changes()` for feeding into `ChangeWithProcMacros`
+- `NavigationTarget.docs` is `Option<Documentation<'static>>` — `Documentation::as_str()` gives the concatenated doc comment text including macro-expanded docs
+- `GotoDefinitionConfig` only needs `ra_fixture: RaFixtureConfig::default()`
+- `byte_offset_to_line` and `line_to_byte_offset` have `assert!` bounds checks — will give clear error messages instead of rowan panics if offsets are still wrong
+- Remote `origin` → `https://github.com/JonasOberhauser/refactor-check.git`
+- Must use `--manifest-path /workspace/refactor-check/Cargo.toml` for cargo commands
+- Must use `GIT_DIR=/workspace/refactor-check/.git GIT_WORK_TREE=/workspace/refactor-check` for git commands
+- `ra_ap_hir::Function::is_unsafe(db)` exists but checks if the function IS `unsafe fn` (preconditions for caller), NOT whether it contains unsafe blocks
+- `ra_ap_hir::AnyFunctionId::is_unsafe(db)` similarly checks the function signature

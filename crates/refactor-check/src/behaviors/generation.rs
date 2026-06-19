@@ -24,7 +24,7 @@ pub async fn execute(
     let role = role_for_iteration(state.iteration);
     let new_phase = if role == LlmRole::Formalizer { PiecePhase::Forming } else { PiecePhase::Fixing };
     for piece in &state.pieces {
-        pm.enter_generation(piece.id(), new_phase);
+        piece.with_ctx(|ctx| pm.enter_generation(ctx, new_phase));
     }
 
     if let InsistState::Insisting { ref last_response, .. } = &state.insist {
@@ -37,7 +37,7 @@ pub async fn execute(
         .pieces
         .iter()
         .map(|piece| {
-            debug!(piece_id = piece.id(), label = %piece.label(), "dispatching generation for piece");
+            debug!(ctx = %piece.ctx_display(), label = %piece.label(), "dispatching generation for piece");
             generate_one_formula(piece, &state.input_content, &state.verified, llm, role)
         })
         .collect();
@@ -58,9 +58,12 @@ async fn generate_one_formula(
     role: LlmRole,
 ) -> Result<String> {
     let messages = build_single_piece_messages(piece, input_content, verified);
-    let response = llm.invoke(LlmRequest { role, messages, piece_id: Some(piece.id()) }).await?;
+    let ctx = piece.take_context();
+    let resp = llm.invoke(LlmRequest { role, messages, context_id: ctx }).await?;
+    piece.restore_context(resp.context_id);
+    let response = resp.value;
     let formula = extract_single_formula(&response);
-    debug!(piece_id = piece.id(), label = %piece.label(), bytes = formula.len(), "extracted formula for piece");
+    debug!(ctx = %piece.ctx_display(), label = %piece.label(), bytes = formula.len(), "extracted formula for piece");
     Ok(formula)
 }
 
@@ -78,8 +81,8 @@ async fn generate_insist(
             let _ = std::fmt::Write::write_fmt(
                 &mut s,
                 format_args!(
-                    "Piece {}: {} #{} (BEFORE: {}, AFTER: {})\n",
-                    i + 1, piece.label(), piece.id(), piece.before(), piece.after(),
+                    "Piece {}: {} {} (BEFORE: {}, AFTER: {})\n",
+                    i + 1, piece.label(), piece.ctx_display(), piece.before(), piece.after(),
                 ),
             );
             s
@@ -104,7 +107,10 @@ async fn generate_insist(
         )),
     ];
 
-    let response = llm.invoke(LlmRequest { role, messages, piece_id: None }).await?;
+    let ctx = state.pieces[0].take_context();
+    let resp = llm.invoke(LlmRequest { role, messages, context_id: ctx }).await?;
+    state.pieces[0].restore_context(resp.context_id);
+    let response = resp.value;
     let mut formulas = extract_all_formulas(&response);
 
     if formulas.len() != state.pieces.len() {
@@ -121,7 +127,7 @@ async fn generate_insist(
         .iter()
         .zip(formulas.drain(..))
         .map(|(piece, formula)| {
-            debug!(piece_id = piece.id(), label = %piece.label(), "collected insist formula for piece");
+            debug!(ctx = %piece.ctx_display(), label = %piece.label(), "collected insist formula for piece");
             formula
         })
         .collect();
@@ -135,6 +141,17 @@ fn build_single_piece_messages(
 ) -> Vec<crate::llm::Message> {
     let mut messages = Vec::new();
 
+    let relation_guidance = if piece.before().contains("/* relation:") || piece.after().contains("/* relation:") {
+        "\n\nIf /* relation: ... */ comments appear in the code, they specify how certain \
+         states differ between before and after. Verify that the piece satisfies the \
+         specified relation. All variables/states not mentioned in a relation comment \
+         are assumed to be equivalent between before and after. The conjunction of all \
+         piece relations must imply overall equivalence of the full refactoring. \
+         If no relation comments are present, verify strict equivalence as before."
+    } else {
+        ""
+    };
+
     messages.push(crate::llm::system_message(&format!(
         "Piece ID: {id}\n\
          You are an expert in formal verification. Generate ONE complete SMT-LIB2 formula \
@@ -142,8 +159,8 @@ fn build_single_piece_messages(
          \nOutput exactly ONE formula in a single ```smt2 code block.\n\
          The formula must be complete (include set-logic, declarations, assertions, check-sat).\n\
          If the before/after are equivalent, the formula should be unsatisfiable.\n\
-         If the formula is satisfiable, the code is NOT equivalent.",
-        id = piece.id(),
+         If the formula is satisfiable, the code is NOT equivalent.{relation_guidance}",
+        id = piece.ctx_display(),
     )));
 
     let mut content = format!(
@@ -173,6 +190,14 @@ pub fn build_retry_messages(
     solver_stderr: &str,
     input_content: &str,
 ) -> Vec<crate::llm::Message> {
+    let relation_guidance = if piece.before().contains("/* relation:") || piece.after().contains("/* relation:") {
+        " If /* relation: ... */ comments are present, encode the specified relation \
+         between before and after states, not just strict equivalence. Variables/states \
+         not mentioned in the relation are assumed equivalent."
+    } else {
+        ""
+    };
+
     let prompt = format!(
         "Original refactoring context:\n\n{ctx}\n\n\
          Piece to verify: {label}\n\
@@ -194,12 +219,12 @@ pub fn build_retry_messages(
     );
 
     vec![
-        crate::llm::system_message(
+        crate::llm::system_message(&format!(
             "You are an expert in formal verification. Fix the following SMT formula so \
              it correctly checks equivalence of this specific BEFORE/AFTER pair. \
              Do NOT output any explanation. \
-             Output ONLY the fixed formula in a single ```smt2 code block.",
-        ),
+             Output ONLY the fixed formula in a single ```smt2 code block.{relation_guidance}",
+        )),
         crate::llm::user_message(&prompt),
     ]
 }
@@ -210,11 +235,18 @@ pub fn build_retry_insist_messages(
     last_response: &str,
     input_content: &str,
 ) -> Vec<crate::llm::Message> {
+    let relation_guidance = if piece.before().contains("/* relation:") || piece.after().contains("/* relation:") {
+        " If /* relation: ... */ comments are present, encode the specified relation \
+         between before and after states, not just strict equivalence."
+    } else {
+        ""
+    };
+
     vec![
-        crate::llm::system_message(
+        crate::llm::system_message(&format!(
             "You MUST output exactly one SMT-LIB2 formula in a single ```smt2 code block. \
-             Do NOT include any explanations.",
-        ),
+             Do NOT include any explanations.{relation_guidance}",
+        )),
         crate::llm::user_message(&format!(
             "Original refactoring context:\n\n{ctx}\n\n\
              Your previous response contained no valid SMT formula.\n\

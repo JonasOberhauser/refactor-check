@@ -1,5 +1,5 @@
-use std::sync::atomic::AtomicU64;
-
+use dashmap::DashMap;
+use refactor_check_core::context_id::ContextId;
 use refactor_check_core::phase_tracker::{DefaultPhaseTracker, PhaseTracker};
 
 use crate::code_piece::{DeductiveCodePiece, FunctionId};
@@ -9,36 +9,39 @@ use crate::phase::{CodePiecePhase, FormulaPhase};
 pub trait DeductivePieceManager: Send + Sync {
     fn new_piece(
         &self,
+        parent_ctx: &ContextId,
         file: std::path::PathBuf,
         function_id: FunctionId,
         start_line: u32,
         end_line: u32,
         code: String,
-    ) -> DeductiveCodePiece;
+    ) -> (DeductiveCodePiece, ContextId);
 
-    fn advance_piece(&self, id: u64, from: Option<CodePiecePhase>, to: CodePiecePhase);
-    fn expect_piece_phase_and_set(&self, id: u64, valid_from: &[CodePiecePhase], to: CodePiecePhase);
-    fn enter_piece_formalizer(&self, id: u64, to: CodePiecePhase);
-    fn piece_phase(&self, id: u64) -> Option<CodePiecePhase>;
+    fn advance_piece(&self, ctx: &ContextId, from: Option<CodePiecePhase>, to: CodePiecePhase);
+    fn expect_piece_phase_and_set(&self, ctx: &ContextId, valid_from: &[CodePiecePhase], to: CodePiecePhase);
+    fn enter_piece_formalizer(&self, ctx: &ContextId, to: CodePiecePhase);
+    fn piece_phase(&self, ctx: &ContextId) -> Option<CodePiecePhase>;
 
     fn new_formula(
         &self,
-        piece_id: u64,
+        parent_ctx: &ContextId,
         content: String,
         source: FormulaSource,
         iteration: u32,
-    ) -> Formula;
+    ) -> (Formula, ContextId);
 
-    fn advance_formula(&self, id: u64, from: Option<FormulaPhase>, to: FormulaPhase);
-    fn expect_formula_phase_and_set(&self, id: u64, valid_from: &[FormulaPhase], to: FormulaPhase);
-    fn formula_phase(&self, id: u64) -> Option<FormulaPhase>;
+    fn advance_formula(&self, ctx: &ContextId, from: Option<FormulaPhase>, to: FormulaPhase);
+    fn expect_formula_phase_and_set(&self, ctx: &ContextId, valid_from: &[FormulaPhase], to: FormulaPhase);
+    fn formula_phase(&self, ctx: &ContextId) -> Option<FormulaPhase>;
+
+    fn store_function_docs(&self, function_id: FunctionId, docs: String);
+    fn get_function_docs(&self, function_id: &FunctionId) -> String;
 }
 
 pub struct DefaultDeductivePieceManager {
     piece_tracker: DefaultPhaseTracker<CodePiecePhase>,
     formula_tracker: DefaultPhaseTracker<FormulaPhase>,
-    piece_counter: AtomicU64,
-    formula_counter: AtomicU64,
+    function_docs: DashMap<FunctionId, String>,
 }
 
 impl DefaultDeductivePieceManager {
@@ -47,17 +50,8 @@ impl DefaultDeductivePieceManager {
         Self {
             piece_tracker: DefaultPhaseTracker::new(),
             formula_tracker: DefaultPhaseTracker::new(),
-            piece_counter: AtomicU64::new(1),
-            formula_counter: AtomicU64::new(1),
+            function_docs: DashMap::new(),
         }
-    }
-
-    fn next_piece_id(&self) -> u64 {
-        self.piece_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    }
-
-    fn next_formula_id(&self) -> u64 {
-        self.formula_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -70,68 +64,77 @@ impl Default for DefaultDeductivePieceManager {
 impl DeductivePieceManager for DefaultDeductivePieceManager {
     fn new_piece(
         &self,
+        parent_ctx: &ContextId,
         file: std::path::PathBuf,
         function_id: FunctionId,
         start_line: u32,
         end_line: u32,
         code: String,
-    ) -> DeductiveCodePiece {
-        let id = self.next_piece_id();
-        let piece = DeductiveCodePiece::with_id(
-            id,
+    ) -> (DeductiveCodePiece, ContextId) {
+        let ctx = parent_ctx.new_child();
+        let piece = DeductiveCodePiece::new(
             file,
             function_id,
             start_line,
             end_line,
             code,
         );
-        self.piece_tracker.advance(id, None, CodePiecePhase::Open);
-        piece
+        assert!(piece.type_invariant(), "type invariant violated: code piece {} has empty code", ctx);
+        self.piece_tracker.advance(&ctx, None, CodePiecePhase::Open);
+        (piece, ctx)
     }
 
-    fn advance_piece(&self, id: u64, from: Option<CodePiecePhase>, to: CodePiecePhase) {
-        self.piece_tracker.advance(id, from, to);
+    fn advance_piece(&self, ctx: &ContextId, from: Option<CodePiecePhase>, to: CodePiecePhase) {
+        self.piece_tracker.advance(ctx, from, to);
     }
 
-    fn expect_piece_phase_and_set(&self, id: u64, valid_from: &[CodePiecePhase], to: CodePiecePhase) {
-        self.piece_tracker.expect_any_and_set(id, valid_from, to);
+    fn expect_piece_phase_and_set(&self, ctx: &ContextId, valid_from: &[CodePiecePhase], to: CodePiecePhase) {
+        self.piece_tracker.expect_any_and_set(ctx, valid_from, to);
     }
 
-    fn enter_piece_formalizer(&self, id: u64, to: CodePiecePhase) {
-        self.piece_tracker.upsert(
-            id,
+    fn enter_piece_formalizer(&self, ctx: &ContextId, to: CodePiecePhase) {
+        self.piece_tracker.expect_any_and_set(
+            ctx,
             &[CodePiecePhase::Open, CodePiecePhase::GetContext, CodePiecePhase::Formalizer, CodePiecePhase::Check],
             to,
         );
     }
 
-    fn piece_phase(&self, id: u64) -> Option<CodePiecePhase> {
-        self.piece_tracker.phases().get(&id).map(|g| *g.value())
+    fn piece_phase(&self, ctx: &ContextId) -> Option<CodePiecePhase> {
+        self.piece_tracker.get_phase(ctx)
     }
 
     fn new_formula(
         &self,
-        piece_id: u64,
+        parent_ctx: &ContextId,
         content: String,
         source: FormulaSource,
         iteration: u32,
-    ) -> Formula {
-        let id = self.next_formula_id();
-        let formula = Formula::with_id(id, piece_id, content, source, iteration);
-        self.formula_tracker.advance(id, None, FormulaPhase::Open);
-        formula
+    ) -> (Formula, ContextId) {
+        let ctx = parent_ctx.new_child();
+        let formula = Formula::new(content, source, iteration);
+        self.formula_tracker.advance(&ctx, None, FormulaPhase::Open);
+        (formula, ctx)
     }
 
-    fn advance_formula(&self, id: u64, from: Option<FormulaPhase>, to: FormulaPhase) {
-        self.formula_tracker.advance(id, from, to);
+    fn advance_formula(&self, ctx: &ContextId, from: Option<FormulaPhase>, to: FormulaPhase) {
+        self.formula_tracker.advance(ctx, from, to);
     }
 
-    fn expect_formula_phase_and_set(&self, id: u64, valid_from: &[FormulaPhase], to: FormulaPhase) {
-        self.formula_tracker.expect_any_and_set(id, valid_from, to);
+    fn expect_formula_phase_and_set(&self, ctx: &ContextId, valid_from: &[FormulaPhase], to: FormulaPhase) {
+        self.formula_tracker.expect_any_and_set(ctx, valid_from, to);
     }
 
-    fn formula_phase(&self, id: u64) -> Option<FormulaPhase> {
-        self.formula_tracker.phases().get(&id).map(|g| *g.value())
+    fn formula_phase(&self, ctx: &ContextId) -> Option<FormulaPhase> {
+        self.formula_tracker.get_phase(ctx)
+    }
+
+    fn store_function_docs(&self, function_id: FunctionId, docs: String) {
+        self.function_docs.insert(function_id, docs);
+    }
+
+    fn get_function_docs(&self, function_id: &FunctionId) -> String {
+        self.function_docs.get(function_id).map(|g| g.value().clone()).unwrap_or_default()
     }
 }
 
@@ -153,115 +156,148 @@ mod tests {
     #[test]
     fn test_piece_phase_transitions() {
         let pm = test_pm();
-        let piece = pm.new_piece(
+        let root = ContextId::root();
+        let (_piece, ctx) = pm.new_piece(
+            root,
             PathBuf::from("test.rs"),
             make_function_id("foo"),
             1,
             10,
             "code".to_string(),
         );
-        let id = piece.id();
 
-        assert_eq!(pm.piece_phase(id), Some(CodePiecePhase::Open));
+        assert_eq!(pm.piece_phase(&ctx), Some(CodePiecePhase::Open));
 
-        pm.advance_piece(id, Some(CodePiecePhase::Open), CodePiecePhase::GetContext);
-        assert_eq!(pm.piece_phase(id), Some(CodePiecePhase::GetContext));
+        pm.advance_piece(&ctx, Some(CodePiecePhase::Open), CodePiecePhase::GetContext);
+        assert_eq!(pm.piece_phase(&ctx), Some(CodePiecePhase::GetContext));
 
-        pm.advance_piece(id, Some(CodePiecePhase::GetContext), CodePiecePhase::Formalizer);
-        assert_eq!(pm.piece_phase(id), Some(CodePiecePhase::Formalizer));
+        pm.advance_piece(&ctx, Some(CodePiecePhase::GetContext), CodePiecePhase::Formalizer);
+        assert_eq!(pm.piece_phase(&ctx), Some(CodePiecePhase::Formalizer));
 
-        pm.advance_piece(id, Some(CodePiecePhase::Formalizer), CodePiecePhase::Check);
-        assert_eq!(pm.piece_phase(id), Some(CodePiecePhase::Check));
+        pm.advance_piece(&ctx, Some(CodePiecePhase::Formalizer), CodePiecePhase::Check);
+        assert_eq!(pm.piece_phase(&ctx), Some(CodePiecePhase::Check));
 
-        pm.advance_piece(id, Some(CodePiecePhase::Check), CodePiecePhase::Judge);
-        assert_eq!(pm.piece_phase(id), Some(CodePiecePhase::Judge));
+        pm.advance_piece(&ctx, Some(CodePiecePhase::Check), CodePiecePhase::Judge);
+        assert_eq!(pm.piece_phase(&ctx), Some(CodePiecePhase::Judge));
 
-        pm.advance_piece(id, Some(CodePiecePhase::Judge), CodePiecePhase::Closed);
-        assert_eq!(pm.piece_phase(id), Some(CodePiecePhase::Closed));
+        pm.advance_piece(&ctx, Some(CodePiecePhase::Judge), CodePiecePhase::Closed);
+        assert_eq!(pm.piece_phase(&ctx), Some(CodePiecePhase::Closed));
     }
 
     #[test]
     #[should_panic(expected = "expected")]
     fn test_piece_invalid_transition_panics() {
         let pm = test_pm();
-        let piece = pm.new_piece(
+        let root = ContextId::root();
+        let (_piece, ctx) = pm.new_piece(
+            root,
             PathBuf::from("test.rs"),
             make_function_id("bar"),
             1,
             5,
             "code".to_string(),
         );
-        let id = piece.id();
 
-        pm.advance_piece(id, Some(CodePiecePhase::Formalizer), CodePiecePhase::Check);
+        pm.advance_piece(&ctx, Some(CodePiecePhase::Formalizer), CodePiecePhase::Check);
     }
 
     #[test]
     fn test_formula_phase_transitions() {
         let pm = test_pm();
-        let piece = pm.new_piece(
+        let root = ContextId::root();
+        let (_piece, ctx) = pm.new_piece(
+            root,
             PathBuf::from("test.rs"),
             make_function_id("baz"),
             1,
             5,
             "code".to_string(),
         );
-        let formula = pm.new_formula(piece.id(), "(check-sat)".to_string(), FormulaSource::SmtLib, 0);
-        let fid = formula.id();
+        let (_formula, fctx) = pm.new_formula(&ctx, "(check-sat)".to_string(), FormulaSource::SmtLib, 0);
 
-        assert_eq!(pm.formula_phase(fid), Some(FormulaPhase::Open));
+        assert_eq!(pm.formula_phase(&fctx), Some(FormulaPhase::Open));
 
-        pm.advance_formula(fid, Some(FormulaPhase::Open), FormulaPhase::Check);
-        assert_eq!(pm.formula_phase(fid), Some(FormulaPhase::Check));
+        pm.advance_formula(&fctx, Some(FormulaPhase::Open), FormulaPhase::Check);
+        assert_eq!(pm.formula_phase(&fctx), Some(FormulaPhase::Check));
 
-        pm.advance_formula(fid, Some(FormulaPhase::Check), FormulaPhase::ClosedUnsat);
-        assert_eq!(pm.formula_phase(fid), Some(FormulaPhase::ClosedUnsat));
+        pm.advance_formula(&fctx, Some(FormulaPhase::Check), FormulaPhase::ClosedUnsat);
+        assert_eq!(pm.formula_phase(&fctx), Some(FormulaPhase::ClosedUnsat));
     }
 
     #[test]
     fn test_formula_fix_loop() {
         let pm = test_pm();
-        let piece = pm.new_piece(
+        let root = ContextId::root();
+        let (_piece, ctx) = pm.new_piece(
+            root,
             PathBuf::from("test.rs"),
             make_function_id("qux"),
             1,
             5,
             "code".to_string(),
         );
-        let formula = pm.new_formula(piece.id(), "(check-sat)".to_string(), FormulaSource::SmtLib, 0);
-        let fid = formula.id();
+        let (_formula, fctx) = pm.new_formula(&ctx, "(check-sat)".to_string(), FormulaSource::SmtLib, 0);
 
-        pm.advance_formula(fid, Some(FormulaPhase::Open), FormulaPhase::Check);
+        pm.advance_formula(&fctx, Some(FormulaPhase::Open), FormulaPhase::Check);
 
-        pm.advance_formula(fid, Some(FormulaPhase::Check), FormulaPhase::Fix);
-        assert_eq!(pm.formula_phase(fid), Some(FormulaPhase::Fix));
+        pm.advance_formula(&fctx, Some(FormulaPhase::Check), FormulaPhase::Fix);
+        assert_eq!(pm.formula_phase(&fctx), Some(FormulaPhase::Fix));
 
-        pm.expect_formula_phase_and_set(fid, &[FormulaPhase::Fix], FormulaPhase::Check);
-        assert_eq!(pm.formula_phase(fid), Some(FormulaPhase::Check));
+        pm.expect_formula_phase_and_set(&fctx, &[FormulaPhase::Fix], FormulaPhase::Check);
+        assert_eq!(pm.formula_phase(&fctx), Some(FormulaPhase::Check));
 
-        pm.advance_formula(fid, Some(FormulaPhase::Check), FormulaPhase::ClosedSat);
-        assert_eq!(pm.formula_phase(fid), Some(FormulaPhase::ClosedSat));
+        pm.advance_formula(&fctx, Some(FormulaPhase::Check), FormulaPhase::ClosedSat);
+        assert_eq!(pm.formula_phase(&fctx), Some(FormulaPhase::ClosedSat));
+    }
+
+    #[test]
+    fn test_formula_fix_loop_with_translation_retry() {
+        let pm = test_pm();
+        let root = ContextId::root();
+        let (_piece, ctx) = pm.new_piece(
+            root,
+            PathBuf::from("test.rs"),
+            make_function_id("fix_retry"),
+            1,
+            5,
+            "code".to_string(),
+        );
+        let (_formula, fctx) = pm.new_formula(&ctx, "(check-sat)".to_string(), FormulaSource::SmtLib, 0);
+
+        pm.advance_formula(&fctx, Some(FormulaPhase::Open), FormulaPhase::Check);
+        pm.advance_formula(&fctx, Some(FormulaPhase::Check), FormulaPhase::Fix);
+        assert_eq!(pm.formula_phase(&fctx), Some(FormulaPhase::Fix));
+
+        // Fix attempt 1: fixer returns formula, but translation fails.
+        // Formula stays in Fix — no premature transition to Check.
+
+        // Fix attempt 2: fixer returns formula, translation succeeds.
+        pm.expect_formula_phase_and_set(&fctx, &[FormulaPhase::Fix], FormulaPhase::Check);
+        pm.advance_formula(&fctx, Some(FormulaPhase::Check), FormulaPhase::ClosedUnsat);
+
+        assert_eq!(pm.formula_phase(&fctx), Some(FormulaPhase::ClosedUnsat));
     }
 
     #[test]
     fn test_enter_piece_formalizer() {
         let pm = test_pm();
-        let piece = pm.new_piece(
+        let root = ContextId::root();
+        let (_piece, ctx) = pm.new_piece(
+            root,
             PathBuf::from("test.rs"),
             make_function_id("quux"),
             1,
             5,
             "code".to_string(),
         );
-        let id = piece.id();
 
-        pm.enter_piece_formalizer(id, CodePiecePhase::GetContext);
-        assert_eq!(pm.piece_phase(id), Some(CodePiecePhase::GetContext));
+        pm.enter_piece_formalizer(&ctx, CodePiecePhase::GetContext);
+        assert_eq!(pm.piece_phase(&ctx), Some(CodePiecePhase::GetContext));
 
-        pm.enter_piece_formalizer(id, CodePiecePhase::Formalizer);
-        assert_eq!(pm.piece_phase(id), Some(CodePiecePhase::Formalizer));
+        pm.enter_piece_formalizer(&ctx, CodePiecePhase::Formalizer);
+        assert_eq!(pm.piece_phase(&ctx), Some(CodePiecePhase::Formalizer));
 
-        pm.expect_piece_phase_and_set(id, &[CodePiecePhase::Formalizer], CodePiecePhase::Check);
-        assert_eq!(pm.piece_phase(id), Some(CodePiecePhase::Check));
+        pm.expect_piece_phase_and_set(&ctx, &[CodePiecePhase::Formalizer], CodePiecePhase::Check);
+        assert_eq!(pm.piece_phase(&ctx), Some(CodePiecePhase::Check));
     }
 }

@@ -3,14 +3,13 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, warn};
 
-use refactor_check_core::provider::{IOProvider, LlmRequest, SolverRequest};
-use refactor_check_core::smt::SolverResult;
+use refactor_check_core::provider::{
+    DynLlmProvider, DynSolverProvider, IOProvider,
+};
 
 use crate::code_piece::FunctionId;
-
-pub type DynLlmProvider = dyn IOProvider<LlmRequest, String>;
-pub type DynSolverProvider = dyn IOProvider<SolverRequest, SolverResult>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FunctionInfo {
@@ -18,6 +17,8 @@ pub struct FunctionInfo {
     pub body: String,
     pub start_line: u32,
     pub end_line: u32,
+    pub docs: String,
+    pub has_guarantees: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -49,9 +50,20 @@ pub enum RustAnalyzerRequest {
         function_id: FunctionId,
     },
     GetCalledFunctionCode {
-        function_id: FunctionId,
-        called_name: String,
+        called: CalledFunction,
     },
+    GetFunctionDocs {
+        function_id: FunctionId,
+    },
+    GetFileContent {
+        path: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct CalledFunctionCode {
+    pub code: String,
+    pub docs: String,
 }
 
 #[derive(Debug, Clone)]
@@ -59,7 +71,9 @@ pub enum RustAnalyzerResponse {
     FunctionList(Vec<FunctionInfo>),
     FunctionCode(String),
     CalledFunctionList(Vec<CalledFunction>),
-    CalledFunctionCode(String),
+    CalledFunctionCode(CalledFunctionCode),
+    FunctionDocs(String),
+    FileContent(String),
 }
 
 pub type DynRustAnalyzerProvider = dyn IOProvider<RustAnalyzerRequest, RustAnalyzerResponse>;
@@ -110,6 +124,21 @@ pub struct PythonResponse {
 
 pub type DynPythonProvider = dyn IOProvider<PythonRequest, PythonResponse>;
 
+#[derive(Debug, Clone)]
+pub struct AgentRequest {
+    pub prompt: String,
+    pub working_directory: PathBuf,
+    pub files_to_read: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentResponse {
+    pub stdout: String,
+    pub success: bool,
+}
+
+pub type DynAgentProvider = dyn IOProvider<AgentRequest, AgentResponse>;
+
 pub struct Providers<'a> {
     pub llm: &'a DynLlmProvider,
     pub solver: &'a DynSolverProvider,
@@ -117,274 +146,820 @@ pub struct Providers<'a> {
     pub git: &'a DynGitProvider,
     pub filesystem: &'a DynFileSystemProvider,
     pub python: &'a DynPythonProvider,
+    pub agent: &'a DynAgentProvider,
 }
 
-pub struct CliRustAnalyzerProvider;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use ra_ap_syntax::ast::{self, AstNode, HasName};
+use std::sync::Mutex;
+
+pub struct CliRustAnalyzerProvider {
+    host: Mutex<ra_ap_ide::AnalysisHost>,
+    path_to_file_id: Mutex<HashMap<PathBuf, ra_ap_vfs::FileId>>,
+    file_id_to_path: Mutex<HashMap<ra_ap_vfs::FileId, PathBuf>>,
+    _proc_macro_client: Option<ra_ap_proc_macro_api::ProcMacroClient>,
+}
+
+fn fetch_docs(analysis: &ra_ap_ide::Analysis, file_id: ra_ap_vfs::FileId, offset: ra_ap_ide::TextSize) -> String {
+    let config = ra_ap_ide::GotoDefinitionConfig {
+        ra_fixture: ra_ap_ide_db::ra_fixture::RaFixtureConfig::default(),
+    };
+    let position = ra_ap_ide::FilePosition { file_id, offset };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        analysis.goto_definition(position, &config)
+    }));
+    match result {
+        Ok(Ok(Some(range_info))) => {
+            for nav_target in range_info.info {
+                if let Some(docs) = nav_target.docs {
+                    return docs.as_str().to_string();
+                }
+            }
+            String::new()
+        }
+        Ok(Ok(None)) => {
+            debug!(?file_id, ?offset, "fetch_docs: goto_definition returned None");
+            String::new()
+        }
+        Ok(Err(e)) => {
+            debug!(?file_id, ?offset, error = %e, "fetch_docs: goto_definition returned error");
+            String::new()
+        }
+        Err(panic_payload) => {
+            let panic_msg = panic_payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            warn!(?file_id, ?offset, panic_msg, "fetch_docs: goto_definition panicked (ra_ap bug), returning empty docs");
+            String::new()
+        }
+    }
+}
+
+/// A function has preconditions that its callers must satisfy.
+/// a) IS unsafe fn, b) preconditions in doc/contract, c) can panic, d) in invariant impl
+fn has_preconditions(fn_ast: &ast::Fn, docs: &str) -> bool {
+    fn_is_unsafe_fn(fn_ast)
+        || docs_contain_preconditions(docs)
+        || fn_has_requires_attr(fn_ast)
+        || docs_mention_panic(docs)
+        || fn_in_invariant_impl(fn_ast)
+}
+
+/// A function is worth verifying (excluding the outgoing-calls check).
+/// b) unsafe block, c) in invariant impl, d) postconditions, e) assertions.
+/// (a) calls function with preconditions — checked separately via outgoing_calls.
+fn has_guarantees(fn_ast: &ast::Fn, docs: &str) -> bool {
+    fn_body_contains_unsafe(fn_ast)
+        || fn_in_invariant_impl(fn_ast)
+        || fn_has_ensures_attr(fn_ast)
+        || docs_contain_guarantees(docs)
+        || fn_body_contains_assertions(fn_ast)
+}
+
+fn fn_is_unsafe_fn(fn_ast: &ast::Fn) -> bool {
+    fn_ast.unsafe_token().is_some()
+}
+
+fn fn_has_requires_attr(fn_ast: &ast::Fn) -> bool {
+    use ra_ap_syntax::ast::HasAttrs;
+    fn_ast.attrs().any(|attr| {
+        attr.meta()
+            .and_then(|m| m.path())
+            .map(|p| {
+                let last = p.syntax().text().to_string();
+                last.split("::").last().unwrap_or(&last) == "requires"
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn fn_has_ensures_attr(fn_ast: &ast::Fn) -> bool {
+    use ra_ap_syntax::ast::HasAttrs;
+    fn_ast.attrs().any(|attr| {
+        attr.meta()
+            .and_then(|m| m.path())
+            .map(|p| {
+                let last = p.syntax().text().to_string();
+                last.split("::").last().unwrap_or(&last) == "ensures"
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn fn_in_invariant_impl(fn_ast: &ast::Fn) -> bool {
+    use ra_ap_syntax::ast::HasAttrs;
+    let mut current = fn_ast.syntax().parent();
+    while let Some(parent) = current {
+        if ra_ap_syntax::ast::Impl::can_cast(parent.kind()) {
+            if let Some(impl_node) = ra_ap_syntax::ast::Impl::cast(parent) {
+                for attr in impl_node.attrs() {
+                    if let Some(path) = attr.meta().and_then(|m| m.path()) {
+                        let last = path.syntax().text().to_string();
+                        let last = last.split("::").last().unwrap_or(&last);
+                        if last == "invariant" {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+/// Check if a call target has preconditions, by navigating to its AST.
+fn call_target_has_preconditions(
+    analysis: &ra_ap_ide::Analysis,
+    target: &ra_ap_ide::NavigationTarget,
+    current_file_id: ra_ap_vfs::FileId,
+    current_root: &ra_ap_syntax::SyntaxNode,
+) -> bool {
+    let docs = target
+        .docs
+        .as_ref()
+        .map(|d| d.as_str().to_string())
+        .unwrap_or_default();
+
+    if docs_contain_preconditions(&docs) || docs_mention_panic(&docs) {
+        return true;
+    }
+
+    let root = if target.file_id == current_file_id {
+        current_root.clone()
+    } else {
+        match analysis.parse(target.file_id) {
+            Ok(tree) => tree.syntax().clone(),
+            Err(_) => return false,
+        }
+    };
+
+    let target_range = target.full_range;
+    let fn_ast = root
+        .descendants()
+        .find(|n| n.text_range() == target_range)
+        .and_then(ast::Fn::cast);
+
+    if let Some(fn_ast) = fn_ast {
+        return has_preconditions(&fn_ast, &docs);
+    }
+    false
+}
+
+fn attrs_look_like_test(fn_ast: &ra_ap_syntax::ast::Fn) -> bool {
+    use ra_ap_syntax::ast::HasAttrs;
+
+    for attr in fn_ast.attrs() {
+        if let Some(meta) = attr.meta() {
+            if let Some(path) = meta.path() {
+                let path_text = path.syntax().text().to_string();
+                if let Some(last) = path_text.split("::").last() {
+                    if last == "test" || last == "bench" {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn docs_contain_preconditions(docs: &str) -> bool {
+    if docs.is_empty() {
+        return false;
+    }
+    let lower = docs.to_lowercase();
+    lower.contains("# safety")
+        || lower.contains("# preconditions")
+        || lower.contains("# pre-conditions")
+}
+
+fn docs_mention_panic(docs: &str) -> bool {
+    docs.to_lowercase().contains("# panics")
+}
+
+fn fn_body_contains_unsafe(fn_ast: &ast::Fn) -> bool {
+    let Some(body) = fn_ast.body() else { return false };
+    body.syntax()
+        .descendants_with_tokens()
+        .any(|e| e.into_token().is_some_and(|t| t.kind() == ra_ap_syntax::T![unsafe]))
+}
+
+fn fn_body_contains_assertions(fn_ast: &ast::Fn) -> bool {
+    let Some(body) = fn_ast.body() else { return false };
+    let syntax = body.syntax();
+
+    for macro_call in syntax.descendants().filter_map(ast::MacroCall::cast) {
+        if let Some(path) = macro_call.path() {
+            let name = path.syntax().text().to_string();
+            let last = name.split("::").last().unwrap_or(&name);
+            if matches!(last,
+                "assert" | "assert_eq" | "assert_ne"
+                | "debug_assert" | "debug_assert_eq" | "debug_assert_ne"
+                | "panic" | "unreachable" | "unimplemented"
+            ) {
+                return true;
+            }
+        }
+    }
+
+    for method_call in syntax.descendants().filter_map(ast::MethodCallExpr::cast) {
+        if let Some(name_ref) = method_call.name_ref() {
+            let name = name_ref.syntax().text().to_string();
+            if name == "unwrap" || name == "expect" {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn docs_contain_guarantees(docs: &str) -> bool {
+    if docs.is_empty() {
+        return false;
+    }
+    let lower = docs.to_lowercase();
+    lower.contains("# guarantees")
+        || lower.contains("# postconditions")
+        || lower.contains("# post-conditions")
+        || lower.contains("# ensures")
+        || lower.contains("# safety")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_fn(src: &str) -> ast::Fn {
+        let parse = ra_ap_syntax::SourceFile::parse(src, ra_ap_syntax::Edition::Edition2024);
+        parse.tree()
+            .syntax()
+            .descendants()
+            .filter_map(ast::Fn::cast)
+            .next()
+            .expect("no Fn found in source")
+    }
+
+    #[test]
+    fn test_unsafe_block_has_guarantees() {
+        assert!(has_guarantees(&parse_fn("fn foo() { unsafe { *ptr } }"), ""));
+        assert!(has_guarantees(&parse_fn("fn foo() { unsafe (*ptr).bar() }"), ""));
+        assert!(has_guarantees(&parse_fn("fn foo() { unsafe\n{\n*ptr\n}"), ""));
+    }
+
+    #[test]
+    fn test_no_guarantees_for_plain_fn() {
+        assert!(!has_guarantees(&parse_fn("fn foo() { let x = 1; }"), ""));
+        assert!(!has_preconditions(&parse_fn("fn foo() { let x = 1; }"), ""));
+    }
+
+    #[test]
+    fn test_unsafe_in_comment_ignored() {
+        assert!(!has_guarantees(&parse_fn("fn foo() { // unsafe {\n let x = 1; }"), ""));
+        assert!(!has_guarantees(&parse_fn("fn foo() { /* unsafe { */ let x = 1; }"), ""));
+    }
+
+    #[test]
+    fn test_unsafe_in_string_ignored() {
+        assert!(!has_guarantees(&parse_fn("fn foo() { let s = \"unsafe {\"; }"), ""));
+    }
+
+    #[test]
+    fn test_assertions_are_guarantees_not_preconditions() {
+        let f = parse_fn("fn foo() { assert!(x > 0); }");
+        assert!(has_guarantees(&f, ""));
+        assert!(!has_preconditions(&f, ""));
+        let f = parse_fn("fn foo() { x.unwrap(); }");
+        assert!(has_guarantees(&f, ""));
+        assert!(!has_preconditions(&f, ""));
+        let f = parse_fn("fn foo() { x.expect(\"msg\"); }");
+        assert!(has_guarantees(&f, ""));
+        assert!(!has_preconditions(&f, ""));
+        let f = parse_fn("fn foo() { unreachable!(); }");
+        assert!(has_guarantees(&f, ""));
+        assert!(!has_preconditions(&f, ""));
+    }
+
+    #[test]
+    fn test_docs_guarantees() {
+        let empty_fn = parse_fn("fn foo() {}");
+        assert!(has_guarantees(&empty_fn, "# Guarantees\nThis function is safe."));
+        assert!(has_guarantees(&empty_fn, "# Postconditions\nReturns non-zero."));
+        assert!(has_guarantees(&empty_fn, "# Ensures\nresult >= 0"));
+        assert!(has_guarantees(&empty_fn, "# Safety\nThis is safe because..."));
+        assert!(!has_guarantees(&empty_fn, "# Arguments\nblah"));
+        assert!(!has_guarantees(&empty_fn, ""));
+    }
+
+    #[test]
+    fn test_assertion_in_comment_ignored() {
+        assert!(!has_guarantees(&parse_fn("fn foo() { // assert!(x > 0)\n }"), ""));
+        assert!(!has_guarantees(&parse_fn("fn foo() { /* .unwrap() */ }"), ""));
+    }
+
+    #[test]
+    fn test_unsafe_in_raw_string_ignored() {
+        assert!(!has_guarantees(&parse_fn("fn foo() { let s = r#\"unsafe {\"#; }"), ""));
+        assert!(!has_guarantees(&parse_fn("fn foo() { let s = r\"unsafe {\"; }"), ""));
+        assert!(!has_guarantees(&parse_fn("fn foo() { let s = br#\"unsafe {\"#; }"), ""));
+    }
+
+    #[test]
+    fn test_requires_attr_is_precondition() {
+        let src = "#[requires(self.value < 99)]\npub fn inc(&mut self) { self.value += 1; }";
+        let f = parse_fn(src);
+        assert!(has_preconditions(&f, ""));
+        assert!(!has_guarantees(&f, ""));
+    }
+
+    #[test]
+    fn test_ensures_attr_is_guarantee() {
+        let src = "#[ensures(ret.value == 0)]\npub fn new() -> Self { Self { value: 0 } }";
+        let f = parse_fn(src);
+        assert!(has_guarantees(&f, ""));
+        assert!(!has_preconditions(&f, ""));
+    }
+
+    #[test]
+    fn test_invariant_impl_is_both() {
+        let src = r#"#[invariant(self.value < 100)]
+impl Value {
+    pub fn inc(&mut self) {
+        self.value += 1;
+    }
+}"#;
+        let fn_ast = parse_fn(src);
+        assert!(fn_in_invariant_impl(&fn_ast));
+        assert!(has_preconditions(&fn_ast, ""));
+        assert!(has_guarantees(&fn_ast, ""));
+    }
+
+    #[test]
+    fn test_no_contract_no_preconditions_no_guarantees() {
+        let src = r#"impl Value {
+    pub fn inc(&mut self) {
+        self.value += 1;
+    }
+}"#;
+        let fn_ast = parse_fn(src);
+        assert!(!fn_in_invariant_impl(&fn_ast));
+        assert!(!has_preconditions(&fn_ast, ""));
+        assert!(!has_guarantees(&fn_ast, ""));
+    }
+
+    #[test]
+    fn test_unsafe_fn_has_preconditions() {
+        let f = parse_fn("unsafe fn foo(x: *const i32) -> i32 { *(x) }");
+        assert!(has_preconditions(&f, ""));
+    }
+
+    #[test]
+    fn test_docs_mention_panic_is_precondition() {
+        let f = parse_fn("fn foo(x: i32) -> i32 { x }");
+        assert!(has_preconditions(&f, "# Panics\nIf x is negative."));
+    }
+}
+
+fn byte_offset_to_line(source: &str, offset: ra_ap_ide::TextSize) -> u32 {
+    let byte = usize::from(offset);
+    assert!(byte <= source.len(), "byte_offset_to_line: offset {} exceeds source len {}", byte, source.len());
+    let mut line = 1u32;
+    for (i, ch) in source.char_indices() {
+        if i >= byte {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+        }
+    }
+    line
+}
+
+fn line_to_byte_offset(source: &str, line: u32) -> ra_ap_ide::TextSize {
+    let mut byte_offset = 0usize;
+    let mut current_line = 1u32;
+    for ch in source.chars() {
+        if current_line >= line {
+            break;
+        }
+        byte_offset += ch.len_utf8();
+        if ch == '\n' {
+            current_line += 1;
+        }
+    }
+    assert!(byte_offset <= source.len(), "line_to_byte_offset: line {} maps to offset {} exceeding source len {}", line, byte_offset, source.len());
+    ra_ap_ide::TextSize::from(byte_offset as u32)
+}
+
+fn fn_impl_for(fn_ast: &ra_ap_syntax::ast::Fn) -> Option<String> {
+    let syntax = fn_ast.syntax();
+    let mut current = syntax.parent();
+    while let Some(parent) = current {
+        if ra_ap_syntax::ast::Impl::can_cast(parent.kind()) {
+            if let Some(impl_node) = ra_ap_syntax::ast::Impl::cast(parent) {
+                if let Some(self_ty) = impl_node.self_ty() {
+                    let ty_text = self_ty.syntax().text().to_string();
+                    return Some(ty_text);
+                }
+            }
+            return None;
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn fn_is_in_trait(fn_ast: &ra_ap_syntax::ast::Fn) -> bool {
+    fn_ast
+        .syntax()
+        .ancestors()
+        .skip(1)
+        .any(|a| ra_ap_syntax::ast::Trait::can_cast(a.kind()))
+}
 
 impl CliRustAnalyzerProvider {
-    #[must_use]
-    pub fn new(_path: String) -> Self {
-        Self
+    pub fn new(project_path: String) -> Result<Self> {
+        let project_path = PathBuf::from(&project_path);
+        let root =
+            ra_ap_paths::AbsPathBuf::assert_utf8(std::env::current_dir()?.join(&project_path));
+        let manifest = ra_ap_project_model::ProjectManifest::discover_single(&root)?;
+
+        let cargo_config = ra_ap_project_model::CargoConfig {
+            features: ra_ap_project_model::CargoFeatures::Selected {
+                features: vec!["verification".to_string()],
+                no_default_features: false,
+            },
+            set_test: false,
+            sysroot: Some(ra_ap_project_model::RustLibSource::Discover),
+            ..Default::default()
+        };
+
+        let mut workspace = ra_ap_project_model::ProjectWorkspace::load(
+            manifest,
+            &cargo_config,
+            &|_| {},
+        )?;
+
+        let build_scripts = workspace.run_build_scripts(&cargo_config, &|_| {})?;
+        workspace.set_build_scripts(build_scripts);
+
+        let load_config = ra_ap_load_cargo::LoadCargoConfig {
+            load_out_dirs_from_check: false,
+            with_proc_macro_server: ra_ap_load_cargo::ProcMacroServerChoice::Sysroot,
+            prefill_caches: false,
+            num_worker_threads: 1,
+            proc_macro_processes: 1,
+        };
+
+        let (raw_db, vfs, proc_macro_client) = ra_ap_load_cargo::load_workspace(
+            workspace,
+            &cargo_config.extra_env,
+            &load_config,
+        )?;
+
+        let mut host = ra_ap_ide::AnalysisHost::new(None);
+        *host.raw_database_mut() = raw_db;
+
+        let mut path_to_file_id: HashMap<PathBuf, ra_ap_vfs::FileId> = HashMap::new();
+        let mut file_id_to_path: HashMap<ra_ap_vfs::FileId, PathBuf> = HashMap::new();
+        for (file_id, vfs_path) in vfs.iter() {
+            if let Some(abs_path) = vfs_path.as_path() {
+                let path_buf: PathBuf = abs_path.to_path_buf().into();
+                path_to_file_id.insert(path_buf.clone(), file_id);
+                file_id_to_path.insert(file_id, path_buf);
+            }
+        }
+
+        Ok(Self {
+            host: Mutex::new(host),
+            path_to_file_id: Mutex::new(path_to_file_id),
+            file_id_to_path: Mutex::new(file_id_to_path),
+            _proc_macro_client: proc_macro_client,
+        })
     }
-}
 
-fn make_abs_path(path: &Path) -> triomphe::Arc<ra_ap_paths::AbsPathBuf> {
-    let abs = ra_ap_paths::AbsPathBuf::assert_utf8(path.to_path_buf());
-    triomphe::Arc::from(abs)
-}
-
-fn list_functions_in_file(file_path: &Path, cfg_verification: bool) -> Result<Vec<FunctionInfo>> {
-    let mut source = std::fs::read_to_string(file_path)?;
-    if cfg_verification {
-        source = strip_cfg_attribute(&source, "verification");
+    fn analysis(&self) -> ra_ap_ide::Analysis {
+        self.host.lock().unwrap_or_else(|e| e.into_inner()).analysis()
     }
-    let cwd = make_abs_path(file_path);
-    let (analysis, file_id) = ra_ap_ide::Analysis::from_single_file(source.clone(), cwd);
-    let config = ra_ap_ide::FileStructureConfig { exclude_locals: true };
-    let structure = analysis.file_structure(&config, file_id)?;
 
-    let mut functions = Vec::new();
-    for node in &structure {
-        if let ra_ap_ide::StructureNodeKind::SymbolKind(
-            ra_ap_ide_db::SymbolKind::Function | ra_ap_ide_db::SymbolKind::Method,
-        ) = node.kind
-        {
-            let start_line = u32::from(node.node_range.start()) + 1;
-            let end_line = u32::from(node.node_range.end()) + 1;
+    fn find_file_id(&self, file_path: &Path) -> Option<ra_ap_vfs::FileId> {
+        let map = self.path_to_file_id.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(file_path).copied()
+    }
 
-            let impl_for = node.parent.and_then(|parent_idx| {
-                structure.get(parent_idx).and_then(|parent| {
-                    if let ra_ap_ide::StructureNodeKind::SymbolKind(ra_ap_ide_db::SymbolKind::Impl) = parent.kind {
-                        let label = parent.label.trim();
-                        label.strip_prefix("impl ").map(|s| {
-                            if let Some(space) = s.find(" for ") {
-                                s[..space].trim().to_string()
-                            } else if let Some(brace) = s.find('<') {
-                                s[..brace].trim().to_string()
-                            } else if let Some(brace) = s.find('{') {
-                                s[..brace].trim().to_string()
-                            } else {
-                                s.trim().to_string()
-                            }
-                        })
-                    } else {
-                        None
-                    }
-                })
-            });
+    fn list_functions_in_file(&self, file_path: &Path) -> Vec<FunctionInfo> {
+        let analysis = self.analysis();
+        let Some(file_id) = self.find_file_id(file_path) else {
+            return Vec::new();
+        };
 
-            let fid = FunctionId::new(
-                file_path.to_path_buf(),
-                &node.label,
-                impl_for.as_deref(),
-                start_line,
+        let Ok(source) = analysis.file_text(file_id) else {
+            return Vec::new();
+        };
+        let source_text = source.as_ref();
+
+        let Ok(tree) = analysis.parse(file_id) else {
+            return Vec::new();
+        };
+        let syntax_root = tree.syntax();
+
+        let file_id_to_path = self
+            .file_id_to_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
+        let call_config = ra_ap_ide::CallHierarchyConfig {
+            exclude_tests: true,
+            ra_fixture: ra_ap_ide_db::ra_fixture::RaFixtureConfig::default(),
+        };
+
+        let mut functions = Vec::new();
+
+        for fn_ast in syntax_root.descendants().filter_map(ra_ap_syntax::ast::Fn::cast) {
+            if attrs_look_like_test(&fn_ast) {
+                continue;
+            }
+
+            if fn_is_in_trait(&fn_ast) {
+                continue;
+            }
+
+            let Some(name_node) = fn_ast.name() else {
+                continue;
+            };
+            let name = name_node.text().to_string();
+
+            let syntax = fn_ast.syntax();
+            let range = syntax.text_range();
+            assert!(
+                range.start() <= range.end(),
+                "list_functions: negative range {:?} for function {}", range, name,
             );
+
+            let start_line = byte_offset_to_line(source_text, range.start());
+            let end_line = byte_offset_to_line(source_text, range.end());
+
+            let impl_for = fn_impl_for(&fn_ast);
+
+            let name_range = name_node.syntax().text_range();
+            let nav_offset = name_range.start();
+            assert!(
+                usize::from(nav_offset) <= source_text.len(),
+                "list_functions: nav_offset {} exceeds source len {} for function {}",
+                usize::from(nav_offset), source_text.len(), name,
+            );
+            let docs = fetch_docs(&analysis, file_id, nav_offset);
+
+            let mut has_guarantees = has_guarantees(&fn_ast, &docs);
+
+            if !has_guarantees {
+                let position = ra_ap_ide::FilePosition { file_id, offset: nav_offset };
+                let call_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    analysis.outgoing_calls(&call_config, position)
+                }));
+                match call_result {
+                    Ok(Ok(Some(call_items))) => {
+                        for item in &call_items {
+                            if call_target_has_preconditions(
+                                &analysis,
+                                &item.target,
+                                file_id,
+                                syntax_root,
+                            ) {
+                                has_guarantees = true;
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Ok(None)) | Ok(Err(_)) => {}
+                    Err(panic_payload) => {
+                        let panic_msg = panic_payload
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".to_string());
+                        warn!(?file_id, ?nav_offset, panic_msg, "outgoing_calls panicked (ra_ap bug), skipping precondition check for {}", name);
+                    }
+                }
+            }
+
+            let Some(file_path) = file_id_to_path.get(&file_id).cloned() else {
+                continue;
+            };
+
+            let fid = FunctionId::new(file_path, &name, impl_for.as_deref(), start_line);
             functions.push(FunctionInfo {
                 id: fid,
                 body: String::new(),
                 start_line,
                 end_line,
+                docs,
+                has_guarantees,
             });
         }
+
+        functions
     }
-    Ok(functions)
-}
 
-fn get_called_functions(file_path: &Path, function_id: &FunctionId) -> Result<Vec<CalledFunction>> {
-    let source = std::fs::read_to_string(file_path)?;
-    let cwd = make_abs_path(file_path);
-    let (analysis, file_id) = ra_ap_ide::Analysis::from_single_file(source, cwd);
+    fn get_function_code(&self, function_id: &FunctionId) -> Result<String> {
+        let analysis = self.analysis();
+        let Some(file_id) = self.find_file_id(&function_id.file) else {
+            anyhow::bail!("File not found in project: {:?}", function_id.file);
+        };
+        let config = ra_ap_ide::FileStructureConfig { exclude_locals: true };
+        let structure = analysis.file_structure(&config, file_id)?;
 
-    let config = ra_ap_ide::CallHierarchyConfig {
-        exclude_tests: false,
-        ra_fixture: ra_ap_ide_db::ra_fixture::RaFixtureConfig::default(),
-    };
+        let source = analysis.file_text(file_id)?;
 
-    let offset = ra_ap_ide::TextSize::from(function_id.line.saturating_sub(1));
-    let position = ra_ap_ide::FilePosition { file_id, offset };
-
-    let mut called = Vec::new();
-
-    if let Ok(Some(call_items)) = analysis.outgoing_calls(&config, position) {
-        for item in call_items {
-            let name = item.target.name.to_string();
-
-            called.push(CalledFunction {
-                name,
-                file: None,
-                start_line: Some(u32::from(item.target.full_range.start()) + 1),
-            });
+        for node in &structure {
+            if let ra_ap_ide::StructureNodeKind::SymbolKind(
+                ra_ap_ide_db::SymbolKind::Function | ra_ap_ide_db::SymbolKind::Method,
+            ) = node.kind
+            {
+                assert!(
+                    node.node_range.start() <= node.node_range.end(),
+                    "get_function_code: negative range {:?} for node {}", node.node_range, node.label,
+                );
+                let node_line = byte_offset_to_line(&source, node.node_range.start());
+                if node_line == function_id.line && node.label == function_id.name {
+                    let start = usize::from(node.node_range.start());
+                    let end = usize::from(node.node_range.end());
+                    assert!(end <= source.len(), "get_function_code: node range {}..{} exceeds source len {}", start, end, source.len());
+                    return Ok(source[start..end].to_string());
+                }
+            }
         }
+
+        let lines: Vec<&str> = source.lines().collect();
+        let start = usize::try_from(function_id.line).unwrap_or(1).saturating_sub(1);
+        let end = (start + 50).min(lines.len());
+        let code = lines[start..end].join("\n");
+        if code.trim().is_empty() {
+            anyhow::bail!("Function {} at {:?}:{} resolved to empty code", function_id.name, function_id.file, function_id.line);
+        }
+        Ok(code)
     }
 
-    called.sort_by(|a, b| a.name.cmp(&b.name));
-    called.dedup_by(|a, b| a.name == b.name);
-    Ok(called)
+    fn get_called_functions(&self, function_id: &FunctionId) -> Result<Vec<CalledFunction>> {
+        let analysis = self.analysis();
+        let Some(file_id) = self.find_file_id(&function_id.file) else {
+            return Ok(Vec::new());
+        };
+
+        let source = analysis.file_text(file_id)?;
+        let offset = line_to_byte_offset(&source, function_id.line);
+        let position = ra_ap_ide::FilePosition { file_id, offset };
+
+        let config = ra_ap_ide::CallHierarchyConfig {
+            exclude_tests: true,
+            ra_fixture: ra_ap_ide_db::ra_fixture::RaFixtureConfig::default(),
+        };
+
+        let file_id_to_path = self.file_id_to_path.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+        let mut called = Vec::new();
+        if let Ok(Some(call_items)) = analysis.outgoing_calls(&config, position) {
+            for item in call_items {
+                assert!(
+                    item.target.full_range.start() <= item.target.full_range.end(),
+                    "get_called_functions: negative range {:?} for call target {}", item.target.full_range, item.target.name,
+                );
+                let name = item.target.name.to_string();
+                let called_file = file_id_to_path
+                    .get(&item.target.file_id)
+                    .cloned();
+                let start_line = called_file.as_ref().and_then(|f| {
+                    let fid = self.find_file_id(f)?;
+                    let src = analysis.file_text(fid).ok()?;
+                    Some(byte_offset_to_line(&src, item.target.full_range.start()))
+                });
+                called.push(CalledFunction {
+                    name,
+                    file: called_file,
+                    start_line,
+                });
+            }
+        }
+
+        called.sort_by(|a, b| a.name.cmp(&b.name));
+        called.dedup_by(|a, b| a.name == b.name);
+        Ok(called)
+    }
+
+    fn get_called_function_code(&self, called: &CalledFunction) -> Result<CalledFunctionCode> {
+        let Some(called_file) = &called.file else {
+            return Ok(CalledFunctionCode {
+                code: format!("// Could not find: {}", called.name),
+                docs: String::new(),
+            });
+        };
+        let analysis = self.analysis();
+        let Some(file_id) = self.find_file_id(called_file) else {
+            return Ok(CalledFunctionCode {
+                code: format!("// Could not find file: {:?}", called_file),
+                docs: String::new(),
+            });
+        };
+
+        let config = ra_ap_ide::FileStructureConfig { exclude_locals: true };
+        let structure = analysis.file_structure(&config, file_id)?;
+        let source = analysis.file_text(file_id)?;
+
+        for node in &structure {
+            if node.label == called.name {
+                if let ra_ap_ide::StructureNodeKind::SymbolKind(
+                    ra_ap_ide_db::SymbolKind::Function | ra_ap_ide_db::SymbolKind::Method,
+                ) = node.kind
+                {
+                    assert!(
+                        node.node_range.start() <= node.node_range.end(),
+                        "get_called_function_code: negative range {:?} for node {}", node.node_range, node.label,
+                    );
+                    let start = usize::from(node.node_range.start());
+                    let end = usize::from(node.node_range.end());
+                    if end <= source.len() {
+                        let code = source[start..end].to_string();
+                        let docs = fetch_docs(&analysis, file_id, node.navigation_range.start());
+                        debug!(
+                            name = %node.label,
+                            node_range_start = usize::from(node.node_range.start()),
+                            node_range_end = usize::from(node.node_range.end()),
+                            nav_range_start = usize::from(node.navigation_range.start()),
+                            nav_range_end = usize::from(node.navigation_range.end()),
+                            source_len = source.len(),
+                            docs_len = docs.len(),
+                            "get_called_function_code: resolved node",
+                        );
+                        return Ok(CalledFunctionCode { code, docs });
+                    }
+                }
+            }
+        }
+
+        Ok(CalledFunctionCode {
+            code: format!("// Could not find: {}", called.name),
+            docs: String::new(),
+        })
+    }
+
+    fn get_function_docs(&self, function_id: &FunctionId) -> String {
+        let analysis = self.analysis();
+        let Some(file_id) = self.find_file_id(&function_id.file) else {
+            return String::new();
+        };
+        let Ok(source) = analysis.file_text(file_id) else {
+            return String::new();
+        };
+        let offset = line_to_byte_offset(&source, function_id.line);
+        fetch_docs(&analysis, file_id, offset)
+    }
 }
 
 #[async_trait]
 impl IOProvider<RustAnalyzerRequest, RustAnalyzerResponse> for CliRustAnalyzerProvider {
     async fn invoke(&self, input: RustAnalyzerRequest) -> Result<RustAnalyzerResponse> {
         match input {
-            RustAnalyzerRequest::ListFunctions { files, cfg_verification } => {
+            RustAnalyzerRequest::ListFunctions { files, cfg_verification: _ } => {
                 let mut all_functions = Vec::new();
-
                 for file_path in &files {
-                    match list_functions_in_file(file_path, cfg_verification) {
-                        Ok(fns) => all_functions.extend(fns),
-                        Err(_) => continue,
-                    }
+                    all_functions.extend(self.list_functions_in_file(file_path));
                 }
-
                 Ok(RustAnalyzerResponse::FunctionList(all_functions))
             }
             RustAnalyzerRequest::GetFunctionCode { function_id } => {
-                let source = std::fs::read_to_string(&function_id.file)?;
-                let cwd = make_abs_path(&function_id.file);
-                let (analysis, file_id) = ra_ap_ide::Analysis::from_single_file(source.clone(), cwd);
-                let config = ra_ap_ide::FileStructureConfig { exclude_locals: true };
-                let structure = analysis.file_structure(&config, file_id)?;
-
-                for node in &structure {
-                    if let ra_ap_ide::StructureNodeKind::SymbolKind(
-                        ra_ap_ide_db::SymbolKind::Function | ra_ap_ide_db::SymbolKind::Method,
-                    ) = node.kind
-                    {
-                        let node_start = u32::from(node.node_range.start()) + 1;
-                        if node_start == function_id.line && node.label == function_id.name {
-                            let start = usize::from(node.node_range.start());
-                            let end = usize::from(node.node_range.end());
-                            if end <= source.len() && start <= end {
-                                let body = source[start..end].to_string();
-                                return Ok(RustAnalyzerResponse::FunctionCode(body));
-                            }
-                        }
-                    }
-                }
-
-                let lines: Vec<&str> = source.lines().collect();
-                let start = usize::try_from(function_id.line).unwrap_or(1).saturating_sub(1);
-                let end = (start + 50).min(lines.len());
-                let body = lines[start..end].join("\n");
-                Ok(RustAnalyzerResponse::FunctionCode(body))
+                let code = self.get_function_code(&function_id)?;
+                Ok(RustAnalyzerResponse::FunctionCode(code))
             }
             RustAnalyzerRequest::GetCalledFunctions { function_id } => {
-                match get_called_functions(&function_id.file, &function_id) {
-                    Ok(called) => Ok(RustAnalyzerResponse::CalledFunctionList(called)),
-                    Err(_) => Ok(RustAnalyzerResponse::CalledFunctionList(Vec::new())),
-                }
+                let called = self.get_called_functions(&function_id)?;
+                Ok(RustAnalyzerResponse::CalledFunctionList(called))
             }
-            RustAnalyzerRequest::GetCalledFunctionCode { function_id, called_name } => {
-                let source = match std::fs::read_to_string(&function_id.file) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        return Ok(RustAnalyzerResponse::CalledFunctionCode(format!(
-                            "// Could not read file: {:?}", function_id.file
-                        )));
-                    }
-                };
-
-                let cwd = make_abs_path(&function_id.file);
-                let (analysis, file_id) =
-                    ra_ap_ide::Analysis::from_single_file(source.clone(), cwd);
-
-                let config = ra_ap_ide::FileStructureConfig { exclude_locals: true };
-                let structure = analysis.file_structure(&config, file_id)?;
-
-                for node in &structure {
-                    if node.label == called_name {
-                        if let ra_ap_ide::StructureNodeKind::SymbolKind(
-                            ra_ap_ide_db::SymbolKind::Function | ra_ap_ide_db::SymbolKind::Method,
-                        ) = node.kind
-                        {
-                            let start = usize::from(node.node_range.start());
-                            let end = usize::from(node.node_range.end());
-                            if end <= source.len() && start <= end {
-                                let code = source[start..end].to_string();
-                                return Ok(RustAnalyzerResponse::CalledFunctionCode(code));
-                            }
-                        }
+            RustAnalyzerRequest::GetCalledFunctionCode { called } => {
+                let result = self.get_called_function_code(&called)?;
+                Ok(RustAnalyzerResponse::CalledFunctionCode(result))
+            }
+            RustAnalyzerRequest::GetFunctionDocs { function_id } => {
+                let docs = self.get_function_docs(&function_id);
+                Ok(RustAnalyzerResponse::FunctionDocs(docs))
+            }
+            RustAnalyzerRequest::GetFileContent { path } => {
+                let analysis = self.analysis();
+                if let Some(file_id) = self.find_file_id(&path) {
+                    if let Ok(source) = analysis.file_text(file_id) {
+                        return Ok(RustAnalyzerResponse::FileContent(source.to_string()));
                     }
                 }
-
-                let offset = ra_ap_ide::TextSize::from(
-                    source[..source.lines().take(usize::try_from(function_id.line).unwrap_or(1).saturating_sub(1)).map(|l| l.len() + 1).sum::<usize>()].len() as u32
-                );
-
-                let position = ra_ap_ide::FilePosition { file_id, offset };
-
-                let refs_config = ra_ap_ide::FindAllRefsConfig {
-                    search_scope: None,
-                    ra_fixture: ra_ap_ide_db::ra_fixture::RaFixtureConfig::default(),
-                    exclude_imports: false,
-                    exclude_tests: false,
-                };
-
-                if let Ok(Some(refs)) = analysis.find_all_refs(position, &refs_config) {
-                    for search_result in refs {
-                        for (ref_file_id, ranges) in &search_result.references {
-                            if let Ok(ref_source) = analysis.file_text(*ref_file_id) {
-                                for (text_range, _category) in ranges {
-                                    let ref_line =
-                                        ref_source[..usize::from(text_range.start())].lines().count();
-                                    let ref_lines: Vec<&str> = ref_source.lines().collect();
-                                    let end_line = (ref_line + 30).min(ref_lines.len());
-                                    if end_line > ref_line {
-                                        let code = ref_lines[ref_line..end_line].join("\n");
-                                        return Ok(RustAnalyzerResponse::CalledFunctionCode(code));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Ok(RustAnalyzerResponse::CalledFunctionCode(format!(
-                    "// Could not find: {called_name}"
-                )))
+                Ok(RustAnalyzerResponse::FileContent(String::new()))
             }
         }
     }
-}
-
-fn strip_cfg_attribute(source: &str, attr_name: &str) -> String {
-    let simple_attr = format!("#[cfg({})]", attr_name);
-    let all_prefix = "#[cfg(all(";
-    let all_suffix = ")]";
-
-    let mut result = String::with_capacity(source.len());
-    let mut lines = source.lines().peekable();
-
-    for line in lines.by_ref() {
-        let trimmed = line.trim();
-
-        if trimmed == simple_attr {
-            result.push('\n');
-            continue;
-        }
-
-        if trimmed.starts_with(all_prefix) && trimmed.ends_with(all_suffix) && trimmed.contains(attr_name) {
-            let modified = trimmed
-                .replace(&format!("{},", attr_name), "")
-                .replace(&format!(", {}", attr_name), "")
-                .replace(&format!(",\t{}", attr_name), "")
-                .replace(attr_name, "");
-            let cleaned = modified
-                .replace("#[cfg(all()]", "")
-                .replace("#[cfg(all( ))]", "")
-                .replace("#[cfg(all())]", "");
-            if !cleaned.trim().is_empty() && cleaned.trim() != "#[cfg(all())]" && cleaned.trim() != "#[cfg(all( ))]" {
-                result.push_str(&cleaned);
-            }
-            result.push('\n');
-            continue;
-        }
-
-        result.push_str(line);
-        result.push('\n');
-    }
-
-    result
 }
 
 pub struct CliGitProvider;
@@ -462,7 +1037,8 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
                 })
             }
             GitRequest::WalkRustFiles { path } => {
-                let files = walkdir_rust_files(&path);
+                let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+                let files = walkdir_rust_files(&canonical);
                 Ok(GitResponse {
                     success: true,
                     output: files.into_iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>().join("\n"),
@@ -478,6 +1054,10 @@ fn walkdir_rust_files(path: &PathBuf) -> Vec<PathBuf> {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_dir() {
+                let dir_name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if dir_name == "tests" || dir_name == "target" || dir_name == "benches" {
+                    continue;
+                }
                 files.extend(walkdir_rust_files(&p));
             } else if let Some(ext) = p.extension() {
                 if ext == "rs" {
@@ -556,5 +1136,66 @@ impl IOProvider<PythonRequest, PythonResponse> for ProcessPythonProvider {
         let explanation = String::new();
 
         Ok(PythonResponse { smtlib, explanation })
+    }
+}
+
+pub struct CliAgentProvider {
+    binary: String,
+    args: Vec<String>,
+    error_gate: Option<Arc<refactor_check_core::error_gate::ErrorGate>>,
+}
+
+impl CliAgentProvider {
+    pub fn new(binary: String, args: Vec<String>) -> Self {
+        Self { binary, args, error_gate: None }
+    }
+
+    pub fn with_error_gate(mut self, gate: Arc<refactor_check_core::error_gate::ErrorGate>) -> Self {
+        self.error_gate = Some(gate);
+        self
+    }
+}
+
+#[async_trait]
+impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
+    async fn invoke(&self, input: AgentRequest) -> Result<AgentResponse> {
+        loop {
+            let mut cmd = tokio::process::Command::new(&self.binary);
+            cmd.args(&self.args)
+                .current_dir(&input.working_directory)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+
+            let mut child = match cmd.spawn() {
+                Ok(child) => child,
+                Err(e) => {
+                    if let Some(gate) = &self.error_gate {
+                        gate.report_and_wait(&format!(
+                            "Failed to spawn agent binary '{}': {e}\n\
+                             Possible fixes:\n\
+                             - Install the binary and ensure it is in PATH\n\
+                             - Restart with --agent-binary /correct/path/to/binary",
+                            self.binary,
+                        )).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            };
+
+            if let Some(mut stdin) = child.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                stdin.write_all(input.prompt.as_bytes()).await?;
+                drop(stdin);
+            }
+
+            let output = child.wait_with_output().await?;
+
+            return Ok(AgentResponse {
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                success: output.status.success(),
+            });
+        }
     }
 }

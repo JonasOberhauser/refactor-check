@@ -1,7 +1,13 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use clap::Parser;
-use refactor_check::agent::{AgentConfig, DEFAULT_SOLVER_TIMEOUT_SECS, run};
-use refactor_check::llm::{LlmConfig, ServiceTier};
+use refactor_check::agent::{DEFAULT_SOLVER_TIMEOUT_SECS, run};
+use refactor_check::config_update::{AppConfig, ServiceTierArg, UpdateArgs};
+use refactor_check::error_gate::ErrorShell;
+use refactor_check::llm::LlmConfig;
+use refactor_check::live_config::LiveConfig;
+use refactor_check::smt::SolverConfig;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -64,12 +70,56 @@ struct Cli {
     #[arg(long, default_value = "5")]
     max_stream_retries: u32,
 
-    #[arg(long, default_value = "priority")]
-    service_tier: String,
+    #[arg(long, value_enum, default_value = "priority")]
+    service_tier: ServiceTierArg,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+impl From<&Cli> for LlmConfig {
+    fn from(cli: &Cli) -> Self {
+        let api_model = cli.api_model.clone();
+        let judge_model = cli.judge_model.clone().unwrap_or_else(|| api_model.clone());
+        LlmConfig {
+            api_key: cli.api_key.clone().expect("api_key has a default value"),
+            judge_api_key: cli.judge_api_key.clone(),
+            formalizer_api_key: cli.formalizer_api_key.clone(),
+            fixer_api_key: cli.fixer_api_key.clone(),
+            splitter_api_key: cli.splitter_api_key.clone(),
+            splitting_judge_api_key: cli.splitting_judge_api_key.clone(),
+            analyzer_api_key: None,
+            api_base: cli.api_base.clone(),
+            splitter_model: cli.splitter_model.clone().unwrap_or_else(|| api_model.clone()),
+            formalizer_model: cli.formalizer_model.clone().unwrap_or_else(|| api_model.clone()),
+            fixer_model: cli.fixer_model.clone().unwrap_or_else(|| api_model.clone()),
+            judge_model: judge_model.clone(),
+            splitting_judge_model: cli.splitting_judge_model.clone().unwrap_or(judge_model),
+            analyzer_model: api_model,
+            stream_timeout_ms: cli.stream_timeout_ms,
+            max_stream_retries: cli.max_stream_retries,
+            service_tier: cli.service_tier.clone().into(),
+        }
+    }
+}
+
+impl From<&Cli> for SolverConfig {
+    fn from(cli: &Cli) -> Self {
+        SolverConfig {
+            solver_path: cli.solver_path.clone(),
+            solver_args: cli.solver_args.clone(),
+            timeout_secs: cli.solver_timeout_secs,
+        }
+    }
+}
+
+impl From<&Cli> for AppConfig {
+    fn from(cli: &Cli) -> Self {
+        AppConfig {
+            llm: LlmConfig::from(cli),
+            solver: SolverConfig::from(cli),
+        }
+    }
+}
+
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -79,47 +129,16 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let api_key = cli.api_key.expect("api_key has a default value");
+    let config_live = Arc::new(LiveConfig::new(AppConfig::from(&cli)));
 
-    let service_tier = match cli.service_tier.to_lowercase().as_str() {
-        "auto" => ServiceTier::Auto,
-        "default" => ServiceTier::Default,
-        "flex" => ServiceTier::Flex,
-        "scale" => ServiceTier::Scale,
-        "priority" => ServiceTier::Priority,
-        other => anyhow::bail!(
-            "Invalid service tier: {other}. Valid values: auto, default, flex, scale, priority"
-        ),
-    };
+    let input = cli.input.clone();
 
-    let api_model = cli.api_model;
+    let shell = ErrorShell::with_base_plugins()
+        .with_config::<UpdateArgs, AppConfig>("set", config_live.clone())?;
 
-    let judge_model = cli.judge_model.unwrap_or_else(|| api_model.clone());
-
-    let config = AgentConfig {
-        llm_config: LlmConfig {
-            api_key,
-            judge_api_key: cli.judge_api_key,
-            formalizer_api_key: cli.formalizer_api_key,
-            fixer_api_key: cli.fixer_api_key,
-            splitter_api_key: cli.splitter_api_key,
-            splitting_judge_api_key: cli.splitting_judge_api_key,
-            analyzer_api_key: None,
-            api_base: cli.api_base,
-            splitter_model: cli.splitter_model.unwrap_or_else(|| api_model.clone()),
-            formalizer_model: cli.formalizer_model.unwrap_or_else(|| api_model.clone()),
-            fixer_model: cli.fixer_model.unwrap_or_else(|| api_model.clone()),
-            judge_model: judge_model.clone(),
-            splitting_judge_model: cli.splitting_judge_model.unwrap_or(judge_model),
-            analyzer_model: api_model.clone(),
-            stream_timeout_ms: cli.stream_timeout_ms,
-            max_stream_retries: cli.max_stream_retries,
-            service_tier,
+    shell.run(
+        move |gate| async move {
+            run(&input, config_live, gate).await
         },
-        solver_path: cli.solver_path,
-        solver_args: cli.solver_args,
-        solver_timeout_secs: cli.solver_timeout_secs,
-    };
-
-    run(&cli.input, config).await
+    )
 }

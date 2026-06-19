@@ -1,12 +1,14 @@
 use crate::phase::PiecePhase;
 use crate::piece::CodePiece;
+use refactor_check_core::context_id::ContextId;
 use refactor_check_core::phase_tracker::{DefaultPhaseTracker, PhaseTracker};
 
 pub trait PieceManager: Send + Sync {
-    fn new_piece(&self, label: &str, before: &str, after: &str) -> CodePiece;
-    fn advance(&self, piece_id: u64, from: Option<PiecePhase>, to: PiecePhase);
-    fn expect_any_and_set(&self, piece_id: u64, valid_from: &[PiecePhase], to: PiecePhase);
-    fn enter_generation(&self, piece_id: u64, to: PiecePhase);
+    fn new_piece(&self, parent_ctx: &ContextId, label: &str, before: &str, after: &str) -> CodePiece;
+    fn advance(&self, ctx: &ContextId, from: Option<PiecePhase>, to: PiecePhase);
+    fn expect_any_and_set(&self, ctx: &ContextId, valid_from: &[PiecePhase], to: PiecePhase);
+    fn enter_generation(&self, ctx: &ContextId, to: PiecePhase);
+    fn get_phase(&self, ctx: &ContextId) -> Option<PiecePhase>;
 }
 
 pub struct DefaultPieceManager {
@@ -22,21 +24,27 @@ impl DefaultPieceManager {
 }
 
 impl PieceManager for DefaultPieceManager {
-    fn new_piece(&self, label: &str, before: &str, after: &str) -> CodePiece {
-        let id = self.tracker.next_id();
-        CodePiece::with_id(id, label, before, after)
+    fn new_piece(&self, parent_ctx: &ContextId, label: &str, before: &str, after: &str) -> CodePiece {
+        let ctx = parent_ctx.new_child();
+        let piece = CodePiece::new(ctx, label, before, after);
+        piece.with_ctx(|c| self.tracker.advance(c, None, PiecePhase::Open));
+        piece
     }
 
-    fn advance(&self, piece_id: u64, from: Option<PiecePhase>, to: PiecePhase) {
-        self.tracker.advance(piece_id, from, to);
+    fn advance(&self, ctx: &ContextId, from: Option<PiecePhase>, to: PiecePhase) {
+        self.tracker.advance(ctx, from, to);
     }
 
-    fn expect_any_and_set(&self, piece_id: u64, valid_from: &[PiecePhase], to: PiecePhase) {
-        self.tracker.expect_any_and_set(piece_id, valid_from, to);
+    fn expect_any_and_set(&self, ctx: &ContextId, valid_from: &[PiecePhase], to: PiecePhase) {
+        self.tracker.expect_any_and_set(ctx, valid_from, to);
     }
 
-    fn enter_generation(&self, piece_id: u64, to: PiecePhase) {
-        self.tracker.upsert(piece_id, &[PiecePhase::Open, PiecePhase::Forming, PiecePhase::Fixing], to);
+    fn enter_generation(&self, ctx: &ContextId, to: PiecePhase) {
+        self.tracker.expect_any_and_set(ctx, &[PiecePhase::Open, PiecePhase::Forming, PiecePhase::Fixing], to);
+    }
+
+    fn get_phase(&self, ctx: &ContextId) -> Option<PiecePhase> {
+        self.tracker.get_phase(ctx)
     }
 }
 
@@ -58,72 +66,94 @@ mod tests {
     #[test]
     fn enter_generation_absent_entry_inserts_without_panic() {
         let pm = test_pm();
-        pm.enter_generation(999, PiecePhase::Fixing);
-        assert_eq!(*pm.tracker.phases().get(&999).unwrap(), PiecePhase::Fixing);
+        let root = ContextId::root();
+        let piece = pm.new_piece(root, "test", "before", "after");
+        piece.with_ctx(|ctx| {
+            pm.enter_generation(ctx, PiecePhase::Fixing);
+            assert_eq!(pm.get_phase(ctx), Some(PiecePhase::Fixing));
+        });
     }
 
     #[test]
     fn enter_generation_absent_entry_inserts_forming() {
         let pm = test_pm();
-        pm.enter_generation(42, PiecePhase::Forming);
-        assert_eq!(*pm.tracker.phases().get(&42).unwrap(), PiecePhase::Forming);
+        let root = ContextId::root();
+        let piece = pm.new_piece(root, "test", "before", "after");
+        piece.with_ctx(|ctx| {
+            pm.enter_generation(ctx, PiecePhase::Forming);
+            assert_eq!(pm.get_phase(ctx), Some(PiecePhase::Forming));
+        });
     }
 
     #[test]
     fn enter_generation_transitions_from_open() {
         let pm = test_pm();
-        let piece = pm.new_piece("test", "before", "after");
-        pm.advance(piece.id(), None, PiecePhase::Solving);
-        pm.advance(piece.id(), Some(PiecePhase::Solving), PiecePhase::Open);
-        pm.enter_generation(piece.id(), PiecePhase::Fixing);
-        assert_eq!(*pm.tracker.phases().get(&piece.id()).unwrap(), PiecePhase::Fixing);
+        let root = ContextId::root();
+        let piece = pm.new_piece(root, "test", "before", "after");
+        piece.with_ctx(|ctx| {
+            pm.advance(ctx, None, PiecePhase::Solving);
+            pm.advance(ctx, Some(PiecePhase::Solving), PiecePhase::Open);
+            pm.enter_generation(ctx, PiecePhase::Fixing);
+            assert_eq!(pm.get_phase(ctx), Some(PiecePhase::Fixing));
+        });
     }
 
     #[test]
     fn enter_generation_transitions_from_forming() {
         let pm = test_pm();
-        let piece = pm.new_piece("test", "before", "after");
-        pm.enter_generation(piece.id(), PiecePhase::Forming);
-        pm.enter_generation(piece.id(), PiecePhase::Fixing);
-        assert_eq!(*pm.tracker.phases().get(&piece.id()).unwrap(), PiecePhase::Fixing);
+        let root = ContextId::root();
+        let piece = pm.new_piece(root, "test", "before", "after");
+        piece.with_ctx(|ctx| {
+            pm.enter_generation(ctx, PiecePhase::Forming);
+            pm.enter_generation(ctx, PiecePhase::Fixing);
+            assert_eq!(pm.get_phase(ctx), Some(PiecePhase::Fixing));
+        });
     }
 
     #[test]
     fn enter_generation_transitions_from_fixing() {
         let pm = test_pm();
-        let piece = pm.new_piece("test", "before", "after");
-        pm.enter_generation(piece.id(), PiecePhase::Fixing);
-        pm.enter_generation(piece.id(), PiecePhase::Forming);
-        assert_eq!(*pm.tracker.phases().get(&piece.id()).unwrap(), PiecePhase::Forming);
+        let root = ContextId::root();
+        let piece = pm.new_piece(root, "test", "before", "after");
+        piece.with_ctx(|ctx| {
+            pm.enter_generation(ctx, PiecePhase::Fixing);
+            pm.enter_generation(ctx, PiecePhase::Forming);
+            assert_eq!(pm.get_phase(ctx), Some(PiecePhase::Forming));
+        });
     }
 
     #[test]
     #[should_panic(expected = "expected one of [Open, Forming, Fixing] but was")]
     fn enter_generation_panics_from_solving() {
         let pm = test_pm();
-        let piece = pm.new_piece("test", "before", "after");
-        pm.advance(piece.id(), None, PiecePhase::Solving);
-        pm.enter_generation(piece.id(), PiecePhase::Fixing);
+        let root = ContextId::root();
+        let piece = pm.new_piece(root, "test", "before", "after");
+        piece.with_ctx(|ctx| {
+            pm.advance(ctx, None, PiecePhase::Solving);
+            pm.enter_generation(ctx, PiecePhase::Fixing);
+        });
     }
 
     #[test]
     fn enter_generation_new_piece_ids_at_nonzero_iteration() {
         let pm = test_pm();
-        let p1 = pm.new_piece("first", "a", "b");
-        pm.enter_generation(p1.id(), PiecePhase::Forming);
-        pm.expect_any_and_set(p1.id(), &[PiecePhase::Forming], PiecePhase::Solving);
-        pm.advance(p1.id(), Some(PiecePhase::Solving), PiecePhase::Open);
+        let root = ContextId::root();
+        let p1 = pm.new_piece(root, "first", "a", "b");
+        p1.with_ctx(|ctx| {
+            pm.enter_generation(ctx, PiecePhase::Forming);
+            pm.expect_any_and_set(ctx, &[PiecePhase::Forming], PiecePhase::Solving);
+            pm.advance(ctx, Some(PiecePhase::Solving), PiecePhase::Open);
+        });
 
-        let p2 = pm.new_piece("resplit_a", "c", "d");
-        let p3 = pm.new_piece("resplit_b", "e", "f");
+        let p2 = pm.new_piece(root, "resplit_a", "c", "d");
+        let p3 = pm.new_piece(root, "resplit_b", "e", "f");
 
-        assert_ne!(p2.id(), p1.id());
-        assert_ne!(p3.id(), p1.id());
+        assert_ne!(p2.label(), p3.label());
 
-        pm.enter_generation(p2.id(), PiecePhase::Fixing);
-        pm.enter_generation(p3.id(), PiecePhase::Fixing);
+        p2.with_ctx(|ctx| pm.enter_generation(ctx, PiecePhase::Fixing));
+        p3.with_ctx(|ctx| pm.enter_generation(ctx, PiecePhase::Fixing));
 
-        assert_eq!(*pm.tracker.phases().get(&p2.id()).unwrap(), PiecePhase::Fixing);
-        assert_eq!(*pm.tracker.phases().get(&p3.id()).unwrap(), PiecePhase::Fixing);
+        p2.with_ctx(|ctx| assert_eq!(pm.get_phase(ctx), Some(PiecePhase::Fixing)));
+        p3.with_ctx(|ctx| assert_eq!(pm.get_phase(ctx), Some(PiecePhase::Fixing)));
     }
 }

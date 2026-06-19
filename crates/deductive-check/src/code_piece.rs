@@ -1,10 +1,7 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-
-static NEXT_CODE_PIECE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FunctionId {
@@ -34,7 +31,6 @@ impl FunctionId {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct DeductiveCodePiece {
-    id: u64,
     file: PathBuf,
     function_id: FunctionId,
     start_line: u32,
@@ -43,8 +39,7 @@ pub struct DeductiveCodePiece {
 }
 
 impl DeductiveCodePiece {
-    pub(crate) fn with_id(
-        id: u64,
+    pub(crate) fn new(
         file: PathBuf,
         function_id: FunctionId,
         start_line: u32,
@@ -52,17 +47,12 @@ impl DeductiveCodePiece {
         code: String,
     ) -> Self {
         Self {
-            id,
             file,
             function_id,
             start_line,
             end_line,
             code,
         }
-    }
-
-    pub fn id(&self) -> u64 {
-        self.id
     }
 
     pub fn file(&self) -> &PathBuf {
@@ -84,10 +74,10 @@ impl DeductiveCodePiece {
     pub fn code(&self) -> &str {
         &self.code
     }
+
+    pub fn type_invariant(&self) -> bool {
+        !self.code.trim().is_empty()
+    }
 }
 
 pub type ArcCodePiece = Arc<DeductiveCodePiece>;
-
-pub fn next_code_piece_id() -> u64 {
-    NEXT_CODE_PIECE_ID.fetch_add(1, Ordering::Relaxed)
-}

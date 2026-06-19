@@ -4,7 +4,6 @@ use crate::code_piece::FunctionId;
 
 #[derive(Debug, Clone)]
 pub struct ClosedPiece {
-    pub piece_id: u64,
     pub file: PathBuf,
     pub function_id: FunctionId,
     pub start_line: u32,
@@ -16,7 +15,6 @@ pub struct ClosedPiece {
 
 #[derive(Debug, Clone)]
 pub struct UnverifiedPiece {
-    pub piece_id: u64,
     pub file: PathBuf,
     pub function_id: FunctionId,
     pub start_line: u32,
@@ -28,7 +26,6 @@ pub struct UnverifiedPiece {
 
 #[derive(Debug, Clone)]
 pub struct BugReport {
-    pub piece_id: u64,
     pub file: PathBuf,
     pub function_id: FunctionId,
     pub description: String,

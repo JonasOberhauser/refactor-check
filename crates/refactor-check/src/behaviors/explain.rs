@@ -1,5 +1,6 @@
 use anyhow::Result;
 use futures::future;
+use refactor_check_core::context_id::ContextId;
 use tracing::{info, warn};
 
 use crate::agent::build_explanation_messages;
@@ -10,6 +11,7 @@ use crate::states::WaitForExplanation;
 pub async fn execute(
     state: &WaitForExplanation,
     llm: &DynLlmProvider,
+    parent_ctx: &ContextId,
 ) -> Result<Vec<Option<String>>> {
     let needs_explanation: Vec<(usize, String, SolverOutcome)> = state
         .result
@@ -28,9 +30,10 @@ pub async fn execute(
 
     let futures = needs_explanation.iter().map(|(i, formula, outcome)| {
         let messages = build_explanation_messages(&state.input_content, formula, outcome);
+        let ctx = parent_ctx.new_child();
         async move {
-            let response = llm.invoke(LlmRequest { role: LlmRole::Fixer, messages, piece_id: None }).await;
-            (*i, response)
+            let resp = llm.invoke(LlmRequest { role: LlmRole::Fixer, messages, context_id: Box::new(ctx) }).await;
+            (*i, resp.map(|r| r.value))
         }
     });
 

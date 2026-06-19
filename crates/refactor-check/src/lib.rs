@@ -1,5 +1,5 @@
 pub use refactor_check_core::{
-    consts, llm, phase_tracker, provider, smt, state,
+    config_update, consts, error_gate, llm, live_config, phase_tracker, provider, smt, state,
 };
 
 pub mod agent;

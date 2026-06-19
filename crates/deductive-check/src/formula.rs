@@ -1,8 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use crate::phase::FormulaPhase;
-
-static NEXT_FORMULA_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormulaSource {
@@ -12,36 +8,22 @@ pub enum FormulaSource {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Formula {
-    id: u64,
-    piece_id: u64,
     content: String,
     source: FormulaSource,
     iteration: u32,
 }
 
 impl Formula {
-    pub(crate) fn with_id(
-        id: u64,
-        piece_id: u64,
+    pub(crate) fn new(
         content: String,
         source: FormulaSource,
         iteration: u32,
     ) -> Self {
         Self {
-            id,
-            piece_id,
             content,
             source,
             iteration,
         }
-    }
-
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    pub fn piece_id(&self) -> u64 {
-        self.piece_id
     }
 
     pub fn content(&self) -> &str {
@@ -57,18 +39,14 @@ impl Formula {
     }
 }
 
-pub fn next_formula_id() -> u64 {
-    NEXT_FORMULA_ID.fetch_add(1, Ordering::Relaxed)
-}
-
 #[derive(Debug, Clone)]
 pub struct ExtractedFormula {
     pub content: String,
     pub source: FormulaSource,
 }
 
-pub fn extract_formulas_from_response(response: &str) -> Vec<ExtractedFormula> {
-    let mut formulas = Vec::new();
+pub fn extract_fenced_blocks(response: &str) -> Vec<(String, String)> {
+    let mut blocks = Vec::new();
     let mut in_fence = false;
     let mut fence_backticks = 0;
     let mut fence_lang = String::new();
@@ -91,8 +69,7 @@ pub fn extract_formulas_from_response(response: &str) -> Vec<ExtractedFormula> {
             in_fence = false;
             let content = buf.trim().to_string();
             if !content.is_empty() {
-                let source = detect_formula_source(&fence_lang, &content);
-                formulas.push(ExtractedFormula { content, source });
+                blocks.push((fence_lang.clone(), content));
             }
             continue;
         }
@@ -103,17 +80,23 @@ pub fn extract_formulas_from_response(response: &str) -> Vec<ExtractedFormula> {
         }
     }
 
-    if formulas.is_empty() {
-        let trimmed = response.trim().to_string();
-        if !trimmed.is_empty() {
-            formulas.push(ExtractedFormula {
-                content: trimmed,
-                source: FormulaSource::SmtLib,
-            });
-        }
-    }
+    blocks
+}
 
-    formulas
+pub fn extract_formulas_from_response(response: &str) -> Vec<ExtractedFormula> {
+    extract_fenced_blocks(response)
+        .into_iter()
+        .filter(|(lang, _)| is_formula_lang(lang))
+        .map(|(lang, content)| ExtractedFormula {
+            source: detect_formula_source(&lang),
+            content,
+        })
+        .collect()
+}
+
+fn is_formula_lang(lang: &str) -> bool {
+    let l = lang.to_lowercase();
+    l.contains("smt") || l.contains("py") || l.contains("python")
 }
 
 fn count_backticks(line: &str) -> usize {
@@ -129,37 +112,17 @@ fn count_backticks(line: &str) -> usize {
     count
 }
 
-fn detect_formula_source(lang: &str, content: &str) -> FormulaSource {
+fn detect_formula_source(lang: &str) -> FormulaSource {
     let lang_lower = lang.to_lowercase();
     if lang_lower.contains("py") || lang_lower.contains("python") {
-        return FormulaSource::PyZ3;
+        FormulaSource::PyZ3
+    } else {
+        FormulaSource::SmtLib
     }
-    if lang_lower.contains("smt") {
-        return FormulaSource::SmtLib;
-    }
-    if content.contains("(set-logic")
-        || content.contains("(declare-")
-        || content.contains("(assert")
-        || content.contains("(check-sat)")
-    {
-        return FormulaSource::SmtLib;
-    }
-    if content.contains("from z3 import")
-        || content.contains("import z3")
-        || content.contains("Solver(")
-        || content.contains("And(")
-        || content.contains("Or(")
-        || content.contains("Implies(")
-    {
-        return FormulaSource::PyZ3;
-    }
-    FormulaSource::SmtLib
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormulaResult {
-    pub formula_id: u64,
-    pub piece_id: u64,
     pub phase: FormulaPhase,
     pub content: String,
     pub source: FormulaSource,
@@ -210,23 +173,36 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_bare_text_when_no_fences() {
+    fn test_bare_text_not_extracted_without_fences() {
         let response = "(set-logic QF_LIA)\n(check-sat)";
         let formulas = extract_formulas_from_response(response);
+        assert_eq!(formulas.len(), 0);
+    }
+
+    #[test]
+    fn test_rust_code_block_not_treated_as_formula() {
+        let response = "Here is the code:\n```rust\nlet x = foo();\nexpect(\"bar\");\n```\nAnd the formula:\n```smt2\n(set-logic ALL)\n(check-sat)\n```";
+        let formulas = extract_formulas_from_response(response);
         assert_eq!(formulas.len(), 1);
-        assert_eq!(formulas[0].source, FormulaSource::SmtLib);
+        assert!(formulas[0].content.contains("(set-logic"));
+    }
+
+    #[test]
+    fn test_bare_text_not_smt_not_treated_as_formula() {
+        let response = "I cannot produce a formula because the code is too complex.";
+        let formulas = extract_formulas_from_response(response);
+        assert_eq!(formulas.len(), 0);
     }
 
     #[test]
     fn test_detect_formula_source_by_language_tag() {
-        assert_eq!(detect_formula_source("smt2", ""), FormulaSource::SmtLib);
-        assert_eq!(detect_formula_source("python", ""), FormulaSource::PyZ3);
-        assert_eq!(detect_formula_source("py", ""), FormulaSource::PyZ3);
+        assert_eq!(detect_formula_source("smt2"), FormulaSource::SmtLib);
+        assert_eq!(detect_formula_source("python"), FormulaSource::PyZ3);
+        assert_eq!(detect_formula_source("py"), FormulaSource::PyZ3);
     }
 
     #[test]
-    fn test_detect_formula_source_by_content() {
-        assert_eq!(detect_formula_source("", "(set-logic QF_LIA)"), FormulaSource::SmtLib);
-        assert_eq!(detect_formula_source("", "from z3 import *"), FormulaSource::PyZ3);
+    fn test_detect_formula_source_unknown_lang_defaults_to_smt() {
+        assert_eq!(detect_formula_source(""), FormulaSource::SmtLib);
     }
 }

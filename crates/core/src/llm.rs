@@ -10,18 +10,24 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, instrument, trace, warn};
 
-use crate::provider::{IOProvider, LlmRequest, LlmRole};
+use crate::config_update::AppConfig;
+use crate::context_id::ContextId;
+use crate::error_gate::ErrorGate;
+use crate::live_config::LiveConfig;
+use crate::provider::{IOProvider, LlmRequest, LlmRole, WithContext};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Role {
     System,
     User,
     Assistant,
 }
 
+#[derive(Clone)]
 pub struct Message {
     pub role: Role,
     pub content: String,
@@ -120,14 +126,67 @@ impl fmt::Debug for LlmConfig {
     }
 }
 
+type OaiClient = async_openai::Client<async_openai::config::OpenAIConfig>;
+
+struct ClientSet {
+    version: u64,
+    formalizer: OaiClient,
+    fixer: OaiClient,
+    judge: OaiClient,
+    splitting_judge: OaiClient,
+    splitter: OaiClient,
+    analyzer: OaiClient,
+}
+
+impl ClientSet {
+    fn build(config: &LlmConfig, version: u64) -> Self {
+        let formalizer_key = config.formalizer_api_key.as_deref().unwrap_or(&config.api_key);
+        let fixer_key = config.fixer_api_key.as_deref().unwrap_or(&config.api_key);
+        let judge_key = config.judge_api_key.as_deref().unwrap_or(&config.api_key);
+        let splitting_judge_key = config.splitting_judge_api_key.as_deref().unwrap_or(judge_key);
+        let splitter_key = config.splitter_api_key.as_deref().unwrap_or(&config.api_key);
+        let analyzer_key = config.analyzer_api_key.as_deref().unwrap_or(&config.api_key);
+
+        Self {
+            version,
+            formalizer: OaiClient::with_config(
+                async_openai::config::OpenAIConfig::new()
+                    .with_api_key(formalizer_key)
+                    .with_api_base(&config.api_base),
+            ),
+            fixer: OaiClient::with_config(
+                async_openai::config::OpenAIConfig::new()
+                    .with_api_key(fixer_key)
+                    .with_api_base(&config.api_base),
+            ),
+            judge: OaiClient::with_config(
+                async_openai::config::OpenAIConfig::new()
+                    .with_api_key(judge_key)
+                    .with_api_base(&config.api_base),
+            ),
+            splitting_judge: OaiClient::with_config(
+                async_openai::config::OpenAIConfig::new()
+                    .with_api_key(splitting_judge_key)
+                    .with_api_base(&config.api_base),
+            ),
+            splitter: OaiClient::with_config(
+                async_openai::config::OpenAIConfig::new()
+                    .with_api_key(splitter_key)
+                    .with_api_base(&config.api_base),
+            ),
+            analyzer: OaiClient::with_config(
+                async_openai::config::OpenAIConfig::new()
+                    .with_api_key(analyzer_key)
+                    .with_api_base(&config.api_base),
+            ),
+        }
+    }
+}
+
 pub struct LlmClient {
-    formalizer_client: async_openai::Client<async_openai::config::OpenAIConfig>,
-    fixer_client: async_openai::Client<async_openai::config::OpenAIConfig>,
-    judge_client: async_openai::Client<async_openai::config::OpenAIConfig>,
-    splitting_judge_client: async_openai::Client<async_openai::config::OpenAIConfig>,
-    splitter_client: async_openai::Client<async_openai::config::OpenAIConfig>,
-    analyzer_client: async_openai::Client<async_openai::config::OpenAIConfig>,
-    config: LlmConfig,
+    config: Arc<LiveConfig<AppConfig>>,
+    clients: std::sync::RwLock<ClientSet>,
+    error_gate: Option<Arc<ErrorGate>>,
 }
 
 struct ConnectionTracer {
@@ -156,13 +215,30 @@ impl ConnectionTracer {
     }
 }
 
+fn is_rate_limit(reason: &str) -> bool {
+    let lower = reason.to_lowercase();
+    lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("too many requests")
+        || lower.contains("code: 429")
+        || lower.contains("code: 1302")
+        || lower.contains("code: 1305")
+}
+
+fn rand_random() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
 struct StreamHandler<'a> {
     client: &'a async_openai::Client<async_openai::config::OpenAIConfig>,
     label: &'a str,
     timeout: Duration,
     max_retries: u32,
     service_tier: ServiceTier,
-    piece_id: Option<u64>,
+    context_id: &'a ContextId,
 }
 
 enum FailureAction {
@@ -177,9 +253,9 @@ impl<'a> StreamHandler<'a> {
         timeout: Duration,
         max_retries: u32,
         service_tier: ServiceTier,
-        piece_id: Option<u64>,
+        context_id: &'a ContextId,
     ) -> Self {
-        Self { client, label, timeout, max_retries, service_tier, piece_id }
+        Self { client, label, timeout, max_retries, service_tier, context_id }
     }
 
     async fn run(
@@ -188,7 +264,9 @@ impl<'a> StreamHandler<'a> {
         request_messages: Vec<ChatCompletionRequestMessage>,
         is_valid: &impl Fn(&str) -> bool,
     ) -> Result<String> {
-        for attempt in 0..=self.max_retries {
+        let mut attempt: u32 = 0;
+        let mut transient_backoff_secs: u64 = 5;
+        loop {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -201,32 +279,50 @@ impl<'a> StreamHandler<'a> {
                 ..Default::default()
             };
 
-            debug!(%self.label, piece_id = self.piece_id, attempt, "sending LLM streaming request");
+            debug!(%self.label, %self.context_id, attempt, "sending LLM streaming request");
 
-            let mut stream = match self.client.chat().create_stream(request).await {
-                Ok(s) => s,
-                Err(e) => {
-                    if attempt < self.max_retries {
-                        warn!(%self.label, attempt, max_retries = self.max_retries, "LLM retry");
-                        continue;
+            let mut stream = loop {
+                match self.client.chat().create_stream(request.clone()).await {
+                    Ok(s) => {
+                        transient_backoff_secs = 5;
+                        break s;
                     }
-                    return Err(e).context("LLM streaming request failed after all retries");
+                    Err(e) => {
+                        let reason = format!("{e}");
+                        if is_rate_limit(&reason) {
+                            let jitter = (rand_random() % 3) as u64;
+                            warn!(%self.label, %self.context_id, bytes = 0usize, backoff_secs = transient_backoff_secs + jitter, reason, "LLM transient error, retrying without incrementing attempt");
+                            tokio::time::sleep(Duration::from_secs(transient_backoff_secs + jitter)).await;
+                            transient_backoff_secs = (transient_backoff_secs * 2).min(120);
+                            continue;
+                        }
+                        if attempt < self.max_retries {
+                            warn!(%self.label, %self.context_id, attempt, max_retries = self.max_retries, reason, "LLM retry");
+                            attempt += 1;
+                            continue;
+                        }
+                        return Err(e).context("LLM streaming request failed after all retries");
+                    }
                 }
             };
 
             let mut content = String::new();
-            let mut got_first_chunk = false;
+            let mut got_first_content = false;
             let mut finish_reason: Option<FinishReason> = None;
             let mut tracer = ConnectionTracer::new();
+            let mut total_chunks: u64 = 0;
+
+            let mut transient_retry = false;
 
             loop {
-                let current_timeout = if got_first_chunk { self.timeout } else { self.timeout * 4 };
+                let current_timeout = if got_first_content { self.timeout } else { self.timeout * 4 };
                 match tokio::time::timeout(current_timeout, stream.next()).await {
                     Ok(Some(Ok(response))) => {
-                        got_first_chunk = true;
+                        total_chunks += 1;
                         if let Some(choice) = response.choices.first() {
                             let has_content = choice.delta.content.as_ref().is_some_and(|c| !c.is_empty());
                             if has_content {
+                                got_first_content = true;
                                 let text = choice.delta.content.as_ref().unwrap();
                                 tracer.on_content(self.label, text);
                                 content.push_str(text);
@@ -240,6 +336,14 @@ impl<'a> StreamHandler<'a> {
                     }
                     Ok(Some(Err(e))) => {
                         let reason = format!("{e}");
+                        if is_rate_limit(&reason) && content.is_empty() {
+                            let jitter = (rand_random() % 3) as u64;
+                            warn!(%self.label, %self.context_id, bytes = 0usize, backoff_secs = transient_backoff_secs + jitter, reason, "LLM transient error, retrying without incrementing attempt");
+                            tokio::time::sleep(Duration::from_secs(transient_backoff_secs + jitter)).await;
+                            transient_backoff_secs = (transient_backoff_secs * 2).min(120);
+                            transient_retry = true;
+                            break;
+                        }
                         match self.handle_failure(&content, attempt, is_valid, &reason)? {
                             FailureAction::UseContent(c) => return Ok(c),
                             FailureAction::Retry => break,
@@ -249,7 +353,12 @@ impl<'a> StreamHandler<'a> {
                         return self.finish(content, &tracer, finish_reason);
                     }
                     Err(_) => {
-                        let reason = format!("timeout after {}ms", self.timeout.as_millis());
+                        let reason = format!(
+                            "timeout after {}ms ({} bytes, {} chunks received)",
+                            current_timeout.as_millis(),
+                            content.len(),
+                            total_chunks,
+                        );
                         match self.handle_failure(&content, attempt, is_valid, &reason)? {
                             FailureAction::UseContent(c) => return Ok(c),
                             FailureAction::Retry => break,
@@ -257,9 +366,14 @@ impl<'a> StreamHandler<'a> {
                     }
                 }
             }
-        }
 
-        bail!("LLM stream exhausted all {} retries without completing", self.max_retries)
+            if !transient_retry {
+                attempt += 1;
+            }
+            if attempt > self.max_retries {
+                bail!("LLM stream exhausted all {} retries without completing ({})", self.max_retries, self.context_id);
+            }
+        }
     }
 
     fn handle_failure(
@@ -270,17 +384,17 @@ impl<'a> StreamHandler<'a> {
         reason: &str,
     ) -> Result<FailureAction> {
         if !content.is_empty() && is_valid(content) {
-            warn!(%self.label, bytes = content.len(), reason, "LLM error, but partial content is valid, returning it");
+            warn!(%self.label, %self.context_id, bytes = content.len(), reason, "LLM error, but partial content is valid, returning it");
             let content = content.trim().to_string();
-            info!(%self.label, bytes = content.len(), "LLM response received");
+            info!(%self.label, %self.context_id, bytes = content.len(), "LLM response received");
             Ok(FailureAction::UseContent(content))
         } else if attempt < self.max_retries {
-            warn!(%self.label, attempt, max_retries = self.max_retries, reason, "LLM retry");
+            warn!(%self.label, %self.context_id, bytes = content.len(), attempt, max_retries = self.max_retries, reason, "LLM retry");
             Ok(FailureAction::Retry)
         } else if content.is_empty() {
-            bail!("LLM error with no content after all retries: {reason}")
+            bail!("LLM error with no content after all retries: {reason} ({})", self.context_id)
         } else {
-            bail!("LLM error after all retries, partial content not usable: {reason}")
+            bail!("LLM error after all retries, partial content not usable: {reason} ({})", self.context_id)
         }
     }
 
@@ -291,122 +405,154 @@ impl<'a> StreamHandler<'a> {
         finish_reason: Option<FinishReason>,
     ) -> Result<String> {
         if tracer.empty_chunks > 0 {
-            trace!(%self.label, total_empty_chunks = tracer.empty_chunks, total_content_bytes = tracer.total_content_bytes, "SSE stream ended");
+            trace!(%self.label, %self.context_id, total_empty_chunks = tracer.empty_chunks, total_content_bytes = tracer.total_content_bytes, "SSE stream ended");
         }
         if matches!(finish_reason, Some(FinishReason::Length)) {
-            warn!(%self.label, bytes = content.len(), "LLM response truncated (finish_reason=length)");
+            warn!(%self.label, %self.context_id, bytes = content.len(), "LLM response truncated (finish_reason=length)");
         }
         let content = content.trim().to_string();
-        info!(%self.label, bytes = content.len(), "LLM response received");
+        info!(%self.label, %self.context_id, bytes = content.len(), "LLM response received");
         let prefixed_response: String = content.lines().map(|l| format!("<\t{l}")).collect::<Vec<_>>().join("\n");
-        debug!(%self.label, piece_id = self.piece_id, content = %prefixed_response, "full LLM response");
+        debug!(%self.label, %self.context_id, content = %prefixed_response, "full LLM response");
         Ok(content)
     }
 }
 
+struct ChatCtx<'a> {
+    label: &'a str,
+    client: &'a OaiClient,
+    model: &'a str,
+    config: &'a LlmConfig,
+    context_id: &'a ContextId,
+}
+
 impl LlmClient {
     #[must_use]
-    pub fn new(config: LlmConfig) -> Self {
-        let formalizer_key = config.formalizer_api_key.as_deref().unwrap_or(&config.api_key);
-        let formalizer_config = async_openai::config::OpenAIConfig::new()
-            .with_api_key(formalizer_key)
-            .with_api_base(&config.api_base);
-
-        let fixer_key = config.fixer_api_key.as_deref().unwrap_or(&config.api_key);
-        let fixer_config = async_openai::config::OpenAIConfig::new()
-            .with_api_key(fixer_key)
-            .with_api_base(&config.api_base);
-
-        let judge_key = config.judge_api_key.as_deref().unwrap_or(&config.api_key);
-        let judge_config = async_openai::config::OpenAIConfig::new()
-            .with_api_key(judge_key)
-            .with_api_base(&config.api_base);
-
-        let formalizer_client = async_openai::Client::with_config(formalizer_config);
-        let fixer_client = async_openai::Client::with_config(fixer_config);
-        let judge_client = async_openai::Client::with_config(judge_config);
-
-        let splitting_judge_key = config.splitting_judge_api_key.as_deref().unwrap_or(judge_key);
-        let splitting_judge_config = async_openai::config::OpenAIConfig::new()
-            .with_api_key(splitting_judge_key)
-            .with_api_base(&config.api_base);
-        let splitting_judge_client = async_openai::Client::with_config(splitting_judge_config);
-
-        let splitter_key = config.splitter_api_key.as_deref().unwrap_or(&config.api_key);
-        let splitter_config = async_openai::config::OpenAIConfig::new()
-            .with_api_key(splitter_key)
-            .with_api_base(&config.api_base);
-        let splitter_client = async_openai::Client::with_config(splitter_config);
-
-        let analyzer_key = config.analyzer_api_key.as_deref().unwrap_or(&config.api_key);
-        let analyzer_config = async_openai::config::OpenAIConfig::new()
-            .with_api_key(analyzer_key)
-            .with_api_base(&config.api_base);
-        let analyzer_client = async_openai::Client::with_config(analyzer_config);
-
-        Self { formalizer_client, fixer_client, judge_client, splitting_judge_client, splitter_client, analyzer_client, config }
+    pub fn with_live_config(config: Arc<LiveConfig<AppConfig>>) -> Self {
+        let (version, snapshot) = config.snapshot();
+        let clients = ClientSet::build(&snapshot.llm, version);
+        Self {
+            config,
+            clients: std::sync::RwLock::new(clients),
+            error_gate: None,
+        }
     }
 
-    #[instrument(skip_all, fields(model = %self.config.formalizer_model))]
-    pub async fn chat_formalizer(&self, messages: Vec<Message>, piece: Option<u64>) -> Result<String> {
-        self.chat_inner("formalizer", &self.formalizer_client, &self.config.formalizer_model, messages, piece, |content| {
-            !content.trim().is_empty()
-        }).await
+    #[must_use]
+    pub fn with_error_gate(mut self, gate: Arc<ErrorGate>) -> Self {
+        self.error_gate = Some(gate);
+        self
     }
 
-    #[instrument(skip_all, fields(model = %self.config.fixer_model))]
-    pub async fn chat_fixer(&self, messages: Vec<Message>, piece: Option<u64>) -> Result<String> {
-        self.chat_inner("fixer", &self.fixer_client, &self.config.fixer_model, messages, piece, |content| {
-            !content.trim().is_empty()
-        }).await
+    fn ensure_current(&self) -> LlmConfig {
+        let (version, snapshot) = self.config.snapshot();
+        let llm_config = snapshot.llm;
+        {
+            let guard = self.clients.read().unwrap_or_else(|e| e.into_inner());
+            if guard.version == version {
+                return llm_config;
+            }
+        }
+        {
+            let mut guard = self.clients.write().unwrap_or_else(|e| e.into_inner());
+            if guard.version != version {
+                *guard = ClientSet::build(&llm_config, version);
+            }
+        }
+        llm_config
     }
 
-    #[instrument(skip_all, fields(model = %self.config.judge_model))]
-    pub async fn chat_judge(&self, messages: Vec<Message>, piece: Option<u64>) -> Result<String> {
-        self.chat_inner("judge", &self.judge_client, &self.config.judge_model, messages, piece, |content| {
-            let upper = content.trim().to_uppercase();
-            let trimmed = upper.trim_start_matches(|c: char| !c.is_alphabetic());
-            trimmed.starts_with("REASONABLE") || trimmed.starts_with("RETRY")
-        }).await
+    #[instrument(skip_all, fields(model))]
+    pub async fn chat_formalizer(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
+        let config = self.ensure_current();
+        tracing::Span::current().record("model", &config.formalizer_model);
+        let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).formalizer.clone();
+        self.chat_inner(
+            ChatCtx { label: "formalizer", client: &client, model: &config.formalizer_model, config: &config, context_id },
+            messages,
+            |content| !content.trim().is_empty(),
+        ).await
     }
 
-    #[instrument(skip_all, fields(model = %self.config.splitter_model))]
-    pub async fn chat_splitter(&self, messages: Vec<Message>, piece: Option<u64>) -> Result<String> {
-        self.chat_inner("splitter", &self.splitter_client, &self.config.splitter_model, messages, piece, |content| {
-            !content.trim().is_empty()
-        }).await
+    #[instrument(skip_all, fields(model))]
+    pub async fn chat_fixer(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
+        let config = self.ensure_current();
+        tracing::Span::current().record("model", &config.fixer_model);
+        let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).fixer.clone();
+        self.chat_inner(
+            ChatCtx { label: "fixer", client: &client, model: &config.fixer_model, config: &config, context_id },
+            messages,
+            |content| !content.trim().is_empty(),
+        ).await
     }
 
-    #[instrument(skip_all, fields(model = %self.config.splitting_judge_model))]
-    pub async fn chat_splitting_judge(&self, messages: Vec<Message>, piece: Option<u64>) -> Result<String> {
-        self.chat_inner("splitting_judge", &self.splitting_judge_client, &self.config.splitting_judge_model, messages, piece, |content| {
-            let upper = content.trim().to_uppercase();
-            let trimmed = upper.trim_start_matches(|c: char| !c.is_alphabetic());
-            trimmed.starts_with("REASONABLE") || trimmed.starts_with("RETRY")
-        }).await
+    #[instrument(skip_all, fields(model))]
+    pub async fn chat_judge(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
+        let config = self.ensure_current();
+        tracing::Span::current().record("model", &config.judge_model);
+        let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).judge.clone();
+        self.chat_inner(
+            ChatCtx { label: "judge", client: &client, model: &config.judge_model, config: &config, context_id },
+            messages,
+            |content| {
+                let upper = content.trim().to_uppercase();
+                let trimmed = upper.trim_start_matches(|c: char| !c.is_alphabetic());
+                trimmed.starts_with("REASONABLE") || trimmed.starts_with("RETRY")
+            },
+        ).await
     }
 
-    #[instrument(skip_all, fields(model = %self.config.analyzer_model))]
-    pub async fn chat_analyzer(&self, messages: Vec<Message>, piece: Option<u64>) -> Result<String> {
-        self.chat_inner("analyzer", &self.analyzer_client, &self.config.analyzer_model, messages, piece, |content| {
-            !content.trim().is_empty()
-        }).await
+    #[instrument(skip_all, fields(model))]
+    pub async fn chat_splitter(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
+        let config = self.ensure_current();
+        tracing::Span::current().record("model", &config.splitter_model);
+        let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).splitter.clone();
+        self.chat_inner(
+            ChatCtx { label: "splitter", client: &client, model: &config.splitter_model, config: &config, context_id },
+            messages,
+            |content| !content.trim().is_empty(),
+        ).await
+    }
+
+    #[instrument(skip_all, fields(model))]
+    pub async fn chat_splitting_judge(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
+        let config = self.ensure_current();
+        tracing::Span::current().record("model", &config.splitting_judge_model);
+        let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).splitting_judge.clone();
+        self.chat_inner(
+            ChatCtx { label: "splitting_judge", client: &client, model: &config.splitting_judge_model, config: &config, context_id },
+            messages,
+            |content| {
+                let upper = content.trim().to_uppercase();
+                let trimmed = upper.trim_start_matches(|c: char| !c.is_alphabetic());
+                trimmed.starts_with("REASONABLE") || trimmed.starts_with("RETRY")
+            },
+        ).await
+    }
+
+    #[instrument(skip_all, fields(model))]
+    pub async fn chat_analyzer(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
+        let config = self.ensure_current();
+        tracing::Span::current().record("model", &config.analyzer_model);
+        let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).analyzer.clone();
+        self.chat_inner(
+            ChatCtx { label: "analyzer", client: &client, model: &config.analyzer_model, config: &config, context_id },
+            messages,
+            |content| !content.trim().is_empty(),
+        ).await
     }
 
     async fn chat_inner(
         &self,
-        label: &str,
-        client: &async_openai::Client<async_openai::config::OpenAIConfig>,
-        model: &str,
+        ctx: ChatCtx<'_>,
         messages: Vec<Message>,
-        piece: Option<u64>,
         is_partial_valid: impl Fn(&str) -> bool,
     ) -> Result<String> {
-        let pid = piece;
+        let ChatCtx { label, client, model, config, context_id } = ctx;
         for msg in &messages {
             if !matches!(msg.role, Role::System) {
                 let prefixed: String = msg.content.lines().map(|l| format!(">\t{l}")).collect::<Vec<_>>().join("\n");
-                debug!(%label, piece_id = pid, role = ?msg.role, content = %prefixed, "LLM message");
+                debug!(%label, %context_id, role = ?msg.role, content = %prefixed, "LLM message");
             }
         }
 
@@ -444,10 +590,10 @@ impl LlmClient {
         let handler = StreamHandler::new(
             client,
             label,
-            Duration::from_millis(self.config.stream_timeout_ms),
-            self.config.max_stream_retries,
-            self.config.service_tier.clone(),
-            pid,
+            Duration::from_millis(config.stream_timeout_ms),
+            config.max_stream_retries,
+            config.service_tier.clone(),
+            context_id,
         );
 
         handler.run(model, request_messages, &is_partial_valid).await
@@ -479,15 +625,30 @@ pub fn assistant_message(content: &str) -> Message {
 }
 
 #[async_trait]
-impl IOProvider<LlmRequest, String> for LlmClient {
-    async fn invoke(&self, input: LlmRequest) -> Result<String> {
-        match input.role {
-            LlmRole::Splitter => self.chat_splitter(input.messages, input.piece_id).await,
-            LlmRole::SplittingJudge => self.chat_splitting_judge(input.messages, input.piece_id).await,
-            LlmRole::Formalizer => self.chat_formalizer(input.messages, input.piece_id).await,
-            LlmRole::Fixer => self.chat_fixer(input.messages, input.piece_id).await,
-            LlmRole::Judge => self.chat_judge(input.messages, input.piece_id).await,
-            LlmRole::Analyzer => self.chat_analyzer(input.messages, input.piece_id).await,
+impl IOProvider<LlmRequest, WithContext<String>> for LlmClient {
+    async fn invoke(&self, input: LlmRequest) -> Result<WithContext<String>> {
+        let LlmRequest { role, messages, context_id } = input;
+
+        loop {
+            let result = match role {
+                LlmRole::Splitter => self.chat_splitter(messages.clone(), &context_id).await,
+                LlmRole::SplittingJudge => self.chat_splitting_judge(messages.clone(), &context_id).await,
+                LlmRole::Formalizer => self.chat_formalizer(messages.clone(), &context_id).await,
+                LlmRole::Fixer => self.chat_fixer(messages.clone(), &context_id).await,
+                LlmRole::Judge => self.chat_judge(messages.clone(), &context_id).await,
+                LlmRole::Analyzer => self.chat_analyzer(messages.clone(), &context_id).await,
+            };
+
+            match result {
+                Ok(content) => return Ok(WithContext { value: content, context_id }),
+                Err(e) => {
+                    if let Some(gate) = &self.error_gate {
+                        gate.report_and_wait(&format!("{e:#}")).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
         }
     }
 }

@@ -1,11 +1,16 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use deductive_check::machine;
 use deductive_check::piece_manager::DefaultDeductivePieceManager;
+use refactor_check_core::config_update::{AppConfig, ServiceTierArg, UpdateArgs};
+use refactor_check_core::error_gate::ErrorShell;
 use refactor_check_core::llm::LlmConfig;
-use refactor_check_core::smt::Z3Solver;
+use refactor_check_core::live_config::LiveConfig;
+use refactor_check_core::smt::{SolverConfig, Z3Solver};
 
 #[derive(Parser)]
 #[command(name = "deductive-check", about = "Deductive verification of code correctness")]
@@ -55,12 +60,91 @@ struct Cli {
     #[arg(long, default_value = "5")]
     max_stream_retries: u32,
 
-    #[arg(long, default_value = "priority")]
-    service_tier: String,
+    #[arg(long, value_enum, default_value = "priority")]
+    service_tier: ServiceTierArg,
+
+    #[arg(long, default_value = "opencode")]
+    agent_binary: String,
+
+    #[arg(long, default_value = "run")]
+    agent_subcommand: String,
+
+    #[arg(long, default_value_t = true)]
+    agent_skip_permissions: bool,
+
+    #[arg(long, default_value = "")]
+    agent_model: String,
+
+    #[arg(long)]
+    agent_dir: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn resolve_api_key(key: Option<&str>) -> String {
+    let raw = key
+        .map(|s| {
+            let path = std::path::Path::new(s);
+            if path.is_file() {
+                std::fs::read_to_string(path)
+                    .unwrap_or_else(|e| {
+                        eprintln!("Warning: could not read api key file {s}: {e}");
+                        s.to_string()
+                    })
+                    .trim()
+                    .to_string()
+            } else {
+                s.to_string()
+            }
+        })
+        .unwrap_or_else(|| std::env::var("OPENROUTER_API_KEY").unwrap_or_default());
+    raw
+}
+
+impl From<&Cli> for LlmConfig {
+    fn from(cli: &Cli) -> Self {
+        let api_model = cli.api_model.clone();
+        let judge_model = cli.judge_model.clone().unwrap_or_else(|| api_model.clone());
+        LlmConfig {
+            api_key: resolve_api_key(cli.api_key.as_deref()),
+            judge_api_key: None,
+            formalizer_api_key: None,
+            fixer_api_key: None,
+            splitter_api_key: None,
+            splitting_judge_api_key: None,
+            analyzer_api_key: None,
+            api_base: cli.api_base.clone(),
+            formalizer_model: cli.formalizer_model.clone().unwrap_or_else(|| api_model.clone()),
+            fixer_model: cli.fixer_model.clone().unwrap_or_else(|| api_model.clone()),
+            judge_model: judge_model.clone(),
+            splitting_judge_model: judge_model,
+            splitter_model: cli.splitter_model.clone().unwrap_or_else(|| api_model.clone()),
+            analyzer_model: cli.analyzer_model.clone().unwrap_or(api_model),
+            stream_timeout_ms: cli.stream_timeout_ms,
+            max_stream_retries: cli.max_stream_retries,
+            service_tier: cli.service_tier.clone().into(),
+        }
+    }
+}
+
+impl From<&Cli> for SolverConfig {
+    fn from(cli: &Cli) -> Self {
+        SolverConfig {
+            solver_path: cli.solver_path.clone(),
+            solver_args: cli.solver_args.clone(),
+            timeout_secs: cli.solver_timeout_secs,
+        }
+    }
+}
+
+impl From<&Cli> for AppConfig {
+    fn from(cli: &Cli) -> Self {
+        AppConfig {
+            llm: LlmConfig::from(cli),
+            solver: SolverConfig::from(cli),
+        }
+    }
+}
+
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -70,95 +154,91 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let api_key = cli.api_key.unwrap_or_else(|| {
-        std::env::var("OPENROUTER_API_KEY").unwrap_or_default()
-    });
+    let config_live = Arc::new(LiveConfig::new(AppConfig::from(&cli)));
 
-    let service_tier = match cli.service_tier.to_lowercase().as_str() {
-        "auto" => refactor_check_core::llm::ServiceTier::Auto,
-        "default" => refactor_check_core::llm::ServiceTier::Default,
-        "flex" => refactor_check_core::llm::ServiceTier::Flex,
-        "scale" => refactor_check_core::llm::ServiceTier::Scale,
-        "priority" => refactor_check_core::llm::ServiceTier::Priority,
-        other => anyhow::bail!(
-            "Invalid service tier: {other}. Valid values: auto, default, flex, scale, priority"
-        ),
-    };
+    let project = cli.project.clone();
+    let agent_binary = cli.agent_binary.clone();
+    let agent_subcommand = cli.agent_subcommand.clone();
+    let agent_model = cli.agent_model.clone();
+    let agent_dir = cli.agent_dir.clone();
+    let agent_skip_permissions = cli.agent_skip_permissions;
 
-    let api_model = cli.api_model;
-    let judge_model = cli.judge_model.unwrap_or_else(|| api_model.clone());
+    let shell = ErrorShell::with_base_plugins()
+        .with_config::<UpdateArgs, AppConfig>("set", config_live.clone())?;
 
-    let llm_config = LlmConfig {
-        api_key,
-        judge_api_key: None,
-        formalizer_api_key: None,
-        fixer_api_key: None,
-        splitter_api_key: None,
-        splitting_judge_api_key: None,
-        analyzer_api_key: None,
-        api_base: cli.api_base,
-        formalizer_model: cli.formalizer_model.unwrap_or_else(|| api_model.clone()),
-        fixer_model: cli.fixer_model.unwrap_or_else(|| api_model.clone()),
-        judge_model: judge_model.clone(),
-        splitting_judge_model: judge_model,
-        splitter_model: cli.splitter_model.unwrap_or_else(|| api_model.clone()),
-        analyzer_model: cli.analyzer_model.unwrap_or_else(|| api_model.clone()),
-        stream_timeout_ms: cli.stream_timeout_ms,
-        max_stream_retries: cli.max_stream_retries,
-        service_tier,
-    };
+    shell.run(
+        move |gate| async move {
+            let mut llm = refactor_check_core::llm::LlmClient::with_live_config(config_live.clone());
+            let mut solver = Z3Solver::with_live_config(config_live.clone());
+            if let Some(g) = &gate {
+                llm = llm.with_error_gate(g.clone());
+                solver = solver.with_error_gate(g.clone());
+            }
 
-    let llm = refactor_check_core::llm::LlmClient::new(llm_config);
-    let solver = Z3Solver::with_config(
-        cli.solver_path.clone(),
-        cli.solver_args,
-        std::time::Duration::from_secs(cli.solver_timeout_secs),
-    );
+            let rust_analyzer = deductive_check::provider::CliRustAnalyzerProvider::new(project.clone())?;
+            let git = deductive_check::provider::CliGitProvider::new();
+            let filesystem = deductive_check::provider::LocalFileSystemProvider::new();
+            let python = deductive_check::provider::ProcessPythonProvider::new();
 
-    let rust_analyzer = deductive_check::provider::CliRustAnalyzerProvider::new(cli.rust_analyzer_path);
-    let git = deductive_check::provider::CliGitProvider::new();
-    let filesystem = deductive_check::provider::LocalFileSystemProvider::new();
-    let python = deductive_check::provider::ProcessPythonProvider::new();
+            let mut agent_args = vec![agent_subcommand];
+            if agent_skip_permissions {
+                agent_args.push("--dangerously-skip-permissions".to_string());
+            }
+            if !agent_model.is_empty() {
+                agent_args.push("--model".to_string());
+                agent_args.push(agent_model);
+            }
+            if let Some(ref dir) = agent_dir {
+                agent_args.push("--dir".to_string());
+                agent_args.push(dir.clone());
+            }
+            let mut agent = deductive_check::provider::CliAgentProvider::new(agent_binary, agent_args);
+            if let Some(g) = &gate {
+                agent = agent.with_error_gate(g.clone());
+            }
 
-    let providers = deductive_check::provider::Providers {
-        llm: &llm,
-        solver: &solver,
-        rust_analyzer: &rust_analyzer,
-        git: &git,
-        filesystem: &filesystem,
-        python: &python,
-    };
+            let providers = deductive_check::provider::Providers {
+                llm: &llm,
+                solver: &solver,
+                rust_analyzer: &rust_analyzer,
+                git: &git,
+                filesystem: &filesystem,
+                python: &python,
+                agent: &agent,
+            };
 
-    let pm = DefaultDeductivePieceManager::new();
+            let pm = DefaultDeductivePieceManager::new();
 
-    let result = machine::run(&cli.project, &providers, &pm).await?;
+            let result = machine::run(&project, &providers, &pm).await?;
 
-    println!("\n{}", "=" .repeat(60));
-    println!("Deductive verification complete");
-    println!("  Total pieces:  {}", result.total_pieces);
-    println!("  Closed:       {}", result.closed_pieces.len());
-    println!("  Unverified:   {}", result.unverified_pieces.len());
-    println!("  Bug reports:  {}", result.bug_reports.len());
-    println!("{}", "=" .repeat(60));
+            println!("\n{}", "=" .repeat(60));
+            println!("Deductive verification complete");
+            println!("  Total pieces:  {}", result.total_pieces);
+            println!("  Closed:       {}", result.closed_pieces.len());
+            println!("  Unverified:   {}", result.unverified_pieces.len());
+            println!("  Bug reports:  {}", result.bug_reports.len());
+            println!("{}", "=" .repeat(60));
 
-    if !result.unverified_pieces.is_empty() {
-        println!("\nUnverified pieces:");
-        for p in &result.unverified_pieces {
-            println!("  {}:{}-{}: {}",
-                p.file.display(),
-                p.start_line,
-                p.end_line,
-                p.function_id.display_name(),
-            );
-        }
-    }
+            if !result.unverified_pieces.is_empty() {
+                println!("\nUnverified pieces:");
+                for p in &result.unverified_pieces {
+                    println!("  {}:{}-{}: {}",
+                        p.file.display(),
+                        p.start_line,
+                        p.end_line,
+                        p.function_id.display_name(),
+                    );
+                }
+            }
 
-    if !result.bug_reports.is_empty() {
-        println!("\nBug reports:");
-        for b in &result.bug_reports {
-            println!("  {}: {}", b.file.display(), b.description);
-        }
-    }
+            if !result.bug_reports.is_empty() {
+                println!("\nBug reports:");
+                for b in &result.bug_reports {
+                    println!("  {}: {}", b.file.display(), b.description);
+                }
+            }
 
-    Ok(())
+            Ok(())
+        },
+    )
 }

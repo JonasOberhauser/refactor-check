@@ -1,9 +1,9 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use async_trait::async_trait;
 
-use refactor_check::provider::{IOProvider, LlmRequest, LlmRole, SolverRequest};
+use async_trait::async_trait;
+use refactor_check::provider::{IOProvider, LlmRequest, LlmRole, SolverRequest, WithContext};
 use refactor_check::smt::{SolverOutcome, SolverResult};
 
 pub struct SequenceLlm {
@@ -65,9 +65,10 @@ impl SequenceLlm {
 }
 
 #[async_trait]
-impl IOProvider<LlmRequest, String> for SequenceLlm {
-    async fn invoke(&self, input: LlmRequest) -> Result<String> {
-        let queue = match input.role {
+impl IOProvider<LlmRequest, WithContext<String>> for SequenceLlm {
+    async fn invoke(&self, input: LlmRequest) -> Result<WithContext<String>> {
+        let LlmRequest { role, context_id, .. } = input;
+        let queue = match role {
             LlmRole::Splitter => &self.splitter,
             LlmRole::SplittingJudge => &self.splitting_judge,
             LlmRole::Formalizer => &self.formalizer,
@@ -77,9 +78,9 @@ impl IOProvider<LlmRequest, String> for SequenceLlm {
         };
         let mut responses = queue.lock().expect("lock poisoned");
         if responses.is_empty() {
-            anyhow::bail!("SequenceLlm: no more {:?} responses available", input.role);
+            anyhow::bail!("SequenceLlm: no more {:?} responses available", role);
         }
-        Ok(responses.remove(0))
+        Ok(WithContext { value: responses.remove(0), context_id })
     }
 }
 
@@ -88,12 +89,16 @@ pub struct FakeSolver {
 }
 
 #[async_trait]
-impl IOProvider<SolverRequest, SolverResult> for FakeSolver {
-    async fn invoke(&self, _input: SolverRequest) -> Result<SolverResult> {
-        Ok(SolverResult {
-            outcome: self.outcome.clone(),
-            stdout: format!("{:?}", self.outcome).to_lowercase(),
-            stderr: String::new(),
+impl IOProvider<SolverRequest, WithContext<SolverResult>> for FakeSolver {
+    async fn invoke(&self, input: SolverRequest) -> Result<WithContext<SolverResult>> {
+        let SolverRequest { context_id, .. } = input;
+        Ok(WithContext {
+            value: SolverResult {
+                outcome: self.outcome.clone(),
+                stdout: format!("{:?}", self.outcome).to_lowercase(),
+                stderr: String::new(),
+            },
+            context_id,
         })
     }
 }

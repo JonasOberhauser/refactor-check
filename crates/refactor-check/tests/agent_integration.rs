@@ -1,9 +1,10 @@
 use std::sync::{Arc, Mutex};
 
+
 use async_trait::async_trait;
 use refactor_check::consts::JUDGE_REASONABLE;
 use refactor_check::machine;
-use refactor_check::provider::{IOProvider, SolverRequest};
+use refactor_check::provider::{IOProvider, SolverRequest, WithContext};
 use refactor_check::smt::{SolverOutcome, SolverResult};
 use refactor_check_test_helpers::sequence::{FakeSolver, SequenceLlm};
 use refactor_check_test_helpers::test_pm;
@@ -174,23 +175,25 @@ async fn test_split_timeout_resplit() {
         call_count: Arc<Mutex<usize>>,
     }
     #[async_trait]
-    impl IOProvider<SolverRequest, SolverResult> for ToggleSolver {
-        async fn invoke(&self, _input: SolverRequest) -> anyhow::Result<SolverResult> {
+    impl IOProvider<SolverRequest, WithContext<SolverResult>> for ToggleSolver {
+        async fn invoke(&self, input: SolverRequest) -> anyhow::Result<WithContext<SolverResult>> {
+            let SolverRequest { context_id, .. } = input;
             let mut count = self.call_count.lock().expect("lock poisoned");
             *count += 1;
-            if *count == 1 {
-                Ok(SolverResult {
+            let value = if *count == 1 {
+                SolverResult {
                     outcome: SolverOutcome::Unknown,
                     stdout: "unknown".to_string(),
                     stderr: String::new(),
-                })
+                }
             } else {
-                Ok(SolverResult {
+                SolverResult {
                     outcome: SolverOutcome::Unsat,
                     stdout: "unsat".to_string(),
                     stderr: String::new(),
-                })
-            }
+                }
+            };
+            Ok(WithContext { value, context_id })
         }
     }
 

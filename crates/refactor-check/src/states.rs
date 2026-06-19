@@ -88,7 +88,7 @@ pub struct VerifiedPiece {
 
 impl std::fmt::Display for VerifiedPiece {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{} #{}] {} ({:?})", self.piece.label(), self.piece.id(), self.formula, self.outcome)
+        write!(f, "[{} {}] {} ({:?})", self.piece.label(), self.piece.ctx_display(), self.formula, self.outcome)
     }
 }
 

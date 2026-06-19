@@ -1,19 +1,46 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use refactor_check_core::context_id::ContextId;
 use tracing::{info, warn};
 
 use crate::code_piece::{ArcCodePiece, FunctionId};
 use crate::formula::FormulaSource;
 use crate::phase::{CodePiecePhase, FormulaPhase};
 use crate::prompts;
-use crate::provider::{FileSystemRequest, GitRequest, PythonRequest, RustAnalyzerRequest, RustAnalyzerResponse, Providers, FunctionInfo};
+use crate::provider::{FileSystemRequest, GitRequest, PythonRequest, RustAnalyzerRequest, RustAnalyzerResponse, Providers, FunctionInfo, AgentRequest};
 use crate::result::{BugReport, ClosedPiece, UnverifiedPiece, VerificationResult};
 use refactor_check_core::provider::{LlmRequest, LlmRole, SolverRequest};
 use refactor_check_core::smt::SolverOutcome;
+
+fn solver_outcome_to_formula_phase(outcome: &SolverOutcome) -> FormulaPhase {
+    match outcome {
+        SolverOutcome::Unsat => FormulaPhase::ClosedUnsat,
+        SolverOutcome::Sat => FormulaPhase::ClosedSat,
+        SolverOutcome::Unknown => FormulaPhase::ClosedUnknown,
+        SolverOutcome::Error(_) => FormulaPhase::Fix,
+    }
+}
+
+fn unverified_from_piece(
+    piece: &crate::code_piece::DeductiveCodePiece,
+    sat_models: Vec<String>,
+    unknown_formulas: Vec<String>,
+    elaboration: String,
+) -> UnverifiedPiece {
+    UnverifiedPiece {
+        file: piece.file().clone(),
+        function_id: piece.function_id().clone(),
+        start_line: piece.start_line(),
+        end_line: piece.end_line(),
+        sat_models,
+        unknown_formulas,
+        elaboration,
+    }
+}
 
 pub enum Step {
     State(Box<dyn AlgorithmState>),
@@ -76,12 +103,14 @@ impl AlgorithmState for Initializer {
                 path: self.project_path.clone(),
             })
             .await?;
-        let all_rust_files: Vec<PathBuf> = resp
+        let mut all_rust_files: Vec<PathBuf> = resp
             .output
             .lines()
             .filter(|l| !l.is_empty())
             .map(PathBuf::from)
             .collect();
+        let mut seen = std::collections::HashSet::new();
+        all_rust_files.retain(|f| seen.insert(f.clone()));
 
         Ok(Step::State(Box::new(FunctionLister {
             project_path: self.project_path,
@@ -122,19 +151,34 @@ impl AlgorithmState for FunctionLister {
         let target_file_set: HashSet<PathBuf> = self.files.iter().cloned().collect();
         let filtered = filter_connected_functions(functions, &target_file_set);
 
+        let mut seen_fns = std::collections::HashSet::new();
+        let guaranteed: Vec<FunctionInfo> = filtered
+            .into_iter()
+            .filter(|fi| fi.has_guarantees)
+            .filter(|fi| seen_fns.insert((fi.id.file.clone(), fi.id.name.clone(), fi.id.line)))
+            .collect();
+
         let function_map: std::collections::HashMap<PathBuf, Vec<FunctionId>> = {
             let mut map: std::collections::HashMap<PathBuf, Vec<FunctionId>> = std::collections::HashMap::new();
-            for fi in &filtered {
+            for fi in &guaranteed {
                 map.entry(fi.id.file.clone()).or_default().push(fi.id.clone());
             }
             map
         };
+
+        let mut function_docs: HashMap<FunctionId, String> = HashMap::new();
+        for fi in &guaranteed {
+            if !fi.docs.is_empty() {
+                function_docs.insert(fi.id.clone(), fi.docs.clone());
+            }
+        }
 
         Ok(Step::State(Box::new(FunctionAnalyzer {
             project_path: self.project_path,
             verification_dir: self.verification_dir,
             branch_name: self.branch_name,
             functions: function_map,
+            function_docs,
         })))
     }
 }
@@ -201,6 +245,7 @@ pub struct FunctionAnalyzer {
     verification_dir: PathBuf,
     branch_name: String,
     functions: std::collections::HashMap<PathBuf, Vec<FunctionId>>,
+    function_docs: HashMap<FunctionId, String>,
 }
 
 #[async_trait]
@@ -210,31 +255,40 @@ impl AlgorithmState for FunctionAnalyzer {
         providers: &Providers<'_>,
         _pm: &dyn crate::piece_manager::DeductivePieceManager,
     ) -> Result<Step> {
-        let mut function_bodies: Vec<(PathBuf, FunctionId, String)> = Vec::new();
-
+        let mut futs = Vec::new();
         for (file, function_ids) in &self.functions {
             for fid in function_ids {
-                let resp = providers
-                    .rust_analyzer
-                    .invoke(RustAnalyzerRequest::GetFunctionCode {
-                        function_id: fid.clone(),
-                    })
-                    .await?;
-
-                let body = match resp {
-                    RustAnalyzerResponse::FunctionCode(code) => code,
-                    _ => anyhow::bail!("Expected FunctionCode from rust-analyzer"),
+                let file = file.clone();
+                let fid = fid.clone();
+                let fut = async {
+                    let resp = providers
+                        .rust_analyzer
+                        .invoke(RustAnalyzerRequest::GetFunctionCode {
+                            function_id: fid.clone(),
+                        })
+                        .await?;
+                    let body = match resp {
+                        RustAnalyzerResponse::FunctionCode(code) => code,
+                        _ => anyhow::bail!("Expected FunctionCode from rust-analyzer"),
+                    };
+                    Ok::<_, anyhow::Error>((file, fid, body))
                 };
-
-                function_bodies.push((file.clone(), fid.clone(), body));
+                futs.push(fut);
             }
         }
+
+        let function_bodies: Vec<(PathBuf, FunctionId, String)> = futures::future::try_join_all(futs)
+            .await?
+            .into_iter()
+            .filter(|(_, _, body)| !body.trim().is_empty())
+            .collect();
 
         Ok(Step::State(Box::new(Splitter {
             project_path: self.project_path,
             verification_dir: self.verification_dir,
             branch_name: self.branch_name,
             function_bodies,
+            function_docs: self.function_docs,
         })))
     }
 }
@@ -244,6 +298,7 @@ pub struct Splitter {
     verification_dir: PathBuf,
     branch_name: String,
     function_bodies: Vec<(PathBuf, FunctionId, String)>,
+    function_docs: HashMap<FunctionId, String>,
 }
 
 #[async_trait]
@@ -253,12 +308,20 @@ impl AlgorithmState for Splitter {
         providers: &Providers<'_>,
         pm: &dyn crate::piece_manager::DeductivePieceManager,
     ) -> Result<Step> {
-        let mut code_pieces: Vec<ArcCodePiece> = Vec::new();
+        let root_ctx = ContextId::root();
+        let futs: Vec<_> = self.function_bodies.iter().map(|(file, fid, body)| {
+            split_function(providers, pm, root_ctx, file, fid, body)
+        }).collect();
 
-        for (file, fid, body) in &self.function_bodies {
-            let pieces = split_function(providers, pm, file, fid, body).await?;
-            code_pieces.extend(pieces);
+        let results = futures::future::try_join_all(futs).await?;
+
+        for (_file, fid, _body) in &self.function_bodies {
+            if let Some(docs) = self.function_docs.get(fid) {
+                pm.store_function_docs(fid.clone(), docs.clone());
+            }
         }
+
+        let code_pieces: Vec<(ArcCodePiece, ContextId)> = results.into_iter().flatten().collect();
 
         Ok(Step::State(Box::new(FullFormalizer {
             project_path: self.project_path,
@@ -273,130 +336,112 @@ impl AlgorithmState for Splitter {
 async fn split_function(
     providers: &Providers<'_>,
     pm: &dyn crate::piece_manager::DeductivePieceManager,
+    root_ctx: &ContextId,
     file: &Path,
     fid: &FunctionId,
     body: &str,
-) -> Result<Vec<ArcCodePiece>> {
-    let messages = vec![
-        crate::llm::system_message(&prompts::splitter_system()),
-        crate::llm::user_message(&prompts::splitter_user(
-            &file.display().to_string(),
-            &fid.display_name(),
-            body,
-            fid.line,
-        )),
-    ];
-
-    let response = providers
-        .llm
-        .invoke(LlmRequest {
-            role: LlmRole::Splitter,
-            messages,
-            piece_id: None,
-        })
-        .await?;
-
-    let pieces = parse_split_pieces(response, file, fid, body, pm);
-    if pieces.is_empty() {
-        let piece = pm.new_piece(
-            file.to_path_buf(),
-            fid.clone(),
-            fid.line,
-            fid.line + body.lines().count() as u32,
-            body.to_string(),
-        );
-        return Ok(vec![Arc::new(piece)]);
+) -> Result<Vec<(ArcCodePiece, ContextId)>> {
+    if body.trim().is_empty() {
+        warn!(file = %file.display(), function = %fid.display_name(), "skipping function with empty body");
+        return Ok(Vec::new());
     }
 
-    Ok(pieces)
+    let mut func_ctx = root_ctx.new_child();
+
+    let max_attempts = 3;
+    for attempt in 0..max_attempts {
+        let messages = vec![
+            crate::llm::system_message(&prompts::splitter_system()),
+            crate::llm::user_message(&prompts::splitter_user(
+                &file.display().to_string(),
+                &fid.display_name(),
+                body,
+                fid.line,
+            )),
+        ];
+
+        let resp = providers
+            .llm
+            .invoke(LlmRequest {
+                role: LlmRole::Splitter,
+                messages,
+                context_id: Box::new(func_ctx),
+            })
+            .await?;
+        func_ctx = *resp.context_id;
+        let response = resp.value;
+
+        let pieces = parse_split_pieces(response, &func_ctx, file, fid, body, pm);
+        let valid_pieces: Vec<(ArcCodePiece, ContextId)> = pieces
+            .into_iter()
+            .filter(|(p, _)| !p.code().trim().is_empty())
+            .collect();
+
+        if !valid_pieces.is_empty() {
+            return Ok(valid_pieces);
+        }
+        warn!(attempt = attempt + 1, %func_ctx, function = %fid.display_name(), "splitter produced no valid pieces, retrying");
+    }
+
+    let (piece, ctx) = pm.new_piece(
+        &func_ctx,
+        file.to_path_buf(),
+        fid.clone(),
+        fid.line,
+        fid.line + body.lines().count() as u32,
+        body.to_string(),
+    );
+    Ok(vec![(Arc::new(piece), ctx)])
 }
 
 fn parse_split_pieces(
     response: String,
+    func_ctx: &ContextId,
     file: &Path,
     fid: &FunctionId,
     original_body: &str,
     pm: &dyn crate::piece_manager::DeductivePieceManager,
-) -> Vec<ArcCodePiece> {
+) -> Vec<(ArcCodePiece, ContextId)> {
+    let blocks = crate::formula::extract_fenced_blocks(&response);
+
     let mut pieces = Vec::new();
-    let mut current_lines: Vec<String> = Vec::new();
-    let mut current_start: u32 = fid.line;
-
-    for line in response.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("// Start point:") {
-            if !current_lines.is_empty() {
-                let code = current_lines.join("\n");
-                let end_line = current_start + code.lines().count() as u32;
-                let piece = pm.new_piece(
-                    file.to_path_buf(),
-                    fid.clone(),
-                    current_start,
-                    end_line,
-                    code,
-                );
-                pieces.push(Arc::new(piece));
-                current_lines.clear();
-            }
-            if let Some(pos_str) = trimmed.strip_prefix("// Start point:") {
-                if let Some(lineno) = parse_line_number(pos_str.trim()) {
-                    current_start = lineno;
-                }
-            }
+    for (_, content) in blocks {
+        let code = content.trim().to_string();
+        if code.is_empty() {
             continue;
         }
-        if trimmed.starts_with("// Handover point:") {
-            current_lines.push(line.to_string());
-            continue;
-        }
-        if !trimmed.is_empty() || !current_lines.is_empty() {
-            current_lines.push(line.to_string());
-        }
-    }
-
-    if !current_lines.is_empty() {
-        let code = current_lines.join("\n");
-        let end_line = current_start + code.lines().count() as u32;
-        let piece = pm.new_piece(
+        let end_line = fid.line + code.lines().count() as u32;
+        let (piece, ctx) = pm.new_piece(
+            func_ctx,
             file.to_path_buf(),
             fid.clone(),
-            current_start,
+            fid.line,
             end_line,
             code,
         );
-        pieces.push(Arc::new(piece));
+        pieces.push((Arc::new(piece), ctx));
     }
 
     if pieces.is_empty() {
-        let piece = pm.new_piece(
+        let (piece, ctx) = pm.new_piece(
+            func_ctx,
             file.to_path_buf(),
             fid.clone(),
             fid.line,
             fid.line + original_body.lines().count() as u32,
             original_body.to_string(),
         );
-        pieces.push(Arc::new(piece));
+        pieces.push((Arc::new(piece), ctx));
     }
 
     pieces
-}
-
-fn parse_line_number(s: &str) -> Option<u32> {
-    let s = s.trim();
-    if let Some(idx) = s.rfind(':') {
-        s[idx + 1..].parse().ok()
-    } else if let Some(idx) = s.rfind(' ') {
-        s[idx + 1..].parse().ok()
-    } else {
-        s.parse().ok()
-    }
 }
 
 pub struct FullFormalizer {
     project_path: PathBuf,
     verification_dir: PathBuf,
     branch_name: String,
-    pieces: Vec<ArcCodePiece>,
+    pieces: Vec<(ArcCodePiece, ContextId)>,
     #[allow(dead_code)]
     iteration: usize,
 }
@@ -404,7 +449,7 @@ pub struct FullFormalizer {
 impl FullFormalizer {
     fn functions_count(&self) -> usize {
         let mut seen = HashSet::new();
-        for piece in &self.pieces {
+        for (piece, _) in &self.pieces {
             seen.insert(piece.function_id().name.clone());
         }
         seen.len()
@@ -420,6 +465,7 @@ async fn gather_context(
     piece: &ArcCodePiece,
     providers: &Providers<'_>,
 ) -> Result<String> {
+    assert!(piece.type_invariant());
     let resp = providers
         .rust_analyzer
         .invoke(RustAnalyzerRequest::GetCalledFunctions {
@@ -432,24 +478,36 @@ async fn gather_context(
         _ => Vec::new(),
     };
 
-    let mut context_parts = Vec::new();
-
-    for cf in &called_functions {
-        let called_name = cf.name.clone();
-        let resp = providers
-            .rust_analyzer
-            .invoke(RustAnalyzerRequest::GetCalledFunctionCode {
-                function_id: piece.function_id().clone(),
-                called_name: called_name.clone(),
-            })
-            .await?;
-
-        if let RustAnalyzerResponse::CalledFunctionCode(called_code) = resp {
-            if !called_code.starts_with("// Could not find") {
-                context_parts.push(format!("--- {} ---\n{}", called_name, called_code));
+    let futs: Vec<_> = called_functions.into_iter().map(|cf| {
+        async move {
+            let name = cf.name.clone();
+            let resp = providers
+                .rust_analyzer
+                .invoke(RustAnalyzerRequest::GetCalledFunctionCode {
+                    called: cf,
+                })
+                .await?;
+            let result = match resp {
+                RustAnalyzerResponse::CalledFunctionCode(r) => r,
+                _ => return Ok::<_, anyhow::Error>(None),
+            };
+            if result.code.starts_with("// Could not find") {
+                return Ok(None);
             }
+            let docs_section = if result.docs.is_empty() {
+                String::new()
+            } else {
+                format!("\nDocumentation:\n{}", result.docs)
+            };
+            Ok(Some(format!("--- {} ---\n{}{}", name, result.code, docs_section)))
         }
-    }
+    }).collect();
+
+    let context_parts: Vec<String> = futures::future::try_join_all(futs)
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
 
     if context_parts.is_empty() {
         Ok("(no called functions found)".to_string())
@@ -460,10 +518,13 @@ async fn gather_context(
 
 async fn formalize_piece(
     piece: &ArcCodePiece,
+    ctx: ContextId,
     context: &str,
     elaboration: &str,
+    docs_section: &str,
     providers: &Providers<'_>,
-) -> Result<String> {
+) -> Result<(String, ContextId)> {
+    assert!(piece.type_invariant());
     let messages = vec![
         crate::llm::system_message(&prompts::formalizer_system()),
         crate::llm::user_message(&prompts::formalizer_user(
@@ -471,236 +532,303 @@ async fn formalize_piece(
             context,
             None,
             elaboration,
+            docs_section,
         )),
     ];
 
-    let response = providers
+    let resp = providers
         .llm
         .invoke(LlmRequest {
-            role: LlmRole::Formalizer,
-            messages,
-            piece_id: Some(piece.id()),
-        })
-        .await?;
+                role: LlmRole::Formalizer,
+                messages,
+                context_id: Box::new(ctx),
+            })
+            .await?;
 
-    Ok(response)
+    Ok((resp.value, *resp.context_id))
 }
 
 async fn check_formula(
     formula_content: &str,
     formula_source: &FormulaSource,
-    piece_id: u64,
+    piece_ctx: &ContextId,
     providers: &Providers<'_>,
     pm: &dyn crate::piece_manager::DeductivePieceManager,
     iteration: u32,
-) -> Result<(crate::formula::Formula, SolverOutcome)> {
-    let formula = pm.new_formula(piece_id, formula_content.to_string(), formula_source.clone(), iteration);
+) -> Result<(crate::formula::Formula, ContextId, SolverOutcome, String)> {
+    let (formula, fctx) = pm.new_formula(piece_ctx, formula_content.to_string(), formula_source.clone(), iteration);
 
-    pm.advance_formula(formula.id(), Some(FormulaPhase::Open), FormulaPhase::Check);
+    pm.advance_formula(&fctx, Some(FormulaPhase::Open), FormulaPhase::Check);
 
-    let smt_content = match formula_source {
-        FormulaSource::PyZ3 => {
-            let resp = providers
-                .python
-                .invoke(PythonRequest {
-                    script: formula_content.to_string(),
-                })
-                .await?;
-
-            if resp.smtlib.is_empty() {
-                warn!(piece_id, formula_id = formula.id(), "Python script produced no SMT output");
-                pm.advance_formula(formula.id(), Some(FormulaPhase::Check), FormulaPhase::ClosedUnknown);
-                return Ok((formula, SolverOutcome::Unknown));
-            }
-            resp.smtlib
+    let smt_content = match translate_formula(formula_content, formula_source, &fctx, providers).await {
+        Ok(smt) => smt,
+        Err(_) => {
+            warn!(%fctx, "Formula translation failed");
+            pm.advance_formula(&fctx, Some(FormulaPhase::Check), FormulaPhase::ClosedUnknown);
+            return Ok((formula, fctx, SolverOutcome::Unknown, String::new()));
         }
-        FormulaSource::SmtLib => formula_content.to_string(),
     };
 
-    let result = providers
+    let resp = providers
         .solver
-        .invoke(SolverRequest {
-            formula: smt_content.clone(),
-            piece_id: Some(piece_id),
-        })
-        .await?;
+            .invoke(SolverRequest {
+                formula: smt_content.clone(),
+                context_id: Box::new(fctx),
+            })
+            .await?;
+    let fctx = *resp.context_id;
+    let result = resp.value;
 
     let outcome = result.outcome.clone();
 
-    match &outcome {
-        SolverOutcome::Unsat => {
-            pm.advance_formula(formula.id(), Some(FormulaPhase::Check), FormulaPhase::ClosedUnsat);
-        }
-        SolverOutcome::Sat => {
-            pm.advance_formula(formula.id(), Some(FormulaPhase::Check), FormulaPhase::ClosedSat);
-        }
-        SolverOutcome::Unknown => {
-            pm.advance_formula(formula.id(), Some(FormulaPhase::Check), FormulaPhase::ClosedUnknown);
-        }
-        SolverOutcome::Error(_) => {
-            pm.advance_formula(formula.id(), Some(FormulaPhase::Check), FormulaPhase::Fix);
-        }
-    }
+    pm.advance_formula(&fctx, Some(FormulaPhase::Check), solver_outcome_to_formula_phase(&outcome));
 
-    Ok((formula, outcome))
+    Ok((formula, fctx, outcome, smt_content))
 }
 
 async fn fix_formula(
     formula_content: &str,
     error: &str,
-    piece_id: u64,
+    fctx: ContextId,
     providers: &Providers<'_>,
-) -> Result<String> {
+) -> Result<(String, ContextId)> {
     let messages = vec![
         crate::llm::system_message(&prompts::fixer_system()),
         crate::llm::user_message(&prompts::fixer_user(formula_content, error)),
     ];
 
-    let response = providers
+    let resp = providers
         .llm
         .invoke(LlmRequest {
-            role: LlmRole::Fixer,
-            messages,
-            piece_id: Some(piece_id),
-        })
-        .await?;
+                role: LlmRole::Fixer,
+                messages,
+                context_id: Box::new(fctx),
+            })
+            .await?;
 
-    Ok(response)
+    Ok((resp.value, *resp.context_id))
+}
+
+async fn translate_formula(
+    content: &str,
+    source: &FormulaSource,
+    formula_ctx: &ContextId,
+    providers: &Providers<'_>,
+) -> Result<String> {
+    match source {
+        FormulaSource::SmtLib => Ok(content.to_string()),
+        FormulaSource::PyZ3 => {
+            let resp = providers
+                .python
+                .invoke(PythonRequest {
+                    script: content.to_string(),
+                })
+                .await?;
+
+            if resp.smtlib.is_empty() {
+                anyhow::bail!("Python script produced no SMT output for ctx {}", formula_ctx);
+            }
+            Ok(resp.smtlib)
+        }
+    }
+}
+
+async fn check_and_fix_formula(
+    ef: &crate::formula::ExtractedFormula,
+    piece_ctx: &ContextId,
+    providers: &Providers<'_>,
+    pm: &dyn crate::piece_manager::DeductivePieceManager,
+    iteration: u32,
+    max_fix_attempts: usize,
+) -> Result<(crate::formula::Formula, SolverOutcome, ContextId)> {
+    let (mut formula, mut fctx, mut outcome, mut current_smt) = check_formula(
+        &ef.content, &ef.source, piece_ctx, providers, pm, iteration,
+    ).await?;
+
+    let mut fix_attempts = 0;
+    while matches!(outcome, SolverOutcome::Error(_)) && fix_attempts < max_fix_attempts {
+        let error_msg = match &outcome {
+            SolverOutcome::Error(e) => e.clone(),
+            _ => unreachable!(),
+        };
+
+        info!(%fctx, fix_attempts, "Attempting to fix formula");
+
+        let (fixed_response, fctx2) = fix_formula(&current_smt, &error_msg, fctx, providers).await?;
+        fctx = fctx2;
+        let fixed_extracted = crate::formula::extract_formulas_from_response(&fixed_response);
+
+        if fixed_extracted.is_empty() {
+            fix_attempts += 1;
+            continue;
+        }
+
+        let fixed_ef = &fixed_extracted[0];
+
+        let translated = match translate_formula(&fixed_ef.content, &fixed_ef.source, &fctx, providers).await {
+            Ok(smt) => smt,
+            Err(e) => {
+                warn!(%fctx, fix_attempts, error = %e, "Failed to translate fixed formula");
+                fix_attempts += 1;
+                continue;
+            }
+        };
+
+        pm.expect_formula_phase_and_set(
+            &fctx,
+            &[FormulaPhase::Fix],
+            FormulaPhase::Check,
+        );
+
+        let resp = providers
+            .solver
+            .invoke(SolverRequest {
+                formula: translated.clone(),
+                context_id: Box::new(fctx),
+            })
+            .await?;
+        fctx = *resp.context_id;
+        let fixed_result = resp.value;
+
+        outcome = fixed_result.outcome.clone();
+        current_smt = translated;
+        formula = crate::formula::Formula::new(
+            fixed_ef.content.clone(),
+            fixed_ef.source.clone(),
+            formula.iteration(),
+        );
+        fix_attempts += 1;
+
+        pm.advance_formula(&fctx, Some(FormulaPhase::Check), solver_outcome_to_formula_phase(&outcome));
+        if !matches!(outcome, SolverOutcome::Error(_)) {
+            break;
+        }
+    }
+
+    Ok((formula, outcome, fctx))
 }
 
 async fn judge_piece(
     piece: &ArcCodePiece,
+    ctx: ContextId,
     formulas_summary: &str,
+    docs_section: &str,
     providers: &Providers<'_>,
-) -> Result<String> {
-    let messages = vec![
+) -> Result<(String, ContextId)> {
+    assert!(piece.type_invariant());
+    let mut messages = vec![
         crate::llm::system_message(&prompts::judge_system()),
-        crate::llm::user_message(&prompts::judge_user(piece.code(), formulas_summary)),
+        crate::llm::user_message(&prompts::judge_user(piece.code(), formulas_summary, docs_section)),
     ];
 
-    let response = providers
+    let resp = providers
         .llm
         .invoke(LlmRequest {
-            role: LlmRole::Judge,
-            messages,
-            piece_id: Some(piece.id()),
-        })
-        .await?;
+                role: LlmRole::Judge,
+                messages: messages.clone(),
+                context_id: Box::new(ctx),
+            })
+            .await?;
 
-    Ok(response)
+    let mut response = resp.value;
+    let mut ctx = *resp.context_id;
+
+    for retry in 0..crate::consts::MAX_JUDGE_CLARIFICATION_RETRIES {
+        let trimmed_upper = response.trim().to_uppercase();
+        if trimmed_upper == crate::consts::JUDGE_REASONABLE {
+            break;
+        }
+        if !trimmed_upper.contains(crate::consts::JUDGE_REASONABLE) {
+            break;
+        }
+
+        info!(%ctx, retry, "Judge response contained REASONABLE with extra text, retrying for clarification");
+
+        messages.push(crate::llm::assistant_message(&response));
+        messages.push(crate::llm::user_message(&prompts::judge_retry(&response)));
+
+        let resp = providers
+            .llm
+            .invoke(LlmRequest {
+                role: LlmRole::Judge,
+                messages: messages.clone(),
+                context_id: Box::new(ctx),
+            })
+            .await?;
+
+        response = resp.value;
+        ctx = *resp.context_id;
+    }
+
+    Ok((response, ctx))
 }
 
 async fn process_piece(
     piece: &ArcCodePiece,
+    mut ctx: ContextId,
     providers: &Providers<'_>,
     pm: &dyn crate::piece_manager::DeductivePieceManager,
     verification_dir: &Path,
 ) -> Result<PieceOutcome> {
-    let piece_id = piece.id();
+    assert!(piece.type_invariant());
 
-    pm.expect_piece_phase_and_set(piece_id, &[CodePiecePhase::Open], CodePiecePhase::GetContext);
+    pm.expect_piece_phase_and_set(&ctx, &[CodePiecePhase::Open], CodePiecePhase::GetContext);
 
     let context = gather_context(piece, providers).await?;
-    info!(piece_id, "Gathered context for piece");
+    info!(%ctx, "Gathered context for piece");
+
+    let own_docs = pm.get_function_docs(piece.function_id());
+    let own_docs_section = if own_docs.is_empty() {
+        String::new()
+    } else {
+        format!("\nFunction documentation:\n{}\nNote: Safety comments describe preconditions that must hold when the function is called. Treat them as verification preconditions.", own_docs)
+    };
 
     let mut elaboration = String::new();
     let max_judge_attempts = crate::consts::MAX_JUDGE_ATTEMPTS;
-    let max_fix_attempts = crate::consts::MAX_INSIST_ATTEMPTS;
 
     for judge_attempt in 0..max_judge_attempts {
-        pm.advance_piece(piece_id, Some(CodePiecePhase::GetContext), CodePiecePhase::Formalizer);
+        pm.advance_piece(&ctx, Some(CodePiecePhase::GetContext), CodePiecePhase::Formalizer);
 
-        let formalizer_response = formalize_piece(piece, &context, &elaboration, providers).await?;
-        info!(piece_id, judge_attempt, "Formalizer responded");
+        let (formalizer_response, ctx2) = formalize_piece(piece, ctx, &context, &elaboration, &own_docs_section, providers).await?;
+        ctx = ctx2;
+        info!(%ctx, judge_attempt, "Formalizer responded");
 
         let extracted = crate::formula::extract_formulas_from_response(&formalizer_response);
         if extracted.is_empty() {
-            warn!(piece_id, judge_attempt, "No formulas extracted from formalizer response");
+            warn!(%ctx, judge_attempt, "No formulas extracted from formalizer response");
             elaboration = format!("Attempt {}: No formulas were extracted. Please produce SMT-LIB2 formulas in ```smt2 code blocks.\n{}", judge_attempt + 1, elaboration);
-            pm.advance_piece(piece_id, Some(CodePiecePhase::Formalizer), CodePiecePhase::GetContext);
+            pm.advance_piece(&ctx, Some(CodePiecePhase::Formalizer), CodePiecePhase::GetContext);
             continue;
         }
 
-        pm.advance_piece(piece_id, Some(CodePiecePhase::Formalizer), CodePiecePhase::Check);
+        pm.advance_piece(&ctx, Some(CodePiecePhase::Formalizer), CodePiecePhase::Check);
+
+        let max_fix_attempts = crate::consts::MAX_INSIST_ATTEMPTS;
+        let iteration = judge_attempt as u32;
+
+        let formula_futs: Vec<_> = extracted.iter().map(|ef| {
+            check_and_fix_formula(
+                ef, &ctx, providers, pm,
+                iteration, max_fix_attempts,
+            )
+        }).collect();
+
+        let formula_results = futures::future::join_all(formula_futs).await;
 
         let mut unsat_count = 0usize;
         let mut sat_models = Vec::new();
         let mut unknown_formulas = Vec::new();
         let mut formula_summaries = Vec::new();
 
-        for ef in &extracted {
-            let iteration = judge_attempt as u32;
-            let (formula, mut outcome) = check_formula(
-                &ef.content,
-                &ef.source,
-                piece_id,
-                providers,
-                pm,
-                iteration,
-            )
-            .await?;
-
-            let mut fix_attempts = 0;
-            while matches!(outcome, SolverOutcome::Error(_)) && fix_attempts < max_fix_attempts {
-                let error_msg = match &outcome {
-                    SolverOutcome::Error(e) => e.clone(),
-                    _ => unreachable!(),
-                };
-
-                info!(piece_id, formula_id = formula.id(), fix_attempts, "Attempting to fix formula");
-
-                pm.expect_formula_phase_and_set(
-                    formula.id(),
-                    &[FormulaPhase::Fix],
-                    FormulaPhase::Check,
-                );
-
-                let fixed_response = fix_formula(&ef.content, &error_msg, piece_id, providers).await?;
-                let fixed_extracted = crate::formula::extract_formulas_from_response(&fixed_response);
-
-                if fixed_extracted.is_empty() {
-                    fix_attempts += 1;
-                    continue;
-                }
-
-                let fixed_ef = &fixed_extracted[0];
-
-                let fixed_result = providers
-                    .solver
-                    .invoke(SolverRequest {
-                        formula: fixed_ef.content.clone(),
-                        piece_id: Some(piece_id),
-                    })
-                    .await?;
-
-                outcome = fixed_result.outcome.clone();
-                fix_attempts += 1;
-
-                match &outcome {
-                    SolverOutcome::Unsat => {
-                        pm.advance_formula(formula.id(), Some(FormulaPhase::Check), FormulaPhase::ClosedUnsat);
-                        break;
-                    }
-                    SolverOutcome::Sat => {
-                        pm.advance_formula(formula.id(), Some(FormulaPhase::Check), FormulaPhase::ClosedSat);
-                        break;
-                    }
-                    SolverOutcome::Unknown => {
-                        pm.advance_formula(formula.id(), Some(FormulaPhase::Check), FormulaPhase::ClosedUnknown);
-                        break;
-                    }
-                    SolverOutcome::Error(_) => {
-                        pm.advance_formula(formula.id(), Some(FormulaPhase::Check), FormulaPhase::Fix);
-                        continue;
-                    }
-                }
-            }
-
+        for (ef, result) in extracted.iter().zip(formula_results) {
+            let (formula, outcome, fctx) = result?;
             let summary = format!(
-                "Formula {} (iteration {}): {:?}",
-                formula.id(),
+                "Formula {} (iteration {}): {:?}\n```\n{}\n```",
+                fctx,
                 formula.iteration(),
-                outcome
+                outcome,
+                formula.content(),
             );
             formula_summaries.push(summary);
 
@@ -723,7 +851,7 @@ async fn process_piece(
                 FormulaSource::SmtLib => "smt2",
                 FormulaSource::PyZ3 => "py",
             };
-            let filename = format!("piece{}_formula{}_iter{}_attempt{}.{}", piece_id, formula.id(), iteration, judge_attempt, ext);
+            let filename = format!("ctx{}_iter{}_attempt{}.{}", fctx, iteration, judge_attempt, ext);
             let _ = providers
                 .filesystem
                 .invoke(FileSystemRequest {
@@ -743,27 +871,29 @@ async fn process_piece(
         let _ = providers
             .git
             .invoke(GitRequest::Commit {
-                message: format!("Add formulas for piece {} (iteration {})", piece_id, judge_attempt),
+                message: format!("Add formulas for ctx {} (iteration {})", ctx, judge_attempt),
             })
             .await;
 
-        pm.advance_piece(piece_id, Some(CodePiecePhase::Check), CodePiecePhase::Judge);
+        pm.advance_piece(&ctx, Some(CodePiecePhase::Check), CodePiecePhase::Judge);
 
         let formulas_summary = formula_summaries.join("\n");
-        let judge_response = judge_piece(piece, &formulas_summary, providers).await?;
-        info!(piece_id, judge_attempt, "Judge responded");
+        let (judge_response, ctx2) = judge_piece(piece, ctx, &formulas_summary, &own_docs_section, providers).await?;
+        ctx = ctx2;
+        info!(%ctx, judge_attempt, "Judge responded");
 
-        let is_reasonable = judge_response
-            .trim()
-            .to_uppercase()
-            .starts_with(crate::consts::JUDGE_REASONABLE);
+        let trimmed_upper = judge_response.trim().to_uppercase();
+        let is_exact = trimmed_upper == crate::consts::JUDGE_REASONABLE;
+        let is_reasonable = is_exact || trimmed_upper.contains(crate::consts::JUDGE_REASONABLE);
+        if is_reasonable && !is_exact {
+            warn!(%ctx, "Judge response accepted via contains fallback (not exact match)");
+        }
 
         if is_reasonable {
             if sat_models.is_empty() && unknown_formulas.is_empty() {
-                pm.advance_piece(piece_id, Some(CodePiecePhase::Judge), CodePiecePhase::Closed);
+                pm.advance_piece(&ctx, Some(CodePiecePhase::Judge), CodePiecePhase::Closed);
                 return Ok(PieceOutcome {
                     closed: Some(ClosedPiece {
-                        piece_id,
                         file: piece.file().clone(),
                         function_id: piece.function_id().clone(),
                         start_line: piece.start_line(),
@@ -775,19 +905,15 @@ async fn process_piece(
                     unverified: None,
                 });
             }
-            pm.advance_piece(piece_id, Some(CodePiecePhase::Judge), CodePiecePhase::Unverified);
+            pm.advance_piece(&ctx, Some(CodePiecePhase::Judge), CodePiecePhase::Unverified);
             return Ok(PieceOutcome {
                 closed: None,
-                unverified: Some(UnverifiedPiece {
-                    piece_id,
-                    file: piece.file().clone(),
-                    function_id: piece.function_id().clone(),
-                    start_line: piece.start_line(),
-                    end_line: piece.end_line(),
+                unverified: Some(unverified_from_piece(
+                    piece,
                     sat_models,
                     unknown_formulas,
-                    elaboration: judge_response,
-                }),
+                    judge_response,
+                )),
             });
         }
 
@@ -797,22 +923,22 @@ async fn process_piece(
             judge_response,
             elaboration
         );
-        pm.advance_piece(piece_id, Some(CodePiecePhase::Judge), CodePiecePhase::GetContext);
+        if judge_attempt + 1 < max_judge_attempts {
+            pm.advance_piece(&ctx, Some(CodePiecePhase::Judge), CodePiecePhase::GetContext);
+        } else {
+            break;
+        }
     }
 
-    pm.advance_piece(piece_id, Some(CodePiecePhase::Judge), CodePiecePhase::Unverified);
+    pm.advance_piece(&ctx, Some(CodePiecePhase::Judge), CodePiecePhase::Unverified);
     Ok(PieceOutcome {
         closed: None,
-        unverified: Some(UnverifiedPiece {
-            piece_id,
-            file: piece.file().clone(),
-            function_id: piece.function_id().clone(),
-            start_line: piece.start_line(),
-            end_line: piece.end_line(),
-            sat_models: Vec::new(),
-            unknown_formulas: Vec::new(),
-            elaboration: format!("Exhausted {} judge attempts. Last elaboration: {}", max_judge_attempts, elaboration),
-        }),
+        unverified: Some(unverified_from_piece(
+            piece,
+            Vec::new(),
+            Vec::new(),
+            format!("Exhausted {} judge attempts. Last elaboration: {}", max_judge_attempts, elaboration),
+        )),
     })
 }
 
@@ -823,11 +949,32 @@ impl AlgorithmState for FullFormalizer {
         providers: &Providers<'_>,
         pm: &dyn crate::piece_manager::DeductivePieceManager,
     ) -> Result<Step> {
+        let functions_count = self.functions_count();
+        let total_pieces = self.pieces.len();
+        let verification_dir = self.verification_dir;
+        let project_path = self.project_path;
+        let branch_name = self.branch_name;
+
+        let mut pieces_only = Vec::new();
+        let mut ctxs_only = Vec::new();
+        for (piece, ctx) in self.pieces {
+            pieces_only.push(piece);
+            ctxs_only.push(ctx);
+        }
+
+        let ctx_labels: Vec<String> = ctxs_only.iter().map(|c| c.to_string()).collect();
+
+        let futs: Vec<_> = pieces_only.iter().zip(ctxs_only).map(|(piece, ctx)| {
+            process_piece(piece, ctx, providers, pm, &verification_dir)
+        }).collect();
+
+        let results = futures::future::join_all(futs).await;
+
         let mut closed_pieces = Vec::new();
         let mut unverified_pieces = Vec::new();
 
-        for piece in &self.pieces {
-            match process_piece(piece, providers, pm, &self.verification_dir).await {
+        for (i, result) in results.into_iter().enumerate() {
+            match result {
                 Ok(outcome) => {
                     if let Some(cp) = outcome.closed {
                         closed_pieces.push(cp);
@@ -837,17 +984,14 @@ impl AlgorithmState for FullFormalizer {
                     }
                 }
                 Err(e) => {
-                    warn!(piece_id = piece.id(), error = %e, "Failed to process piece");
-                    unverified_pieces.push(UnverifiedPiece {
-                        piece_id: piece.id(),
-                        file: piece.file().clone(),
-                        function_id: piece.function_id().clone(),
-                        start_line: piece.start_line(),
-                        end_line: piece.end_line(),
-                        sat_models: Vec::new(),
-                        unknown_formulas: Vec::new(),
-                        elaboration: format!("Processing error: {}", e),
-                    });
+                    let piece = &pieces_only[i];
+                    warn!(ctx = %ctx_labels[i], error = %e, "Failed to process piece");
+                    unverified_pieces.push(unverified_from_piece(
+                        piece,
+                        Vec::new(),
+                        Vec::new(),
+                        format!("Processing error: {}", e),
+                    ));
                 }
             }
         }
@@ -857,14 +1001,14 @@ impl AlgorithmState for FullFormalizer {
                 closed_pieces,
                 unverified_pieces,
                 bug_reports: Vec::new(),
-                total_functions: self.functions_count(),
-                total_pieces: self.pieces.len(),
+                total_functions: functions_count,
+                total_pieces,
             }))
         } else {
             Ok(Step::State(Box::new(ProblemAnalyzer {
-                project_path: self.project_path,
-                verification_dir: self.verification_dir,
-                branch_name: self.branch_name,
+                project_path,
+                verification_dir,
+                branch_name,
                 closed: closed_pieces,
                 unverified: unverified_pieces,
                 recheck_files: Vec::new(),
@@ -891,38 +1035,153 @@ impl AlgorithmState for ProblemAnalyzer {
         providers: &Providers<'_>,
         _pm: &dyn crate::piece_manager::DeductivePieceManager,
     ) -> Result<Step> {
+        info!(
+            unverified_count = self.unverified.len(),
+            closed_count = self.closed.len(),
+            "ProblemAnalyzer starting",
+        );
+
         let mut bug_reports = Vec::new();
         let mut remaining_unverified = Vec::new();
         let mut files_to_recheck = self.recheck_files.clone();
 
-        for piece in &self.unverified {
-            let messages = vec![
-                crate::llm::system_message(&prompts::analyzer_system()),
-                crate::llm::user_message(&prompts::analyzer_user(
-                    &format!("{}:{}", piece.file.display(), piece.start_line),
-                    &piece.sat_models,
-                    &piece.unknown_formulas,
-                    &piece.elaboration,
-                )),
-            ];
+        let base_commit = if self.base_commit.is_empty() {
+            info!("ProblemAnalyzer: getting current commit hash");
+            let resp = providers.git.invoke(GitRequest::CurrentCommitHash).await?;
+            resp.output.trim().to_string()
+        } else {
+            self.base_commit.clone()
+        };
+        info!(%base_commit, "ProblemAnalyzer: base commit resolved");
 
-            let response = providers
-                .llm
-                .invoke(LlmRequest {
-                    role: LlmRole::Analyzer,
-                    messages,
-                    piece_id: Some(piece.piece_id),
+        for (i, piece) in self.unverified.iter().enumerate() {
+            info!(
+                piece_index = i,
+                total = self.unverified.len(),
+                file = %piece.file.display(),
+                function = %piece.function_id.display_name(),
+                "ProblemAnalyzer: processing unverified piece",
+            );
+            let source = match providers
+                .rust_analyzer
+                .invoke(RustAnalyzerRequest::GetFileContent {
+                    path: piece.file.clone(),
+                })
+                .await
+            {
+                Ok(RustAnalyzerResponse::FileContent(s)) if !s.is_empty() => s,
+                Ok(_) => {
+                    warn!(file = %piece.file.display(), "Source file not found in VFS (empty content)");
+                    bug_reports.push(BugReport {
+                        file: piece.file.clone(),
+                        function_id: piece.function_id.clone(),
+                        description: format!(
+                            "{} at {}:{}-{}: could not read source file (not in VFS)",
+                            piece.function_id.display_name(),
+                            piece.file.display(),
+                            piece.start_line,
+                            piece.end_line,
+                        ),
+                    });
+                    continue;
+                }
+                Err(e) => {
+                    warn!(file = %piece.file.display(), error = %e, "Failed to get source file from rust-analyzer");
+                    bug_reports.push(BugReport {
+                        file: piece.file.clone(),
+                        function_id: piece.function_id.clone(),
+                        description: format!(
+                            "{} at {}:{}-{}: rust-analyzer error: {}",
+                            piece.function_id.display_name(),
+                            piece.file.display(),
+                            piece.start_line,
+                            piece.end_line,
+                            e,
+                        ),
+                    });
+                    continue;
+                }
+            };
+
+            let sat = if piece.sat_models.is_empty() {
+                "None".to_string()
+            } else {
+                piece.sat_models.iter().map(|m| format!("```\n{}\n```", m)).collect::<Vec<_>>().join("\n\n")
+            };
+            let unknown = if piece.unknown_formulas.is_empty() {
+                "None".to_string()
+            } else {
+                piece.unknown_formulas.iter().map(|f| format!("```\n{}\n```", f)).collect::<Vec<_>>().join("\n\n")
+            };
+
+            let prompt = format!(
+                r#"You are a verification problem analyzer. A verification attempt for a Rust function has failed. Your job is to fix the problem by editing the source code.
+
+## Failed verification
+
+Function: {} at {}:{}
+SAT models (counterexamples): {}
+Unknown formulas: {}
+Previous elaboration: {}
+
+## Source file ({})
+
+```
+{}
+```
+
+## Instructions
+
+Analyze why verification failed and fix the problem. Common patterns:
+- Function f fails because it cannot satisfy the precondition of callee g, but that precondition stems from an overly strict precondition in g's callee h. Fix: relax h's preconditions.
+- A loop invariant is too strong because a helper has unnecessarily strict preconditions. Fix: weaken the helper's preconditions.
+- An assertion fails because a caller passes values violating an undocumented assumption. Fix: add a precondition to the caller.
+- The formula is too complex. Fix: add `/* VERIFICATION HINT: ... */` comments explaining how to simplify.
+
+You may edit ANY function in this file, not just the failing one. After fixing, respond with exactly one of:
+- "RETRY" if you made code changes that should be re-verified
+- A bug description if you found a genuine bug in the code (not just a verification issue)
+
+If you respond RETRY, make sure to commit your changes first."#,
+                piece.function_id.display_name(),
+                piece.file.display(),
+                piece.start_line,
+                sat,
+                unknown,
+                piece.elaboration,
+                piece.file.display(),
+                source,
+            );
+
+            let agent_resp = providers
+                .agent
+                .invoke(AgentRequest {
+                    prompt,
+                    working_directory: self.project_path.clone(),
+                    files_to_read: vec![piece.file.clone()],
                 })
                 .await?;
 
-            let is_retry = response.trim().to_uppercase().starts_with("RETRY");
+            let response = agent_resp.stdout.trim().to_string();
 
-            if is_retry {
+            if response.to_uppercase().starts_with("RETRY") {
+                let _ = providers
+                    .git
+                    .invoke(GitRequest::AddFiles {
+                        paths: vec![piece.file.clone()],
+                    })
+                    .await;
+                let _ = providers
+                    .git
+                    .invoke(GitRequest::Commit {
+                        message: format!("Agent fix for {} at {}:{}", piece.function_id.display_name(), piece.file.display(), piece.start_line),
+                    })
+                    .await;
+
                 remaining_unverified.push(piece.clone());
                 files_to_recheck.push(piece.file.clone());
             } else {
                 bug_reports.push(BugReport {
-                    piece_id: piece.piece_id,
                     file: piece.file.clone(),
                     function_id: piece.function_id.clone(),
                     description: format!(
@@ -946,13 +1205,6 @@ impl AlgorithmState for ProblemAnalyzer {
                 total_pieces: 0,
             }))
         } else {
-            let base_commit = if self.base_commit.is_empty() {
-                let resp = providers.git.invoke(GitRequest::CurrentCommitHash).await?;
-                resp.output.trim().to_string()
-            } else {
-                self.base_commit.clone()
-            };
-
             Ok(Step::State(Box::new(Restarter {
                 project_path: self.project_path,
                 verification_dir: self.verification_dir,

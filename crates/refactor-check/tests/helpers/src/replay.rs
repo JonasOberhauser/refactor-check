@@ -1,19 +1,18 @@
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use async_trait::async_trait;
 
-use refactor_check::provider::{IOProvider, LlmRequest, LlmRole, SolverRequest};
+use async_trait::async_trait;
+use refactor_check::provider::{IOProvider, LlmRequest, LlmRole, SolverRequest, WithContext};
 use refactor_check::smt::{SolverOutcome, SolverResult};
 
 pub struct LogReplayLlm {
-    formalizer: Arc<Mutex<HashMap<u64, Vec<String>>>>,
-    fixer: Arc<Mutex<HashMap<u64, Vec<String>>>>,
-    judge: Arc<Mutex<HashMap<u64, Vec<String>>>>,
+    formalizer: Arc<Mutex<Vec<String>>>,
+    fixer: Arc<Mutex<Vec<String>>>,
+    judge: Arc<Mutex<Vec<String>>>,
     splitter: Arc<Mutex<Vec<String>>>,
     splitting_judge: Arc<Mutex<Vec<String>>>,
-    analyzer: Arc<Mutex<HashMap<u64, Vec<String>>>>,
+    analyzer: Arc<Mutex<Vec<String>>>,
 }
 
 impl Default for LogReplayLlm {
@@ -25,13 +24,21 @@ impl Default for LogReplayLlm {
 impl LogReplayLlm {
     pub fn new() -> Self {
         Self {
-            formalizer: Arc::new(Mutex::new(HashMap::new())),
-            fixer: Arc::new(Mutex::new(HashMap::new())),
-            judge: Arc::new(Mutex::new(HashMap::new())),
+            formalizer: Arc::new(Mutex::new(Vec::new())),
+            fixer: Arc::new(Mutex::new(Vec::new())),
+            judge: Arc::new(Mutex::new(Vec::new())),
             splitter: Arc::new(Mutex::new(Vec::new())),
             splitting_judge: Arc::new(Mutex::new(Vec::new())),
-            analyzer: Arc::new(Mutex::new(HashMap::new())),
+            analyzer: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn take_first(q: &Arc<Mutex<Vec<String>>>, role: &str) -> Result<String> {
+        let mut q = q.lock().expect("lock poisoned");
+        if q.is_empty() {
+            anyhow::bail!("LogReplayLlm: no more {role} responses");
+        }
+        Ok(q.remove(0))
     }
 
     pub fn splitter_push(&mut self, response: String) {
@@ -42,88 +49,41 @@ impl LogReplayLlm {
         self.splitting_judge.lock().unwrap().push(response);
     }
 
-    pub fn formalizer_push(&mut self, piece_id: u64, response: String) {
-        self.formalizer.lock().unwrap().entry(piece_id).or_default().push(response);
+    pub fn formalizer_push(&mut self, response: String) {
+        self.formalizer.lock().unwrap().push(response);
     }
 
-    pub fn fixer_push(&mut self, piece_id: u64, response: String) {
-        self.fixer.lock().unwrap().entry(piece_id).or_default().push(response);
+    pub fn fixer_push(&mut self, response: String) {
+        self.fixer.lock().unwrap().push(response);
     }
 
-    pub fn judge_push(&mut self, piece_id: u64, response: String) {
-        self.judge.lock().unwrap().entry(piece_id).or_default().push(response);
+    pub fn judge_push(&mut self, response: String) {
+        self.judge.lock().unwrap().push(response);
     }
 
-    pub fn analyzer_push(&mut self, piece_id: u64, response: String) {
-        self.analyzer.lock().unwrap().entry(piece_id).or_default().push(response);
+    pub fn analyzer_push(&mut self, response: String) {
+        self.analyzer.lock().unwrap().push(response);
     }
 }
 
 #[async_trait]
-impl IOProvider<LlmRequest, String> for LogReplayLlm {
-    async fn invoke(&self, input: LlmRequest) -> Result<String> {
-        let piece_id = input.piece_id;
-        match input.role {
-            LlmRole::Splitter => {
-                let mut q = self.splitter.lock().expect("lock poisoned");
-                if q.is_empty() {
-                    anyhow::bail!("LogReplayLlm: no more Splitter responses");
-                }
-                Ok(q.remove(0))
-            }
-            LlmRole::SplittingJudge => {
-                let mut q = self.splitting_judge.lock().expect("lock poisoned");
-                if q.is_empty() {
-                    anyhow::bail!("LogReplayLlm: no more SplittingJudge responses");
-                }
-                Ok(q.remove(0))
-            }
-            LlmRole::Formalizer => {
-                let pid = piece_id.expect("formalizer must have piece_id");
-                let mut map = self.formalizer.lock().expect("lock poisoned");
-                let q = map.get_mut(&pid)
-                    .ok_or_else(|| anyhow::anyhow!("LogReplayLlm: no Formalizer entry for piece_id={pid}"))?;
-                if q.is_empty() {
-                    anyhow::bail!("LogReplayLlm: no more Formalizer responses for piece_id={pid}");
-                }
-                Ok(q.remove(0))
-            }
-            LlmRole::Fixer => {
-                let pid = piece_id.expect("fixer must have piece_id");
-                let mut map = self.fixer.lock().expect("lock poisoned");
-                let q = map.get_mut(&pid)
-                    .ok_or_else(|| anyhow::anyhow!("LogReplayLlm: no Fixer entry for piece_id={pid}"))?;
-                if q.is_empty() {
-                    anyhow::bail!("LogReplayLlm: no more Fixer responses for piece_id={pid}");
-                }
-                Ok(q.remove(0))
-            }
-            LlmRole::Judge => {
-                let pid = piece_id.expect("judge must have piece_id");
-                let mut map = self.judge.lock().expect("lock poisoned");
-                let q = map.get_mut(&pid)
-                    .ok_or_else(|| anyhow::anyhow!("LogReplayLlm: no Judge entry for piece_id={pid}"))?;
-                if q.is_empty() {
-                    anyhow::bail!("LogReplayLlm: no more Judge responses for piece_id={pid}");
-                }
-                Ok(q.remove(0))
-            }
-            LlmRole::Analyzer => {
-                let pid = piece_id.unwrap_or(0);
-                let mut map = self.analyzer.lock().expect("lock poisoned");
-                let q = map.get_mut(&pid)
-                    .ok_or_else(|| anyhow::anyhow!("LogReplayLlm: no Analyzer entry for piece_id={pid}"))?;
-                if q.is_empty() {
-                    anyhow::bail!("LogReplayLlm: no more Analyzer responses for piece_id={pid}");
-                }
-                Ok(q.remove(0))
-            }
-        }
+impl IOProvider<LlmRequest, WithContext<String>> for LogReplayLlm {
+    async fn invoke(&self, input: LlmRequest) -> Result<WithContext<String>> {
+        let LlmRequest { role, context_id, .. } = input;
+        let value = match role {
+            LlmRole::Splitter => Self::take_first(&self.splitter, "Splitter")?,
+            LlmRole::SplittingJudge => Self::take_first(&self.splitting_judge, "SplittingJudge")?,
+            LlmRole::Formalizer => Self::take_first(&self.formalizer, "Formalizer")?,
+            LlmRole::Fixer => Self::take_first(&self.fixer, "Fixer")?,
+            LlmRole::Judge => Self::take_first(&self.judge, "Judge")?,
+            LlmRole::Analyzer => Self::take_first(&self.analyzer, "Analyzer")?,
+        };
+        Ok(WithContext { value, context_id })
     }
 }
 
 pub struct LogReplaySolver {
-    runs: Arc<Mutex<HashMap<u64, Vec<SolverResult>>>>,
+    runs: Arc<Mutex<Vec<SolverResult>>>,
 }
 
 impl Default for LogReplaySolver {
@@ -135,12 +95,12 @@ impl Default for LogReplaySolver {
 impl LogReplaySolver {
     pub fn new() -> Self {
         Self {
-            runs: Arc::new(Mutex::new(HashMap::new())),
+            runs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    pub fn push(&mut self, piece_id: u64, outcome: SolverOutcome, stdout: String, stderr: String) {
-        self.runs.lock().unwrap().entry(piece_id).or_default().push(SolverResult {
+    pub fn push(&mut self, outcome: SolverOutcome, stdout: String, stderr: String) {
+        self.runs.lock().unwrap().push(SolverResult {
             outcome,
             stdout,
             stderr,
@@ -149,15 +109,13 @@ impl LogReplaySolver {
 }
 
 #[async_trait]
-impl IOProvider<SolverRequest, SolverResult> for LogReplaySolver {
-    async fn invoke(&self, input: SolverRequest) -> Result<SolverResult> {
-        let pid = input.piece_id.expect("solver must have piece_id");
-        let mut map = self.runs.lock().expect("lock poisoned");
-        let q = map.get_mut(&pid)
-            .ok_or_else(|| anyhow::anyhow!("LogReplaySolver: no entry for piece_id={pid}"))?;
+impl IOProvider<SolverRequest, WithContext<SolverResult>> for LogReplaySolver {
+    async fn invoke(&self, input: SolverRequest) -> Result<WithContext<SolverResult>> {
+        let SolverRequest { context_id, .. } = input;
+        let mut q = self.runs.lock().expect("lock poisoned");
         if q.is_empty() {
-            anyhow::bail!("LogReplaySolver: no more outcomes for piece_id={pid}");
+            anyhow::bail!("LogReplaySolver: no more outcomes");
         }
-        Ok(q.remove(0))
+        Ok(WithContext { value: q.remove(0), context_id })
     }
 }

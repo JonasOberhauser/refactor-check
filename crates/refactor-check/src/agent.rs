@@ -1,28 +1,29 @@
 use anyhow::Context;
+use std::sync::Arc;
 
-use crate::llm::{LlmConfig, Message, system_message, user_message};
+use refactor_check_core::config_update::AppConfig;
+use crate::error_gate::ErrorGate;
+use crate::llm::{Message, system_message, user_message};
+use crate::live_config::LiveConfig;
 use crate::piece_manager::DefaultPieceManager;
 use crate::smt::SolverOutcome;
 
 pub use crate::smt::DEFAULT_SOLVER_TIMEOUT_SECS;
 
-pub struct AgentConfig {
-    pub llm_config: LlmConfig,
-    pub solver_path: String,
-    pub solver_args: Vec<String>,
-    pub solver_timeout_secs: u64,
-}
-
-pub async fn run(input_file: &str, config: AgentConfig) -> anyhow::Result<()> {
+pub async fn run(
+    input_file: &str,
+    config: Arc<LiveConfig<AppConfig>>,
+    error_gate: Option<Arc<ErrorGate>>,
+) -> anyhow::Result<()> {
     let input_content = std::fs::read_to_string(input_file)
         .with_context(|| format!("Failed to read input file: {input_file}"))?;
 
-    let llm = crate::llm::LlmClient::new(config.llm_config.clone());
-    let solver = crate::smt::Z3Solver::with_config(
-        config.solver_path.clone(),
-        config.solver_args.clone(),
-        std::time::Duration::from_secs(config.solver_timeout_secs),
-    );
+    let mut llm = crate::llm::LlmClient::with_live_config(config.clone());
+    let mut solver = crate::smt::Z3Solver::with_live_config(config);
+    if let Some(gate) = &error_gate {
+        llm = llm.with_error_gate(gate.clone());
+        solver = solver.with_error_gate(gate.clone());
+    }
     let pm = DefaultPieceManager::new();
 
     let result = crate::machine::run(&input_content, &llm, &solver, &pm).await?;
@@ -41,8 +42,8 @@ pub async fn run(input_file: &str, config: AgentConfig) -> anyhow::Result<()> {
     println!("=== Open Pieces ===\n{}\n", result.open_count);
     for f in &result.formulas {
         println!(
-            "--- Formula ---\n[{} #{}]\n{}\nOutcome: {:?}, Verdict: {}\n",
-            f.piece_label, f.piece_id, f.formula, f.outcome, f.verdict
+            "--- Formula ---\n[{}]\n{}\nOutcome: {:?}, Verdict: {}\n",
+            f.piece_label, f.formula, f.outcome, f.verdict
         );
         if let Some(ref explanation) = f.explanation {
             println!("--- Explanation ---\n{explanation}\n");

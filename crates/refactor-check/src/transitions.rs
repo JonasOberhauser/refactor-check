@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use refactor_check_core::context_id::ContextId;
 use tracing::debug;
 use tracing::warn;
 
@@ -22,7 +23,7 @@ impl AlgorithmState for WaitForSplit {
         _solver: &DynSolverProvider,
         pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
-        let raw_pieces = behaviors::splitter::execute(&self, llm, pm).await?;
+        let raw_pieces = behaviors::splitter::execute(&self, llm, pm, ContextId::root()).await?;
         let pieces: Vec<Arc<CodePiece>> = raw_pieces.into_iter().map(Arc::new).collect();
         Ok(Step::State(Box::new(WaitForSplittingJudge {
             input_content: self.input_content,
@@ -44,7 +45,7 @@ impl AlgorithmState for WaitForSplittingJudge {
         _solver: &DynSolverProvider,
         _pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
-        let verdict = behaviors::splitting_judge::execute(&self, llm).await?;
+        let (verdict, _) = behaviors::splitting_judge::execute(&self, llm, ContextId::root().new_child()).await?;
         match verdict {
             behaviors::splitting_judge::SplittingJudgeVerdict::Accept => {
                 debug!("splitting judge accepted the decomposition");
@@ -147,13 +148,7 @@ impl AlgorithmState for WaitForGeneration {
             .into_iter()
             .zip(formulas)
             .map(|(piece, formula)| {
-                assert!(
-                    piece.id() != 0,
-                    "piece {} #{} has invalid id",
-                    piece.label(),
-                    piece.id(),
-                );
-                debug!(piece_id = piece.id(), label = %piece.label(), "paired piece with formula");
+                debug!(ctx = %piece.ctx_display(), label = %piece.label(), "paired piece with formula");
                 FormulaBranch {
                     piece,
                     input_content: Arc::clone(&self.input_content),
@@ -257,7 +252,7 @@ impl AlgorithmState for WaitForExplanation {
         _solver: &DynSolverProvider,
         _pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
-        let explanations = behaviors::explain::execute(&self, llm).await?;
+        let explanations = behaviors::explain::execute(&self, llm, ContextId::root()).await?;
         let mut result = self.result;
         for (f, explanation) in result.formulas.iter_mut().zip(explanations) {
             f.explanation = explanation;
@@ -335,7 +330,6 @@ pub fn build_result(
             .iter()
             .map(|v| FormulaResult {
                 formula: v.formula.clone(),
-                piece_id: v.piece.id(),
                 piece_label: v.piece.label().to_string(),
                 outcome: v.outcome.clone(),
                 verdict: JUDGE_REASONABLE.to_string(),

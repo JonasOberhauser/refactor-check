@@ -9,12 +9,15 @@ Rules:
 - Assume that function preconditions hold at the start point.
 - Verify that for every function call, the called function's preconditions are satisfied.
 - Verify that all handover points' conditions hold.
+- Verify that all unsafe operations inside `unsafe` blocks have their preconditions satisfied. This includes but is not limited to: pointer dereferences (pointer is valid and aligned), slice indexing (index is in bounds), and any other operation that would be undefined behavior if its preconditions are violated.
+- Verify that the code cannot panic or fail runtime assertions. This includes: out-of-bounds access, arithmetic overflow (unless wrapped), unwrap on None, expect on Err, division by zero, and any assert!/assert_eq!/assert_ne!/debug_assert! macro.
+- Do NOT include panics due to running out of memory (OOM) or allocation failures in the verification. These are environment-dependent and cannot be meaningfully verified.
 - Parameters passed as &T to functions should be assumed not to be modified by the function.
 - If a formula is too complex, you may split it into subproblems with a side-condition.
 - Python/Z3 scripts must output an SMT-LIB2 formula + explanation on stdout, not call the solver directly."#.to_string()
 }
 
-pub fn formalizer_user(code: &str, context: &str, start_condition: Option<&str>, elaboration: &str) -> String {
+pub fn formalizer_user(code: &str, context: &str, start_condition: Option<&str>, elaboration: &str, docs_section: &str) -> String {
     let cond = start_condition.unwrap_or("(the function's precondition)");
     let elab = if elaboration.is_empty() {
         String::new()
@@ -34,9 +37,10 @@ Context (called functions and their specifications):
 
 Starting condition: {}
 {}
+{}
 
 Produce SMT-LIB2 formulas in ```smt2 code blocks or Python/Z3 scripts in ```py code blocks. Each formula should be UNSAT if the code is correct."#,
-        code, context, cond, elab
+        code, context, cond, elab, docs_section
     )
 }
 
@@ -46,6 +50,7 @@ pub fn fixer_system() -> String {
 Rules:
 - Produce the fixed formula in a ```smt2 code block for SMT-LIB2, or ```py code block for Python/Z3.
 - Keep the same verification intent as the original formula.
+- Do NOT include panics due to running out of memory (OOM) or allocation failures in the verification scope.
 - If the formula cannot be fixed, explain why."#.to_string()
 }
 
@@ -68,12 +73,25 @@ Please fix the formula."#,
 }
 
 pub fn judge_system() -> String {
-    r#"You are a verification judge. Given a Rust code piece, its verification formulas, and the solver results, determine if the verification is REASONABLE.
+    format!(
+        r##"You are a verification judge. Given a Rust code piece, its verification formulas, and the solver results, determine if the verification is reasonable.
 
-Reply REASONABLE if the formulas together imply the correctness of the code piece w.r.t. the conditions. Explain any problems that should be improved otherwise."#.to_string()
+You must check two things:
+1. The formulas correctly represent the code and its correctness conditions — including that preconditions of unsafe operations are satisfied, and that the code cannot panic or fail runtime assertions. Panics due to running out of memory (OOM) or allocation failures should NOT be considered — these are out of scope.
+2. Any SAT or UNSAT result is due to the actual code behavior, not due to imprecision or over-approximation in the formula. If the formula is too imprecise (e.g., uses uninterpreted functions where concrete semantics are needed, or abstracts away relevant state), it is NOT reasonable even if the solver says UNSAT.
+
+OUTPUT FORMAT (CRITICAL — violating this wastes resources):
+- If the verification IS reasonable, your ENTIRE response must be the single word: {JUDGE_REASONABLE}
+  Do NOT add any explanation, analysis, preamble, or trailing text.
+  Do NOT write any heading before the word.
+  The word {JUDGE_REASONABLE} must be the ONLY text in your response.
+- If the verification is NOT reasonable, write your explanation of the problems.
+  Do NOT include the word {JUDGE_REASONABLE} anywhere in your explanation."##,
+        JUDGE_REASONABLE = refactor_check_core::consts::JUDGE_REASONABLE,
+    )
 }
 
-pub fn judge_user(code: &str, formulas_and_results: &str) -> String {
+pub fn judge_user(code: &str, formulas_and_results: &str, docs_section: &str) -> String {
     format!(
         r#"Determine if the following verification is REASONABLE.
 
@@ -84,19 +102,45 @@ Code:
 
 Formulas and results:
 {}
+{}
 
-Reply REASONABLE if the formulas together imply the correctness of the code piece. Otherwise, explain what problems need to be improved."#,
-        code, formulas_and_results
+Check:
+1. Do the formulas correctly encode the code and its correctness conditions?
+2. Are the SAT/UNSAT results due to the actual code, not formula imprecision?
+
+If both checks pass, your ENTIRE response must be the single word REASONABLE — nothing else, no explanation, no preamble.
+If not reasonable, explain the problems but do NOT use the word REASONABLE anywhere."#,
+        code, formulas_and_results, docs_section
+    )
+}
+
+pub fn judge_retry(previous_response: &str) -> String {
+    format!(
+        r#"Your previous response was:
+
+{prev}
+
+Your response contained the word 'REASONABLE' but also other text. Please either:
+- Reply ONLY with the word REASONABLE (nothing else), or
+- Reply with an explanation that does NOT contain the word 'REASONABLE' at all, in case the code is not reasonable."#,
+        prev = previous_response,
     )
 }
 
 pub fn analyzer_system() -> String {
-    r#"You are a verification problem analyzer. Given an unverified piece and its solver results, determine whether the problems are due to incorrect conditions (too weak or too strong), and suggest fixes.
+    r#"You are a verification problem analyzer. When verification of a code piece fails, you must determine the root cause by analyzing the entire call chain, not just the failing function in isolation.
 
-Reply RETRY if conditions need to be adjusted, or describe the bug if one is found."#.to_string()
+Common patterns where the root cause is elsewhere:
+- Function f fails verification because it cannot satisfy the precondition of its callee g. But that precondition may actually stem from an overly strict precondition in g's callee h (which f does not even call directly). In this case, the fix is to relax the preconditions of h, not to change f or g.
+- A loop invariant is too strong because a helper function called inside the loop has unnecessarily strict preconditions. The fix may be to weaken the helper's preconditions.
+- An assertion in a function fails because a caller passes values that violate an undocumented assumption. The fix may be to document and propagate a precondition upward through the call chain.
+
+Always trace the root cause through the full dependency chain before proposing a fix.
+
+Reply RETRY if conditions anywhere in the project need to be adjusted (including functions not directly involved in the failing verification), or describe the bug if one is found."#.to_string()
 }
 
-pub fn analyzer_user(code: &str, sat_models: &[String], unknown_formulas: &[String], elaboration: &str) -> String {
+pub fn analyzer_user(code: &str, sat_models: &[String], unknown_formulas: &[String], elaboration: &str, docs_section: &str) -> String {
     let sat = if sat_models.is_empty() {
         "None".to_string()
     } else {
@@ -108,7 +152,7 @@ pub fn analyzer_user(code: &str, sat_models: &[String], unknown_formulas: &[Stri
         unknown_formulas.iter().map(|f| format!("```\n{}\n```", f)).collect::<Vec<_>>().join("\n\n")
     };
     format!(
-        r#"Analyze the following unverified code piece:
+        r#"Analyze the following unverified code piece and trace the root cause through the full call chain:
 
 Code:
 ```
@@ -123,9 +167,14 @@ Unknown formulas:
 
 Previous elaboration:
 {}
+{}
 
-Determine whether the problems are due to incorrect conditions or a bug. Reply RETRY if conditions need to be adjusted, or describe the bug."#,
-        code, sat, unknown, elaboration
+Do NOT fix only the failing function in isolation. Trace the dependency chain to find where conditions should actually be changed. For example:
+- If f cannot satisfy g's precondition, check whether g's precondition is too strict because of g's callee h.
+- If an assertion fails, check whether the caller should have a precondition that was never documented.
+
+Reply RETRY if conditions anywhere in the project need to be adjusted, or describe the bug."#,
+        code, sat, unknown, elaboration, docs_section
     )
 }
 

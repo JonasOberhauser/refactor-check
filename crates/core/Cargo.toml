@@ -13,3 +13,4 @@ anyhow = "1"
 tracing = "0.1"
 async-trait = "0.1"
 dashmap = "6"
+clap = { version = "4", features = ["derive"] }

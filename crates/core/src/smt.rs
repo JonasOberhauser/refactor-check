@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,7 +8,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, trace, warn};
 
-use crate::provider::{IOProvider, SolverRequest};
+use crate::config_update::AppConfig;
+use crate::context_id::ContextId;
+use crate::error_gate::ErrorGate;
+use crate::live_config::LiveConfig;
+use crate::provider::{IOProvider, SolverRequest, WithContext};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SolverOutcome {
@@ -144,15 +149,32 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
 
 pub const DEFAULT_SOLVER_TIMEOUT_SECS: u64 = 60;
 
-#[instrument(skip_all, fields(solver_path, piece_id = ?piece_id))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SolverConfig {
+    pub solver_path: String,
+    pub solver_args: Vec<String>,
+    pub timeout_secs: u64,
+}
+
+impl Default for SolverConfig {
+    fn default() -> Self {
+        Self {
+            solver_path: "z3".to_string(),
+            solver_args: vec!["-in".to_string()],
+            timeout_secs: DEFAULT_SOLVER_TIMEOUT_SECS,
+        }
+    }
+}
+
+#[instrument(skip_all, fields(solver_path, %context_id))]
 pub async fn run_solver(
     solver_path: &str,
     solver_args: &[String],
     timeout: Duration,
     formula: &str,
-    piece_id: Option<u64>,
+    context_id: &ContextId,
 ) -> Result<SolverResult> {
-    info!(formula_bytes = formula.len(), ?timeout, piece_id = ?piece_id, "running SMT solver");
+    info!(formula_bytes = formula.len(), ?timeout, %context_id, "running SMT solver");
     let start = std::time::Instant::now();
 
     let mut child = tokio::process::Command::new(solver_path)
@@ -189,7 +211,7 @@ pub async fn run_solver(
 let status = tokio::select! {
         status = async move { child_for_wait.lock().await.wait().await } => Some(status),
         () = tokio::time::sleep(timeout) => {
-            warn!(elapsed_ms = start.elapsed().as_millis(), piece_id = ?piece_id, "solver timed out, killing process");
+            warn!(elapsed_ms = start.elapsed().as_millis(), %context_id, "solver timed out, killing process");
             {
                 let mut guard = child.lock().await;
                 let _ = guard.kill().await;
@@ -223,13 +245,13 @@ let status = tokio::select! {
     let stdout = bytes_to_string(stdout);
     let stderr = bytes_to_string(stderr);
     let outcome = parse_solver_outcome(status.code(), &stdout, &stderr);
-    debug!(%stdout, %stderr, piece_id = ?piece_id, "solver raw output");
+    debug!(%stdout, %stderr, %context_id, "solver raw output");
     info!(
         ?outcome,
         elapsed_ms = elapsed.as_millis(),
         stdout_bytes = stdout.len(),
         stderr_bytes = stderr.len(),
-        piece_id = ?piece_id,
+        %context_id,
         "solver finished"
     );
 
@@ -241,27 +263,49 @@ let status = tokio::select! {
 }
 
 pub struct Z3Solver {
-    solver_path: String,
-    solver_args: Vec<String>,
-    timeout: Duration,
+    config: Arc<LiveConfig<AppConfig>>,
+    error_gate: Option<Arc<ErrorGate>>,
 }
 
 impl Z3Solver {
     #[must_use]
-    pub fn new(solver_path: String) -> Self {
-        Self::with_config(solver_path, vec!["-in".to_string()], Duration::from_secs(DEFAULT_SOLVER_TIMEOUT_SECS))
+    pub fn with_live_config(config: Arc<LiveConfig<AppConfig>>) -> Self {
+        Self { config, error_gate: None }
     }
 
     #[must_use]
-    pub fn with_config(solver_path: String, solver_args: Vec<String>, timeout: Duration) -> Self {
-        Self { solver_path, solver_args, timeout }
+    pub fn with_error_gate(mut self, gate: Arc<ErrorGate>) -> Self {
+        self.error_gate = Some(gate);
+        self
     }
 }
 
 #[async_trait]
-impl IOProvider<SolverRequest, SolverResult> for Z3Solver {
-    async fn invoke(&self, input: SolverRequest) -> Result<SolverResult> {
-        run_solver(&self.solver_path, &self.solver_args, self.timeout, &input.formula, input.piece_id).await
+impl IOProvider<SolverRequest, WithContext<SolverResult>> for Z3Solver {
+    async fn invoke(&self, input: SolverRequest) -> Result<WithContext<SolverResult>> {
+        let SolverRequest { formula, context_id } = input;
+        loop {
+            let cfg = self.config.snapshot().1.solver;
+            let result = run_solver(
+                &cfg.solver_path,
+                &cfg.solver_args,
+                Duration::from_secs(cfg.timeout_secs),
+                &formula,
+                &context_id,
+            )
+            .await;
+
+            match result {
+                Ok(result) => return Ok(WithContext { value: result, context_id }),
+                Err(e) => {
+                    if let Some(gate) = &self.error_gate {
+                        gate.report_and_wait(&format!("{e:#}")).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
     }
 }
 

@@ -19,9 +19,9 @@ pub async fn execute(
 
     assert!(
         !piece.before().is_empty() && !piece.after().is_empty(),
-        "piece {} #{} must have non-empty BEFORE and AFTER",
+        "piece {} {} must have non-empty BEFORE and AFTER",
         piece.label(),
-        piece.id(),
+        piece.ctx_display(),
     );
 
     loop {
@@ -30,7 +30,7 @@ pub async fn execute(
             anyhow::bail!("Judge failed to give a clear verdict after {MAX_JUDGE_ATTEMPTS} attempts");
         }
 
-        debug!(attempt = attempts, piece_id = piece.id(), label = %piece.label(), "asking judge for verdict");
+        debug!(attempt = attempts, ctx = %piece.ctx_display(), label = %piece.label(), "asking judge for verdict");
 
         let prompt = if attempts == 1 {
             format!(
@@ -67,8 +67,18 @@ pub async fn execute(
             )
         };
 
+        let has_relation = piece.before().contains("/* relation:") || piece.after().contains("/* relation:");
+        let relation_note = if has_relation {
+            "\n\nIf the piece contains /* relation: ... */ comments, verify that the \
+             formula correctly encodes the specified relation between before and after \
+             states. Variables/states not mentioned in the relation are assumed equivalent \
+             and should be encoded as such."
+        } else {
+            ""
+        };
+
         let messages = vec![
-            llm::system_message(
+            llm::system_message(&format!(
                 "You are a judge evaluating an SMT-based equivalence check. \
                  Your job is to verify that the formula VALIDLY ENCODES the semantics of the \
                  BEFORE and AFTER code — not to judge whether the formula itself is tautological. \
@@ -80,12 +90,15 @@ pub async fn execute(
                  and what is wrong with the formalization. Provide your explanation concisely. \
                  \n\nFor loops or recursive functions, assume that checking single executions of the loop body, \
                  or single code flows through recursive calls with recursion arguments proven to be equal \
-                 (potentially under some introduced loop invariant), is sufficient.",
-            ),
+                 (potentially under some introduced loop invariant), is sufficient.{relation_note}",
+            )),
             llm::user_message(&prompt),
         ];
 
-        let response = llm.invoke(LlmRequest { role: LlmRole::Judge, messages, piece_id: Some(piece.id()) }).await?;
+        let ctx = piece.take_context();
+        let resp = llm.invoke(LlmRequest { role: LlmRole::Judge, messages, context_id: ctx }).await?;
+        piece.restore_context(resp.context_id);
+        let response = resp.value;
         let trimmed = response.trim().to_string();
         let upper = trimmed.to_uppercase();
 

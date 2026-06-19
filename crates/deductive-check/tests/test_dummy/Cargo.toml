@@ -1,0 +1,14 @@
+[package]
+name = "test_dummy"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+test-log = "0.2"
+env_logger = "0.11"
+
+[features]
+verification = []

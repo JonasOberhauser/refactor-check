@@ -42,21 +42,24 @@ async fn run_branch(
     loop {
         match phase {
             BranchPhase::WaitForSolver { formula } => {
-                pm.expect_any_and_set(piece.id(), &[PiecePhase::Forming, PiecePhase::Fixing], PiecePhase::Solving);
-                debug!(piece_id = piece.id(), label = %piece.label(), "running solver");
-                let result = solver.invoke(SolverRequest { formula: formula.clone(), piece_id: Some(piece.id()) }).await?;
-                debug!(piece_id = piece.id(), label = %piece.label(), outcome = ?result.outcome, "solver done");
+                piece.with_ctx(|ctx| pm.expect_any_and_set(ctx, &[PiecePhase::Forming, PiecePhase::Fixing], PiecePhase::Solving));
+                debug!(ctx = %piece.ctx_display(), label = %piece.label(), "running solver");
+                let ctx = piece.take_context();
+                let resp = solver.invoke(SolverRequest { formula: formula.clone(), context_id: ctx }).await?;
+                piece.restore_context(resp.context_id);
+                let result = resp.value;
+                debug!(ctx = %piece.ctx_display(), label = %piece.label(), outcome = ?result.outcome, "solver done");
                 match transitions::transition_solver(formula.clone(), result) {
                     BranchFromSolver::Judge(f, r) => {
-                        pm.advance(piece.id(), Some(PiecePhase::Solving), PiecePhase::Judging);
+                        piece.with_ctx(|ctx| pm.advance(ctx, Some(PiecePhase::Solving), PiecePhase::Judging));
                         phase = BranchPhase::WaitForJudge {
                             formula: f,
                             solver_result: r,
                         };
                     }
                     BranchFromSolver::Error(f, r) => {
-                        pm.advance(piece.id(), Some(PiecePhase::Solving), PiecePhase::Open);
-                        debug!(piece_id = piece.id(), label = %piece.label(), "solver error");
+                        piece.with_ctx(|ctx| pm.advance(ctx, Some(PiecePhase::Solving), PiecePhase::Open));
+                        debug!(ctx = %piece.ctx_display(), label = %piece.label(), "solver error");
                         return Ok(vec![ChildDone::Open(OpenItem {
                             piece: Arc::clone(&piece),
                             formula: f,
@@ -66,8 +69,8 @@ async fn run_branch(
                         })]);
                     }
                     BranchFromSolver::Resplit(f, r) => {
-                        pm.advance(piece.id(), Some(PiecePhase::Solving), PiecePhase::Open);
-                        debug!(piece_id = piece.id(), label = %piece.label(), "solver timeout, requesting resplit");
+                        piece.with_ctx(|ctx| pm.advance(ctx, Some(PiecePhase::Solving), PiecePhase::Open));
+                        debug!(ctx = %piece.ctx_display(), label = %piece.label(), "solver timeout, requesting resplit");
                         return Ok(vec![ChildDone::NeedsResplit {
                             piece: Arc::clone(&piece),
                             formula: f,
@@ -92,7 +95,7 @@ async fn run_branch(
                     retry_count,
                 ) {
                     BranchFromJudge::Verified(verified) => {
-                        pm.advance(piece.id(), Some(PiecePhase::Judging), PiecePhase::Verified);
+                        piece.with_ctx(|ctx| pm.advance(ctx, Some(PiecePhase::Judging), PiecePhase::Verified));
                         return Ok(vec![ChildDone::Verified(verified)]);
                     }
                     BranchFromJudge::Retry {
@@ -101,7 +104,7 @@ async fn run_branch(
                         solver_stdout,
                         solver_stderr,
                     } => {
-                        pm.advance(piece.id(), Some(PiecePhase::Judging), PiecePhase::Fixing);
+                        piece.with_ctx(|ctx| pm.advance(ctx, Some(PiecePhase::Judging), PiecePhase::Fixing));
                         retry_count += 1;
                         phase = BranchPhase::NeedFormula {
                             feedback: Some(feedback),
@@ -140,29 +143,30 @@ async fn run_branch(
                 let fb = feedback.as_deref().unwrap_or("");
                 let role = LlmRole::Fixer;
 
-                let response = if insist_pending {
+                let ctx = piece.take_context();
+                let resp = if insist_pending {
                     let prev = last_response.as_deref().unwrap_or("");
-                    debug!(piece_id = piece.id(), label = %piece.label(), "insist fixer retry for piece");
+                    debug!(ctx = %piece.ctx_display(), label = %piece.label(), "insist fixer retry for piece");
                     llm.invoke(LlmRequest {
                         role,
                         messages: generation::build_retry_insist_messages(
                             &piece, fb, prev, &input_content,
                         ),
-                        piece_id: Some(piece.id()),
-                    })
-                    .await?
+                        context_id: ctx,
+                    }).await?
                 } else {
-                    debug!(piece_id = piece.id(), label = %piece.label(), "fixer retry for piece");
+                    debug!(ctx = %piece.ctx_display(), label = %piece.label(), "fixer retry for piece");
                     llm.invoke(LlmRequest {
                         role,
                         messages: generation::build_retry_messages(
                             &piece, &current_formula, fb,
                             solver_stdout, solver_stderr, &input_content,
                         ),
-                        piece_id: Some(piece.id()),
-                    })
-                    .await?
+                        context_id: ctx,
+                    }).await?
                 };
+                piece.restore_context(resp.context_id);
+                let response = resp.value;
 
                 let formulas = extract_all_formulas(&response);
                 match transitions::transition_need_formula(formulas, insist_attempt) {
@@ -180,7 +184,7 @@ async fn run_branch(
                         };
                     }
                     BranchFromNeedFormula::Exhausted(reason) => {
-                        debug!(piece_id = piece.id(), label = %piece.label(), "need formula exhausted");
+                        debug!(ctx = %piece.ctx_display(), label = %piece.label(), "need formula exhausted");
                         return Ok(vec![ChildDone::Open(OpenItem {
                             piece: Arc::clone(&piece),
                             formula: current_formula,
