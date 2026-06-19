@@ -54,7 +54,7 @@ Rules:
 - If the formula cannot be fixed, explain why."#.to_string()
 }
 
-pub fn fixer_user(formula: &str, error: &str) -> String {
+pub fn fixer_user(formula: &str, error: &str, context: &str, docs_section: &str) -> String {
     format!(
         r#"The following SMT formula caused an error when checked:
 
@@ -67,8 +67,11 @@ Error output:
 {}
 ```
 
+Context (called functions and their specifications):
+{}
+{}
 Please fix the formula."#,
-        formula, error
+        formula, error, context, docs_section
     )
 }
 
@@ -91,7 +94,7 @@ OUTPUT FORMAT (CRITICAL — violating this wastes resources):
     )
 }
 
-pub fn judge_user(code: &str, formulas_and_results: &str, docs_section: &str) -> String {
+pub fn judge_user(code: &str, formulas_and_results: &str, context: &str, docs_section: &str) -> String {
     format!(
         r#"Determine if the following verification is REASONABLE.
 
@@ -100,8 +103,11 @@ Code:
 {}
 ```
 
-Formulas and results:
+Context (called functions and their specifications):
 {}
+{}
+
+Formulas and results:
 {}
 
 Check:
@@ -110,7 +116,7 @@ Check:
 
 If both checks pass, your ENTIRE response must be the single word REASONABLE — nothing else, no explanation, no preamble.
 If not reasonable, explain the problems but do NOT use the word REASONABLE anywhere."#,
-        code, formulas_and_results, docs_section
+        code, context, docs_section, formulas_and_results
     )
 }
 

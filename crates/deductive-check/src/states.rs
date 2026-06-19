@@ -16,6 +16,11 @@ use crate::result::{BugReport, ClosedPiece, UnverifiedPiece, VerificationResult}
 use refactor_check_core::provider::{LlmRequest, LlmRole, SolverRequest};
 use refactor_check_core::smt::SolverOutcome;
 
+struct PieceContext {
+    called_functions: String,
+    docs_section: String,
+}
+
 fn solver_outcome_to_formula_phase(outcome: &SolverOutcome) -> FormulaPhase {
     match outcome {
         SolverOutcome::Unsat => FormulaPhase::ClosedUnsat,
@@ -590,11 +595,13 @@ async fn fix_formula(
     formula_content: &str,
     error: &str,
     fctx: ContextId,
+    context: &str,
+    docs_section: &str,
     providers: &Providers<'_>,
 ) -> Result<(String, ContextId)> {
     let messages = vec![
         crate::llm::system_message(&prompts::fixer_system()),
-        crate::llm::user_message(&prompts::fixer_user(formula_content, error)),
+        crate::llm::user_message(&prompts::fixer_user(formula_content, error, context, docs_section)),
     ];
 
     let resp = providers
@@ -640,6 +647,7 @@ async fn check_and_fix_formula(
     pm: &dyn crate::piece_manager::DeductivePieceManager,
     iteration: u32,
     max_fix_attempts: usize,
+    piece_ctx_info: &PieceContext,
 ) -> Result<(crate::formula::Formula, SolverOutcome, ContextId)> {
     let (mut formula, mut fctx, mut outcome, mut current_smt) = check_formula(
         &ef.content, &ef.source, piece_ctx, providers, pm, iteration,
@@ -654,7 +662,7 @@ async fn check_and_fix_formula(
 
         info!(%fctx, fix_attempts, "Attempting to fix formula");
 
-        let (fixed_response, fctx2) = fix_formula(&current_smt, &error_msg, fctx, providers).await?;
+        let (fixed_response, fctx2) = fix_formula(&current_smt, &error_msg, fctx, &piece_ctx_info.called_functions, &piece_ctx_info.docs_section, providers).await?;
         fctx = fctx2;
         let fixed_extracted = crate::formula::extract_formulas_from_response(&fixed_response);
 
@@ -712,13 +720,13 @@ async fn judge_piece(
     piece: &ArcCodePiece,
     ctx: ContextId,
     formulas_summary: &str,
-    docs_section: &str,
+    piece_ctx_info: &PieceContext,
     providers: &Providers<'_>,
 ) -> Result<(String, ContextId)> {
     assert!(piece.type_invariant());
     let mut messages = vec![
         crate::llm::system_message(&prompts::judge_system()),
-        crate::llm::user_message(&prompts::judge_user(piece.code(), formulas_summary, docs_section)),
+        crate::llm::user_message(&prompts::judge_user(piece.code(), formulas_summary, &piece_ctx_info.called_functions, &piece_ctx_info.docs_section)),
     ];
 
     let resp = providers
@@ -807,10 +815,16 @@ async fn process_piece(
         let max_fix_attempts = crate::consts::MAX_INSIST_ATTEMPTS;
         let iteration = judge_attempt as u32;
 
+        let piece_ctx_info = PieceContext {
+            called_functions: context.clone(),
+            docs_section: own_docs_section.clone(),
+        };
+
         let formula_futs: Vec<_> = extracted.iter().map(|ef| {
             check_and_fix_formula(
                 ef, &ctx, providers, pm,
                 iteration, max_fix_attempts,
+                &piece_ctx_info,
             )
         }).collect();
 
@@ -878,7 +892,7 @@ async fn process_piece(
         pm.advance_piece(&ctx, Some(CodePiecePhase::Check), CodePiecePhase::Judge);
 
         let formulas_summary = formula_summaries.join("\n");
-        let (judge_response, ctx2) = judge_piece(piece, ctx, &formulas_summary, &own_docs_section, providers).await?;
+        let (judge_response, ctx2) = judge_piece(piece, ctx, &formulas_summary, &piece_ctx_info, providers).await?;
         ctx = ctx2;
         info!(%ctx, judge_attempt, "Judge responded");
 
