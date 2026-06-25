@@ -4,6 +4,7 @@ pub mod context_id;
 pub mod error_gate;
 pub mod llm;
 pub mod live_config;
+pub mod message_log;
 pub mod phase_tracker;
 pub mod provider;
 pub mod smt;

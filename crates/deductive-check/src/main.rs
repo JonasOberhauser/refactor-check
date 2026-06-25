@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 use deductive_check::machine;
@@ -10,6 +11,7 @@ use refactor_check_core::config_update::{AppConfig, ServiceTierArg, UpdateArgs};
 use refactor_check_core::error_gate::ErrorShell;
 use refactor_check_core::llm::LlmConfig;
 use refactor_check_core::live_config::LiveConfig;
+use refactor_check_core::message_log::{MessageLog, MessageLogLayer, ShowPlugin};
 use refactor_check_core::smt::{SolverConfig, Z3Solver};
 
 #[derive(Parser)]
@@ -148,11 +150,14 @@ impl From<&Cli> for AppConfig {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("deductive_check=info")),
-        )
+    let log = Arc::new(MessageLog::new());
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("deductive_check=info"));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(MessageLogLayer::new(log.clone()))
         .init();
 
     let cli = Cli::parse();
@@ -167,7 +172,8 @@ fn main() -> Result<()> {
     let result_file = cli.result_file.clone();
 
     let shell = ErrorShell::with_base_plugins()
-        .with_config::<UpdateArgs, AppConfig>("set", config_live.clone())?;
+        .with_config::<UpdateArgs, AppConfig>("set", config_live.clone())?
+        .with_plugin(Box::new(ShowPlugin::new(log)))?;
 
     shell.run(
         move |gate| async move {
