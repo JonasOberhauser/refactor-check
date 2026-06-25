@@ -43,6 +43,10 @@ pub struct ShellContext<'a> {
 }
 
 impl<'a> ShellContext<'a> {
+    pub fn new(epoch: &'a Arc<AtomicU64>, plugin_infos: &'a [PluginInfo]) -> Self {
+        Self { epoch, plugin_infos }
+    }
+
     pub fn resume(&self) -> u64 {
         self.epoch.fetch_add(1, Ordering::Release)
     }
@@ -142,6 +146,11 @@ impl ErrorShell {
         C: Clone + Send + Sync + 'static,
     {
         self.register_plugin(Box::new(SetPlugin::<A, C>::new(name, config)))?;
+        Ok(self)
+    }
+
+    pub fn with_plugin(mut self, plugin: Box<dyn ShellPlugin>) -> Result<Self> {
+        self.register_plugin(plugin)?;
         Ok(self)
     }
 
