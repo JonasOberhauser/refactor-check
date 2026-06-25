@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
 use crate::code_piece::FunctionId;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClosedPiece {
     pub file: PathBuf,
     pub function_id: FunctionId,
@@ -13,7 +14,7 @@ pub struct ClosedPiece {
     pub unknown_formulas: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnverifiedPiece {
     pub file: PathBuf,
     pub function_id: FunctionId,
@@ -24,14 +25,14 @@ pub struct UnverifiedPiece {
     pub elaboration: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BugReport {
     pub file: PathBuf,
     pub function_id: FunctionId,
     pub description: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationResult {
     pub closed_pieces: Vec<ClosedPiece>,
     pub unverified_pieces: Vec<UnverifiedPiece>,
@@ -43,5 +44,11 @@ pub struct VerificationResult {
 impl VerificationResult {
     pub fn all_verified(&self) -> bool {
         self.unverified_pieces.is_empty()
+    }
+
+    pub fn save_to_file(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, json)?;
+        Ok(())
     }
 }
