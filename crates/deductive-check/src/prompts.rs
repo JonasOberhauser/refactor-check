@@ -16,6 +16,185 @@ When analyzing code pieces, treat each `if exit`/`else` pair as covering all pos
 "#
 }
 
+fn splitter_rules_and_examples() -> &'static str {
+    r#"
+
+## Splitter Rules (for understanding code piece structure)
+
+Key lines are: function entry point, loop headers (for, while, loop). NOT key lines: assertions, breaks, returns.
+
+1. Every key line gets at least one piece. A piece spans from its key line to the next key line reached along every execution path.
+2. Piece format: `/* <starting loop header> */` (only if piece starts at a loop) → `// Start point: <file:line>` → code → `// Handover point: <file:line>` → `/* Next handover point: <loop header> <assertions> // Start point: file:line */` (only if handing over to a loop).
+3. No enclosing loop context at top of piece. Only the starting loop's header in `/* ... */` before `// Start point:`.
+4. Outer→inner transition: when an outer loop contains an inner loop, the code between them forms a piece (even if empty).
+5. Inner loop piece carries ALL code after the inner loop until the next key line, including outer loop continue/exit logic.
+6. `if exit <loop_pattern>:` / `else <loop_pattern>:` after loop body code. Loop header pattern disambiguates nested loops.
+7. `break` → `// break` + `goto <label>;`. Label at landing point inside `if exit <outer_loop>:` block.
+8. `else <loop>:` block contains only a short handover comment: loop header + assertions + start point. No full code paths.
+9. `/* Next handover point: ... */` after `// Handover point:` when handing over to a loop: loop header + assertions at loop body start + start point.
+10. Assertions are not key lines — they belong to whatever piece they appear in.
+11. All function exits use explicit `return`.
+
+## Example 1 — With invariants
+
+Source:
+```text
+ 1: #[requires(items.len() <= 1000)]
+ 2: pub fn process_all(items: &mut Vec<Item>, threshold: i32) -> usize {
+ 3:     let mut count = 0;
+ 4:     for item in items.iter_mut() {
+ 5:         for _ in 0..50 {
+ 6:             if item.value >= threshold { break; }
+ 9:             assert!(item.value < item.max_value);
+10:             item.inc();
+11:         }
+12:         assert!(count < items.len());
+13:         count += 1;
+14:     }
+15:     count
+16: }
+```
+
+Piece 1 (entry → outer loop):
+```
+// Start point: example.rs:2
+    let mut count = 0;
+// Handover point: example.rs:4
+/* Next handover point:
+   for item in items.iter_mut() {
+       // Start point: example.rs:4
+   }
+*/
+```
+
+Piece 2 (outer → inner):
+```
+/* for item in items.iter_mut() { */
+// Start point: example.rs:4
+        // (no code before inner loop)
+// Handover point: example.rs:5
+/* Next handover point:
+   for _ in 0..50 {
+       assert!(item.value < item.max_value);
+       // Start point: example.rs:5
+   }
+*/
+```
+
+Piece 3 (inner loop body):
+```
+/* for _ in 0..50 { */
+// Start point: example.rs:5
+            if item.value >= threshold {
+                // break
+                goto inner_exit;
+            }
+            assert!(item.value < item.max_value);
+            item.inc();
+        if exit _ in 0..50: {
+            inner_exit:
+            assert!(count < items.len());
+            count += 1;
+            if exit item in items.iter_mut(): {
+                return count;
+// Handover point: example.rs:16
+            } else item in items.iter_mut(): {
+                /* handover point: for item in items.iter_mut() {
+                   // Start point: example.rs:4
+                } */
+            }
+        } else _ in 0..50: {
+            /* handover point: for _ in 0..50 {
+               assert!(item.value < item.max_value);
+               // Start point: example.rs:5
+            } */
+        }
+```
+
+## Example 2 — Without invariants
+
+Source:
+```text
+20: pub fn find_and_update(data: &mut [Entry], target: u32) -> bool {
+21:     let mut found = false;
+22:     let mut idx = 0;
+23:     while idx < data.len() {
+24:         assert!(idx < data.len());
+25:         for j in 0..3 {
+26:             assert!(j < 3);
+27:             data[idx].flags[j] += 1;
+28:         }
+29:         if data[idx].key == target {
+30:             found = true;
+31:             break;
+32:         }
+33:         idx += 1;
+34:     }
+35:     found
+36: }
+```
+
+Piece 1 (entry → while):
+```
+// Start point: example.rs:20
+    let mut found = false;
+    let mut idx = 0;
+// Handover point: example.rs:23
+/* Next handover point:
+   while idx < data.len() {
+       assert!(idx < data.len());
+       // Start point: example.rs:23
+   }
+*/
+```
+
+Piece 2 (while → for):
+```
+/* while idx < data.len() { */
+// Start point: example.rs:23
+        assert!(idx < data.len());
+// Handover point: example.rs:25
+/* Next handover point:
+   for j in 0..3 {
+       assert!(j < 3);
+       // Start point: example.rs:25
+   }
+*/
+```
+
+Piece 3 (for loop body):
+```
+/* for j in 0..3 { */
+// Start point: example.rs:25
+            assert!(j < 3);
+            data[idx].flags[j] += 1;
+        if exit j in 0..3: {
+            if data[idx].key == target {
+                found = true;
+                // break
+                goto while_exit;
+            }
+            idx += 1;
+            if exit while idx < data.len(): {
+                while_exit:
+                return found;
+// Handover point: example.rs:36
+            } else while idx < data.len(): {
+                /* handover point: while idx < data.len() {
+                   assert!(idx < data.len());
+                   // Start point: example.rs:23
+                } */
+            }
+        } else j in 0..3: {
+            /* handover point: for j in 0..3 {
+               assert!(j < 3);
+               // Start point: example.rs:25
+            } */
+        }
+```
+"#
+}
+
 pub fn formalizer_system() -> String {
     r#"You are a formal verification expert specializing in Rust code. Your task is to analyze Rust code pieces and produce SMT-LIB2 formulas that verify the code's correctness.
 
@@ -32,7 +211,7 @@ Rules:
 - Do NOT include panics due to running out of memory (OOM) or allocation failures in the verification. These are environment-dependent and cannot be meaningfully verified.
 - Parameters passed as &T to functions should be assumed not to be modified by the function.
 - If a formula is too complex, you may split it into subproblems with a side-condition.
-- Python/Z3 scripts must output an SMT-LIB2 formula + explanation on stdout, not call the solver directly."#.to_string() + splitter_notation_section()
+- Python/Z3 scripts must output an SMT-LIB2 formula + explanation on stdout, not call the solver directly."#.to_string() + splitter_rules_and_examples() + splitter_notation_section()
 }
 
 pub fn formalizer_user(code: &str, context: &str, start_condition: Option<&str>, elaboration: &str, docs_section: &str) -> String {
@@ -69,7 +248,7 @@ Rules:
 - Produce the fixed formula in a ```smt2 code block for SMT-LIB2, or ```py code block for Python/Z3.
 - Keep the same verification intent as the original formula.
 - Do NOT include panics due to running out of memory (OOM) or allocation failures in the verification scope.
-- If the formula cannot be fixed, explain why."#.to_string()
+- If the formula cannot be fixed, explain why."#.to_string() + splitter_rules_and_examples() + splitter_notation_section()
 }
 
 pub fn fixer_user(formula: &str, error: &str, context: &str, docs_section: &str) -> String {
@@ -109,7 +288,7 @@ OUTPUT FORMAT (CRITICAL — violating this wastes resources):
 - If the verification is NOT reasonable, write your explanation of the problems.
   Do NOT include the word {JUDGE_REASONABLE} anywhere in your explanation."##,
         JUDGE_REASONABLE = refactor_check_core::consts::JUDGE_REASONABLE,
-    ) + splitter_notation_section()
+    ) + splitter_rules_and_examples() + splitter_notation_section()
 }
 
 pub fn judge_user(code: &str, formulas_and_results: &str, context: &str, docs_section: &str) -> String {
@@ -161,7 +340,7 @@ Common patterns where the root cause is elsewhere:
 
 Always trace the root cause through the full dependency chain before proposing a fix.
 
-Reply RETRY if conditions anywhere in the project need to be adjusted (including functions not directly involved in the failing verification), or describe the bug if one is found."#.to_string() + splitter_notation_section()
+Reply RETRY if conditions anywhere in the project need to be adjusted (including functions not directly involved in the failing verification), or describe the bug if one is found."#.to_string() + splitter_rules_and_examples() + splitter_notation_section()
 }
 
 pub fn analyzer_user(code: &str, sat_models: &[String], unknown_formulas: &[String], elaboration: &str, docs_section: &str) -> String {
