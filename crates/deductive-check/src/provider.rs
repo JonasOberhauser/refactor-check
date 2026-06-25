@@ -1141,13 +1141,13 @@ impl IOProvider<PythonRequest, PythonResponse> for ProcessPythonProvider {
 
 pub struct CliAgentProvider {
     binary: String,
-    args: Vec<String>,
+    base_args: Vec<String>,
     error_gate: Option<Arc<refactor_check_core::error_gate::ErrorGate>>,
 }
 
 impl CliAgentProvider {
     pub fn new(binary: String, args: Vec<String>) -> Self {
-        Self { binary, args, error_gate: None }
+        Self { binary, base_args: args, error_gate: None }
     }
 
     pub fn with_error_gate(mut self, gate: Arc<refactor_check_core::error_gate::ErrorGate>) -> Self {
@@ -1156,19 +1156,57 @@ impl CliAgentProvider {
     }
 }
 
+fn extract_text_from_json_events(stdout: &str) -> String {
+    let mut texts = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(part) = value.get("part") {
+                if let Some(part_type) = part.get("type") {
+                    if part_type.as_str() == Some("text") {
+                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                            texts.push(text.to_string());
+                        }
+                    }
+                }
+            }
+            if value.get("type").and_then(|t| t.as_str()) == Some("error") {
+                if let Some(err) = value.get("error") {
+                    if let Some(msg) = err.get("data").and_then(|d| d.get("message")).and_then(|m| m.as_str()) {
+                        texts.push(format!("[agent error: {msg}]"));
+                    }
+                }
+            }
+        }
+    }
+    texts.join("")
+}
+
 #[async_trait]
 impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
     async fn invoke(&self, input: AgentRequest) -> Result<AgentResponse> {
         loop {
+            let mut args = self.base_args.clone();
+            args.push("--format".to_string());
+            args.push("json".to_string());
+            args.push("--dir".to_string());
+            args.push(input.working_directory.to_string_lossy().to_string());
+            for file in &input.files_to_read {
+                args.push("-f".to_string());
+                args.push(file.to_string_lossy().to_string());
+            }
+            args.push(input.prompt.clone());
+
             let mut cmd = tokio::process::Command::new(&self.binary);
-            cmd.args(&self.args)
-                .current_dir(&input.working_directory)
-                .stdin(std::process::Stdio::piped())
+            cmd.args(&args)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
 
-            let mut child = match cmd.spawn() {
-                Ok(child) => child,
+            let output = match cmd.output().await {
+                Ok(output) => output,
                 Err(e) => {
                     if let Some(gate) = &self.error_gate {
                         gate.report_and_wait(&format!(
@@ -1184,18 +1222,62 @@ impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
                 }
             };
 
-            if let Some(mut stdin) = child.stdin.take() {
-                use tokio::io::AsyncWriteExt;
-                stdin.write_all(input.prompt.as_bytes()).await?;
-                drop(stdin);
+            let stdout_raw = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr_raw = String::from_utf8_lossy(&output.stderr).to_string();
+            let extracted = extract_text_from_json_events(&stdout_raw);
+
+            if extracted.is_empty() && !output.status.success() {
+                if let Some(gate) = &self.error_gate {
+                    gate.report_and_wait(&format!(
+                        "Agent binary '{}' failed (exit {:?}): {}",
+                        self.binary,
+                        output.status.code(),
+                        stderr_raw.trim(),
+                    )).await;
+                    continue;
+                }
             }
 
-            let output = child.wait_with_output().await?;
-
             return Ok(AgentResponse {
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stdout: extracted,
                 success: output.status.success(),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_tests {
+    use super::extract_text_from_json_events;
+
+    #[test]
+    fn test_extract_text_from_single_text_event() {
+        let input = r#"{"type":"text","part":{"type":"text","text":"Hello world"}}"#;
+        assert_eq!(extract_text_from_json_events(input), "Hello world");
+    }
+
+    #[test]
+    fn test_extract_text_from_multiple_events() {
+        let input = r#"{"type":"step_start","part":{"type":"step-start"}}
+{"type":"text","part":{"type":"text","text":"Bug: overflow"}}
+{"type":"step_finish","part":{"type":"step-finish"}}"#;
+        assert_eq!(extract_text_from_json_events(input), "Bug: overflow");
+    }
+
+    #[test]
+    fn test_extract_text_from_error_event() {
+        let input = r#"{"type":"error","error":{"name":"APIError","data":{"message":"Missing Auth","statusCode":401}}}"#;
+        assert_eq!(extract_text_from_json_events(input), "[agent error: Missing Auth]");
+    }
+
+    #[test]
+    fn test_extract_text_empty_input() {
+        assert_eq!(extract_text_from_json_events(""), "");
+    }
+
+    #[test]
+    fn test_extract_text_invalid_json_lines() {
+        let input = "not json\n{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"ok\"}}\nalso not json";
+        assert_eq!(extract_text_from_json_events(input), "ok");
     }
 }

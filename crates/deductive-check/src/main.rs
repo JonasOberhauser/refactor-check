@@ -72,11 +72,14 @@ struct Cli {
     #[arg(long, default_value_t = true)]
     agent_skip_permissions: bool,
 
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "opencode/deepseek-v4-flash-free")]
     agent_model: String,
 
     #[arg(long)]
     agent_dir: Option<String>,
+
+    #[arg(long, default_value = "verification/result.json")]
+    result_file: String,
 }
 
 fn resolve_api_key(key: Option<&str>) -> String {
@@ -160,8 +163,8 @@ fn main() -> Result<()> {
     let agent_binary = cli.agent_binary.clone();
     let agent_subcommand = cli.agent_subcommand.clone();
     let agent_model = cli.agent_model.clone();
-    let agent_dir = cli.agent_dir.clone();
     let agent_skip_permissions = cli.agent_skip_permissions;
+    let result_file = cli.result_file.clone();
 
     let shell = ErrorShell::with_base_plugins()
         .with_config::<UpdateArgs, AppConfig>("set", config_live.clone())?;
@@ -185,12 +188,8 @@ fn main() -> Result<()> {
                 agent_args.push("--dangerously-skip-permissions".to_string());
             }
             if !agent_model.is_empty() {
-                agent_args.push("--model".to_string());
+                agent_args.push("-m".to_string());
                 agent_args.push(agent_model);
-            }
-            if let Some(ref dir) = agent_dir {
-                agent_args.push("--dir".to_string());
-                agent_args.push(dir.clone());
             }
             let mut agent = deductive_check::provider::CliAgentProvider::new(agent_binary, agent_args);
             if let Some(g) = &gate {
@@ -210,6 +209,16 @@ fn main() -> Result<()> {
             let pm = DefaultDeductivePieceManager::new();
 
             let result = machine::run(&project, &providers, &pm).await?;
+
+            let result_path = std::path::PathBuf::from(&result_file);
+            if let Some(parent) = result_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            if let Err(e) = result.save_to_file(&result_path) {
+                eprintln!("Warning: failed to save result to {}: {e}", result_path.display());
+            } else {
+                eprintln!("Result saved to {}", result_path.display());
+            }
 
             println!("\n{}", "=" .repeat(60));
             println!("Deductive verification complete");
