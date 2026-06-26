@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
+use tracing::warn;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
@@ -94,7 +95,7 @@ fn resolve_api_key(key: Option<&str>) -> String {
             if path.is_file() {
                 std::fs::read_to_string(path)
                     .unwrap_or_else(|e| {
-                        eprintln!("Warning: could not read api key file {s}: {e}");
+                        warn!("could not read api key file {s}: {e}");
                         s.to_string()
                     })
                     .trim()
@@ -176,14 +177,14 @@ fn main() -> Result<()> {
             .with_ansi(force_ansi);
         tracing_subscriber::registry()
             .with(filter)
-            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
             .with(file_layer)
             .with(MessageLogLayer::new(log.clone()))
             .init();
     } else {
         tracing_subscriber::registry()
             .with(filter)
-            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
             .with(MessageLogLayer::new(log.clone()))
             .init();
     }
@@ -247,9 +248,9 @@ fn main() -> Result<()> {
                 std::fs::create_dir_all(parent)?;
             }
             if let Err(e) = result.save_to_file(&result_path) {
-                eprintln!("Warning: failed to save result to {}: {e}", result_path.display());
+                warn!("failed to save result to {}: {e}", result_path.display());
             } else {
-                eprintln!("Result saved to {}", result_path.display());
+                println!("Result saved to {}", result_path.display());
             }
 
             println!("\n{}", "=" .repeat(60));

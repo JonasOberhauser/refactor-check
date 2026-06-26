@@ -52,7 +52,7 @@ impl<'a> ShellContext<'a> {
     }
 
     pub fn exit(&self) -> ! {
-        eprintln!("[exiting...]");
+        println!("[exiting...]");
         std::process::exit(0);
     }
 
