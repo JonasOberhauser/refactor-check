@@ -220,29 +220,20 @@ impl ShellPlugin for ShowPlugin {
             if keys.is_empty() {
                 return "No pieces recorded yet".to_string();
             }
-            let mut top_level: Vec<String> = keys
-                .iter()
-                .filter(|k| !k.contains('.'))
-                .cloned()
-                .collect();
-            top_level.sort_by(|a, b| {
-                let na: u64 = a.parse().unwrap_or(0);
-                let nb: u64 = b.parse().unwrap_or(0);
-                na.cmp(&nb)
+            let mut sorted = keys;
+            sorted.sort_by(|a, b| {
+                let sa: Vec<u64> = a.split('.').filter_map(|s| s.parse().ok()).collect();
+                let sb: Vec<u64> = b.split('.').filter_map(|s| s.parse().ok()).collect();
+                sa.cmp(&sb)
             });
             let mut out = String::new();
-            for top in &top_level {
-                let children: Vec<&String> = keys
-                    .iter()
-                    .filter(|k| k.starts_with(top.as_str()) && k.as_str() != top.as_str())
-                    .collect();
-                out.push_str(top);
-                out.push('\n');
-                for child in &children {
+            for key in &sorted {
+                let depth = key.matches('.').count();
+                for _ in 0..depth {
                     out.push_str("  ");
-                    out.push_str(child);
-                    out.push('\n');
                 }
+                out.push_str(key);
+                out.push('\n');
             }
             out
         } else if !is_valid_ctx_id(ctx_id) {
