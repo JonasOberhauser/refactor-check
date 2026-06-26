@@ -1,11 +1,17 @@
 use std::future::Future;
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
+use rustyline::completion::Completer;
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::Editor;
 
 use crate::config_update::{ApplyTo, SetPlugin};
 use crate::live_config::LiveConfig;
@@ -121,6 +127,44 @@ impl ShellPlugin for HelpPlugin {
     }
 }
 
+struct ShellHelper {
+    commands: Vec<String>,
+}
+
+impl ShellHelper {
+    fn new(commands: Vec<String>) -> Self {
+        Self { commands }
+    }
+}
+
+impl Completer for ShellHelper {
+    type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        let prefix = &line[..pos];
+        let matches: Vec<String> = self
+            .commands
+            .iter()
+            .filter(|cmd| cmd.starts_with(prefix))
+            .cloned()
+            .collect();
+        Ok((0, matches))
+    }
+}
+
+impl Hinter for ShellHelper {
+    type Hint = String;
+}
+
+impl Highlighter for ShellHelper {}
+impl Validator for ShellHelper {}
+impl rustyline::Helper for ShellHelper {}
+
 pub struct ErrorShell {
     plugins: Vec<Box<dyn ShellPlugin>>,
 }
@@ -196,24 +240,6 @@ impl ErrorShell {
                 rt.block_on(work(Some(gate)))
             })?;
 
-        let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
-        std::thread::Builder::new()
-            .name("stdin".to_string())
-            .spawn(move || {
-                let stdin = std::io::stdin();
-                let mut buf = String::new();
-                loop {
-                    buf.clear();
-                    match stdin.read_line(&mut buf) {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let _ = cmd_tx.send(buf.trim().to_string());
-                        }
-                        Err(_) => break,
-                    }
-                }
-            })?;
-
         let plugin_infos: Vec<PluginInfo> = self
             .plugins
             .iter()
@@ -223,63 +249,67 @@ impl ErrorShell {
             })
             .collect();
 
-        println!("[Interactive error shell — type 'help' for commands]");
-
+        let command_names: Vec<String> = plugin_infos.iter().map(|p| p.name.clone()).collect();
         let plugins = self.plugins;
+
+        let mut editor = Editor::new()?;
+        editor.set_helper(Some(ShellHelper::new(command_names)));
+
+        println!("[Interactive error shell — type 'help' for commands]");
 
         loop {
             while let Ok(error) = rx.try_recv() {
                 println!("\n--- ERROR ---\n{error}\n-------------");
-                print!("> ");
-                let _ = std::io::stdout().flush();
-            }
-
-            loop {
-                match cmd_rx.try_recv() {
-                    Ok(cmd) => {
-                        if cmd.is_empty() {
-                            continue;
-                        }
-
-                        let (name, args) = match cmd.split_once(char::is_whitespace) {
-                            Some((n, a)) => (n, a.trim()),
-                            None => (cmd.as_str(), ""),
-                        };
-
-                        let ctx = ShellContext {
-                            epoch: &epoch,
-                            plugin_infos: &plugin_infos,
-                        };
-
-                        match plugins.iter().find(|p| p.name() == name) {
-                            Some(plugin) => {
-                                let msg = plugin.handle(args, &ctx);
-                                if !msg.is_empty() {
-                                    println!("{msg}");
-                                }
-                                print!("> ");
-                                let _ = std::io::stdout().flush();
-                            }
-                            None => {
-                                println!(
-                                    "[unknown command: '{cmd}' — type 'help' for available commands]"
-                                );
-                            }
-                        }
-                    }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        println!("[EOF — exiting]");
-                        std::process::exit(0);
-                    }
-                }
             }
 
             if bg_handle.is_finished() {
                 break;
             }
 
-            std::thread::sleep(Duration::from_millis(50));
+            let line = match editor.readline("> ") {
+                Ok(line) => line,
+                Err(ReadlineError::Interrupted) => continue,
+                Err(ReadlineError::Eof) => {
+                    println!("[EOF — exiting]");
+                    std::process::exit(0);
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+            let cmd = line.trim();
+            if cmd.is_empty() {
+                continue;
+            }
+
+            let _ = editor.add_history_entry(cmd);
+
+            let (name, args) = match cmd.split_once(char::is_whitespace) {
+                Some((n, a)) => (n, a.trim()),
+                None => (cmd, ""),
+            };
+
+            let ctx = ShellContext {
+                epoch: &epoch,
+                plugin_infos: &plugin_infos,
+            };
+
+            match plugins.iter().find(|p| p.name() == name) {
+                Some(plugin) => {
+                    let msg = plugin.handle(args, &ctx);
+                    if !msg.is_empty() {
+                        println!("{msg}");
+                    }
+                }
+                None => {
+                    println!(
+                        "[unknown command: '{cmd}' — type 'help' for available commands]"
+                    );
+                }
+            }
+
+            while let Ok(error) = rx.try_recv() {
+                println!("\n--- ERROR ---\n{error}\n-------------");
+            }
         }
 
         bg_handle

@@ -1,5 +1,6 @@
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use tracing::field::Visit;
@@ -8,6 +9,7 @@ use tracing_subscriber::layer::Layer;
 use crate::error_gate::{ShellContext, ShellPlugin};
 
 pub struct LogEntry {
+    pub seq: u64,
     pub level: tracing::Level,
     pub target: String,
     pub message: String,
@@ -16,6 +18,7 @@ pub struct LogEntry {
 
 pub struct MessageLog {
     entries: DashMap<String, Vec<LogEntry>>,
+    counter: AtomicU64,
 }
 
 impl Default for MessageLog {
@@ -28,6 +31,7 @@ impl MessageLog {
     pub fn new() -> Self {
         Self {
             entries: DashMap::new(),
+            counter: AtomicU64::new(0),
         }
     }
 
@@ -36,6 +40,10 @@ impl MessageLog {
             .entry(context_id)
             .or_default()
             .push(entry);
+    }
+
+    pub fn next_seq(&self) -> u64 {
+        self.counter.fetch_add(1, Ordering::Relaxed)
     }
 
     pub fn get(&self, context_id: &str) -> Vec<LogEntry> {
@@ -47,6 +55,10 @@ impl MessageLog {
 
     pub fn keys(&self) -> Vec<String> {
         self.entries.iter().map(|r| r.key().clone()).collect()
+    }
+
+    pub fn has(&self, context_id: &str) -> bool {
+        self.entries.contains_key(context_id)
     }
 }
 
@@ -139,6 +151,7 @@ impl<S: tracing::Subscriber> Layer<S> for MessageLogLayer {
         let level = *event.metadata().level();
         let target = event.metadata().target().to_string();
         let entry = LogEntry {
+            seq: self.log.next_seq(),
             level,
             target,
             message: visitor.message,
@@ -154,6 +167,7 @@ impl<S: tracing::Subscriber> Layer<S> for MessageLogLayer {
 impl Clone for LogEntry {
     fn clone(&self) -> Self {
         Self {
+            seq: self.seq,
             level: self.level,
             target: self.target.clone(),
             message: self.message.clone(),
@@ -232,7 +246,7 @@ impl ShellPlugin for ShowPlugin {
             }
             out
         } else if !is_valid_ctx_id(ctx_id) {
-            return format!("Invalid piece id: '{ctx_id}' — expected dotted number like 1.2.3");
+            format!("Invalid piece id: '{ctx_id}' — expected dotted number like 1.2.3")
         } else {
             self.show_piece(ctx_id)
         }
@@ -241,39 +255,49 @@ impl ShellPlugin for ShowPlugin {
 
 impl ShowPlugin {
     fn show_piece(&self, ctx_id: &str) -> String {
-        let ancestors = ancestors(ctx_id);
-        let mut out = String::new();
+        let ancestor_ids = ancestors(ctx_id);
 
-        for ancestor in &ancestors {
-            let entries = self.log.get(ancestor);
-            if entries.is_empty() {
-                continue;
-            }
+        if !self.log.has(ctx_id) {
+            return format!("No messages found for {ctx_id}");
+        }
 
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(&format!("--- {} ---\n", ancestor));
-            for entry in &entries {
-                let level_str = match entry.level {
-                    tracing::Level::ERROR => "ERROR",
-                    tracing::Level::WARN => "WARN ",
-                    tracing::Level::INFO => "INFO ",
-                    tracing::Level::DEBUG => "DEBUG",
-                    tracing::Level::TRACE => "TRACE",
-                };
-                out.push_str(level_str);
-                out.push(' ');
-                out.push_str(&entry.message);
-                for (name, value) in &entry.fields {
-                    out.push_str(&format!(" {name}={value}"));
-                }
-                out.push('\n');
+        let mut all_entries: Vec<(String, LogEntry)> = Vec::new();
+        for ancestor in &ancestor_ids {
+            for entry in self.log.get(ancestor) {
+                all_entries.push((ancestor.clone(), entry));
             }
         }
 
+        all_entries.sort_by_key(|(_, e)| e.seq);
+
+        let mut out = String::new();
+        let mut prev_ancestor = "";
+        for (ancestor, entry) in &all_entries {
+            if ancestor != prev_ancestor {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&format!("--- {} ---\n", ancestor));
+                prev_ancestor = ancestor;
+            }
+            let level_str = match entry.level {
+                tracing::Level::ERROR => "ERROR",
+                tracing::Level::WARN => "WARN ",
+                tracing::Level::INFO => "INFO ",
+                tracing::Level::DEBUG => "DEBUG",
+                tracing::Level::TRACE => "TRACE",
+            };
+            out.push_str(level_str);
+            out.push(' ');
+            out.push_str(&entry.message);
+            for (name, value) in &entry.fields {
+                out.push_str(&format!(" {name}={value}"));
+            }
+            out.push('\n');
+        }
+
         if out.is_empty() {
-            format!("No messages found for {ctx_id} or its ancestors")
+            format!("No messages found for {ctx_id}")
         } else {
             out
         }
@@ -283,6 +307,16 @@ impl ShowPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_entry(log: &MessageLog, message: &str) -> LogEntry {
+        LogEntry {
+            seq: log.next_seq(),
+            level: tracing::Level::INFO,
+            target: "test".to_string(),
+            message: message.to_string(),
+            fields: vec![],
+        }
+    }
 
     #[test]
     fn test_ancestors_leaf() {
@@ -313,13 +347,7 @@ mod tests {
     #[test]
     fn test_message_log_push_and_get() {
         let log = MessageLog::new();
-        let entry = LogEntry {
-            level: tracing::Level::INFO,
-            target: "test".to_string(),
-            message: "hello".to_string(),
-            fields: vec![],
-        };
-        log.push("1.2".to_string(), entry);
+        log.push("1.2".to_string(), test_entry(&log, "hello"));
         let entries = log.get("1.2");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].message, "hello");
@@ -343,51 +371,11 @@ mod tests {
     #[test]
     fn test_show_plugin_list_ids() {
         let log = Arc::new(MessageLog::new());
-        log.push(
-            "2".to_string(),
-            LogEntry {
-                level: tracing::Level::INFO,
-                target: "test".to_string(),
-                message: "msg".to_string(),
-                fields: vec![],
-            },
-        );
-        log.push(
-            "2.1".to_string(),
-            LogEntry {
-                level: tracing::Level::INFO,
-                target: "test".to_string(),
-                message: "msg".to_string(),
-                fields: vec![],
-            },
-        );
-        log.push(
-            "1".to_string(),
-            LogEntry {
-                level: tracing::Level::INFO,
-                target: "test".to_string(),
-                message: "msg".to_string(),
-                fields: vec![],
-            },
-        );
-        log.push(
-            "1.2".to_string(),
-            LogEntry {
-                level: tracing::Level::INFO,
-                target: "test".to_string(),
-                message: "msg".to_string(),
-                fields: vec![],
-            },
-        );
-        log.push(
-            "1.2.3".to_string(),
-            LogEntry {
-                level: tracing::Level::INFO,
-                target: "test".to_string(),
-                message: "msg".to_string(),
-                fields: vec![],
-            },
-        );
+        log.push("2".to_string(), test_entry(&log, "msg"));
+        log.push("2.1".to_string(), test_entry(&log, "msg"));
+        log.push("1".to_string(), test_entry(&log, "msg"));
+        log.push("1.2".to_string(), test_entry(&log, "msg"));
+        log.push("1.2.3".to_string(), test_entry(&log, "msg"));
         let plugin = ShowPlugin::new(log);
         let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let infos: Vec<crate::error_gate::PluginInfo> = vec![];
@@ -412,27 +400,55 @@ mod tests {
     }
 
     #[test]
+    fn test_show_plugin_no_parents_for_nonexistent() {
+        let log = Arc::new(MessageLog::new());
+        log.push("1".to_string(), test_entry(&log, "root msg"));
+        log.push("1.1".to_string(), test_entry(&log, "child1"));
+        log.push("1.2".to_string(), test_entry(&log, "child2"));
+        let plugin = ShowPlugin::new(log);
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let infos: Vec<crate::error_gate::PluginInfo> = vec![];
+        let ctx = ShellContext::new(&epoch, &infos);
+        let result = plugin.handle("1.3", &ctx);
+        assert!(result.contains("No messages found"));
+    }
+
+    #[test]
+    fn test_show_plugin_chronological_order() {
+        let log = Arc::new(MessageLog::new());
+        log.push("1".to_string(), test_entry(&log, "first"));
+        log.push("1.2".to_string(), test_entry(&log, "second"));
+        log.push("1".to_string(), test_entry(&log, "third"));
+        log.push("1.2".to_string(), test_entry(&log, "fourth"));
+        let plugin = ShowPlugin::new(log);
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let infos: Vec<crate::error_gate::PluginInfo> = vec![];
+        let ctx = ShellContext::new(&epoch, &infos);
+        let result = plugin.handle("1.2", &ctx);
+        let first_pos = result.find("first").unwrap();
+        let second_pos = result.find("second").unwrap();
+        let third_pos = result.find("third").unwrap();
+        let fourth_pos = result.find("fourth").unwrap();
+        assert!(first_pos < second_pos);
+        assert!(second_pos < third_pos);
+        assert!(third_pos < fourth_pos);
+    }
+
+    #[test]
     fn test_show_plugin_with_entries() {
         let log = Arc::new(MessageLog::new());
-        log.push(
-            "1".to_string(),
-            LogEntry {
-                level: tracing::Level::INFO,
-                target: "test".to_string(),
-                message: "root msg".to_string(),
-                fields: vec![],
-            },
-        );
+        log.push("1".to_string(), test_entry(&log, "root msg"));
         log.push(
             "1.2".to_string(),
             LogEntry {
+                seq: log.next_seq(),
                 level: tracing::Level::WARN,
                 target: "test".to_string(),
                 message: "warn msg".to_string(),
                 fields: vec![("attempt".to_string(), "1".to_string())],
             },
         );
-        let plugin = ShowPlugin::new(log.clone());
+        let plugin = ShowPlugin::new(log);
         let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let infos: Vec<crate::error_gate::PluginInfo> = vec![];
         let ctx = ShellContext::new(&epoch, &infos);
