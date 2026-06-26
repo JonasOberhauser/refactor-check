@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use dashmap::DashMap;
 use refactor_check_core::context_id::ContextId;
+use refactor_check_core::message_log::MessageLog;
 use refactor_check_core::phase_tracker::{DefaultPhaseTracker, PhaseTracker};
 
 use crate::code_piece::{DeductiveCodePiece, FunctionId};
@@ -42,22 +45,24 @@ pub struct DefaultDeductivePieceManager {
     piece_tracker: DefaultPhaseTracker<CodePiecePhase>,
     formula_tracker: DefaultPhaseTracker<FormulaPhase>,
     function_docs: DashMap<FunctionId, String>,
+    message_log: Arc<MessageLog>,
 }
 
 impl DefaultDeductivePieceManager {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(message_log: Arc<MessageLog>) -> Self {
         Self {
             piece_tracker: DefaultPhaseTracker::new(),
             formula_tracker: DefaultPhaseTracker::new(),
             function_docs: DashMap::new(),
+            message_log,
         }
     }
 }
 
 impl Default for DefaultDeductivePieceManager {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(MessageLog::new()))
     }
 }
 
@@ -81,15 +86,18 @@ impl DeductivePieceManager for DefaultDeductivePieceManager {
         );
         assert!(piece.type_invariant(), "type invariant violated: code piece {} has empty code", ctx);
         self.piece_tracker.advance(&ctx, None, CodePiecePhase::Open);
+        self.message_log.set_status(ctx.to_string(), CodePiecePhase::Open.to_string());
         (piece, ctx)
     }
 
     fn advance_piece(&self, ctx: &ContextId, from: Option<CodePiecePhase>, to: CodePiecePhase) {
         self.piece_tracker.advance(ctx, from, to);
+        self.message_log.set_status(ctx.to_string(), to.to_string());
     }
 
     fn expect_piece_phase_and_set(&self, ctx: &ContextId, valid_from: &[CodePiecePhase], to: CodePiecePhase) {
         self.piece_tracker.expect_any_and_set(ctx, valid_from, to);
+        self.message_log.set_status(ctx.to_string(), to.to_string());
     }
 
     fn enter_piece_formalizer(&self, ctx: &ContextId, to: CodePiecePhase) {
@@ -98,6 +106,7 @@ impl DeductivePieceManager for DefaultDeductivePieceManager {
             &[CodePiecePhase::Open, CodePiecePhase::GetContext, CodePiecePhase::Formalizer, CodePiecePhase::Check],
             to,
         );
+        self.message_log.set_status(ctx.to_string(), to.to_string());
     }
 
     fn piece_phase(&self, ctx: &ContextId) -> Option<CodePiecePhase> {
@@ -114,15 +123,18 @@ impl DeductivePieceManager for DefaultDeductivePieceManager {
         let ctx = parent_ctx.new_child();
         let formula = Formula::new(content, source, iteration);
         self.formula_tracker.advance(&ctx, None, FormulaPhase::Open);
+        self.message_log.set_status(ctx.to_string(), FormulaPhase::Open.to_string());
         (formula, ctx)
     }
 
     fn advance_formula(&self, ctx: &ContextId, from: Option<FormulaPhase>, to: FormulaPhase) {
         self.formula_tracker.advance(ctx, from, to);
+        self.message_log.set_status(ctx.to_string(), to.to_string());
     }
 
     fn expect_formula_phase_and_set(&self, ctx: &ContextId, valid_from: &[FormulaPhase], to: FormulaPhase) {
         self.formula_tracker.expect_any_and_set(ctx, valid_from, to);
+        self.message_log.set_status(ctx.to_string(), to.to_string());
     }
 
     fn formula_phase(&self, ctx: &ContextId) -> Option<FormulaPhase> {
@@ -140,7 +152,7 @@ impl DeductivePieceManager for DefaultDeductivePieceManager {
 
 #[cfg(test)]
 pub fn test_pm() -> DefaultDeductivePieceManager {
-    DefaultDeductivePieceManager::new()
+    DefaultDeductivePieceManager::new(Arc::new(MessageLog::new()))
 }
 
 #[cfg(test)]

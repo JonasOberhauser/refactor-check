@@ -18,6 +18,7 @@ pub struct LogEntry {
 
 pub struct MessageLog {
     entries: DashMap<String, Vec<LogEntry>>,
+    statuses: DashMap<String, String>,
     counter: AtomicU64,
 }
 
@@ -31,6 +32,7 @@ impl MessageLog {
     pub fn new() -> Self {
         Self {
             entries: DashMap::new(),
+            statuses: DashMap::new(),
             counter: AtomicU64::new(0),
         }
     }
@@ -59,6 +61,14 @@ impl MessageLog {
 
     pub fn has(&self, context_id: &str) -> bool {
         self.entries.contains_key(context_id)
+    }
+
+    pub fn set_status(&self, context_id: String, status: String) {
+        self.statuses.insert(context_id, status);
+    }
+
+    pub fn get_status(&self, context_id: &str) -> Option<String> {
+        self.statuses.get(context_id).map(|r| r.value().clone())
     }
 }
 
@@ -226,13 +236,26 @@ impl ShellPlugin for ShowPlugin {
                 let sb: Vec<u64> = b.split('.').filter_map(|s| s.parse().ok()).collect();
                 sa.cmp(&sb)
             });
+            let max_id_len = sorted
+                .iter()
+                .map(|k| k.len() + k.matches('.').count() * 2)
+                .max()
+                .unwrap_or(0);
             let mut out = String::new();
             for key in &sorted {
                 let depth = key.matches('.').count();
-                for _ in 0..depth {
+                let indent = depth * 2;
+                let status = self.log.get_status(key).unwrap_or("-".to_string());
+                let visual_len = key.len() + indent;
+                let padding = max_id_len.saturating_sub(visual_len) + 2;
+                for _ in 0..indent {
                     out.push_str("  ");
                 }
                 out.push_str(key);
+                for _ in 0..padding {
+                    out.push(' ');
+                }
+                out.push_str(&status);
                 out.push('\n');
             }
             out

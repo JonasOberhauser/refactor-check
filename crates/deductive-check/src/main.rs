@@ -200,7 +200,7 @@ fn main() -> Result<()> {
 
     let shell = ErrorShell::with_base_plugins()
         .with_config::<UpdateArgs, AppConfig>("set", config_live.clone())?
-        .with_plugin(Box::new(ShowPlugin::new(log)))?;
+        .with_plugin(Box::new(ShowPlugin::new(log.clone())))?;
 
     shell.run(
         move |gate| async move {
@@ -239,7 +239,7 @@ fn main() -> Result<()> {
                 agent: &agent,
             };
 
-            let pm = DefaultDeductivePieceManager::new();
+            let pm = DefaultDeductivePieceManager::new(log.clone());
 
             let result = machine::run(&project, &providers, &pm).await?;
 

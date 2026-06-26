@@ -75,6 +75,12 @@ where
     }
 }
 
+impl<P> DefaultPhaseTracker<P> {
+    pub fn phases(&self) -> &DashMap<u64, P> {
+        &self.phases
+    }
+}
+
 impl<P> Default for DefaultPhaseTracker<P>
 where
     P: PartialEq + Debug + Clone + Send + Sync,
