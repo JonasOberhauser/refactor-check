@@ -44,6 +44,10 @@ impl MessageLog {
             .map(|r| r.value().clone())
             .unwrap_or_default()
     }
+
+    pub fn keys(&self) -> Vec<String> {
+        self.entries.iter().map(|r| r.key().clone()).collect()
+    }
 }
 
 struct EventVisitor {
@@ -192,18 +196,51 @@ impl ShellPlugin for ShowPlugin {
     }
 
     fn description(&self) -> &str {
-        "Show message history for a piece id and its ancestors (e.g. 'show 1.2.3')"
+        "Show message history for a piece id and its ancestors (e.g. 'show 1.2.3'), or list all ids with no args"
     }
 
     fn handle(&self, args: &str, _ctx: &ShellContext<'_>) -> String {
         let ctx_id = args.trim();
         if ctx_id.is_empty() {
-            return "Usage: show <piece_id>  (e.g. show 1.2.3)".to_string();
-        }
-        if !is_valid_ctx_id(ctx_id) {
+            let keys = self.log.keys();
+            if keys.is_empty() {
+                return "No pieces recorded yet".to_string();
+            }
+            let mut top_level: Vec<String> = keys
+                .iter()
+                .filter(|k| !k.contains('.'))
+                .cloned()
+                .collect();
+            top_level.sort_by(|a, b| {
+                let na: u64 = a.parse().unwrap_or(0);
+                let nb: u64 = b.parse().unwrap_or(0);
+                na.cmp(&nb)
+            });
+            let mut out = String::new();
+            for top in &top_level {
+                let children: Vec<&String> = keys
+                    .iter()
+                    .filter(|k| k.starts_with(top.as_str()) && k.as_str() != top.as_str())
+                    .collect();
+                out.push_str(top);
+                out.push('\n');
+                for child in &children {
+                    out.push_str("  ");
+                    out.push_str(child);
+                    out.push('\n');
+                }
+            }
+            out
+        } else if !is_valid_ctx_id(ctx_id) {
             return format!("Invalid piece id: '{ctx_id}' — expected dotted number like 1.2.3");
+        } else {
+            self.show_piece(ctx_id)
         }
+    }
+}
 
+impl ShowPlugin {
+    fn show_piece(&self, ctx_id: &str) -> String {
         let ancestors = ancestors(ctx_id);
         let mut out = String::new();
 
@@ -297,10 +334,70 @@ mod tests {
         let infos: Vec<crate::error_gate::PluginInfo> = vec![];
         let ctx = ShellContext::new(&epoch, &infos);
         let result = plugin.handle("", &ctx);
-        assert!(result.contains("Usage"));
+        assert!(result.contains("No pieces recorded"));
 
         let result = plugin.handle("abc", &ctx);
         assert!(result.contains("Invalid"));
+    }
+
+    #[test]
+    fn test_show_plugin_list_ids() {
+        let log = Arc::new(MessageLog::new());
+        log.push(
+            "2".to_string(),
+            LogEntry {
+                level: tracing::Level::INFO,
+                target: "test".to_string(),
+                message: "msg".to_string(),
+                fields: vec![],
+            },
+        );
+        log.push(
+            "2.1".to_string(),
+            LogEntry {
+                level: tracing::Level::INFO,
+                target: "test".to_string(),
+                message: "msg".to_string(),
+                fields: vec![],
+            },
+        );
+        log.push(
+            "1".to_string(),
+            LogEntry {
+                level: tracing::Level::INFO,
+                target: "test".to_string(),
+                message: "msg".to_string(),
+                fields: vec![],
+            },
+        );
+        log.push(
+            "1.2".to_string(),
+            LogEntry {
+                level: tracing::Level::INFO,
+                target: "test".to_string(),
+                message: "msg".to_string(),
+                fields: vec![],
+            },
+        );
+        log.push(
+            "1.2.3".to_string(),
+            LogEntry {
+                level: tracing::Level::INFO,
+                target: "test".to_string(),
+                message: "msg".to_string(),
+                fields: vec![],
+            },
+        );
+        let plugin = ShowPlugin::new(log);
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let infos: Vec<crate::error_gate::PluginInfo> = vec![];
+        let ctx = ShellContext::new(&epoch, &infos);
+        let result = plugin.handle("", &ctx);
+        assert!(result.contains("1"));
+        assert!(result.contains("2"));
+        assert!(result.contains("1.2"));
+        assert!(result.contains("1.2.3"));
+        assert!(result.contains("2.1"));
     }
 
     #[test]
