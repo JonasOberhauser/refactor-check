@@ -258,15 +258,24 @@ impl ErrorShell {
         println!("[Interactive error shell — type 'help' for commands]");
 
         loop {
-            while let Ok(error) = rx.try_recv() {
-                println!("\n--- ERROR ---\n{error}\n-------------");
-            }
-
             if bg_handle.is_finished() {
                 break;
             }
 
-            let line = match editor.readline("> ") {
+            let mut pending_errors = String::new();
+            while let Ok(error) = rx.try_recv() {
+                if !pending_errors.is_empty() {
+                    pending_errors.push('\n');
+                }
+                pending_errors.push_str("\n--- ERROR ---\n");
+                pending_errors.push_str(&error);
+                pending_errors.push_str("\n-------------");
+            }
+            if !pending_errors.is_empty() {
+                println!("{pending_errors}");
+            }
+
+            let line = match editor.readline("$ ") {
                 Ok(line) => line,
                 Err(ReadlineError::Interrupted) => continue,
                 Err(ReadlineError::Eof) => {
@@ -305,10 +314,6 @@ impl ErrorShell {
                         "[unknown command: '{cmd}' — type 'help' for available commands]"
                     );
                 }
-            }
-
-            while let Ok(error) = rx.try_recv() {
-                println!("\n--- ERROR ---\n{error}\n-------------");
             }
         }
 
