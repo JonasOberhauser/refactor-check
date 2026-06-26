@@ -82,6 +82,9 @@ struct Cli {
 
     #[arg(long, default_value = "verification/result.json")]
     result_file: String,
+
+    #[arg(long)]
+    log: Option<String>,
 }
 
 fn resolve_api_key(key: Option<&str>) -> String {
@@ -149,18 +152,41 @@ impl From<&Cli> for AppConfig {
     }
 }
 
+fn parse_log_spec(spec: &str) -> (String, bool) {
+    if let Some(path) = spec.strip_prefix("ansi:") {
+        (path.to_string(), true)
+    } else {
+        (spec.to_string(), false)
+    }
+}
+
 fn main() -> Result<()> {
+    let cli = Cli::parse();
+
     let log = Arc::new(MessageLog::new());
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("deductive_check=info"));
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer())
-        .with(MessageLogLayer::new(log.clone()))
-        .init();
 
-    let cli = Cli::parse();
+    if let Some(log_spec) = &cli.log {
+        let (path, force_ansi) = parse_log_spec(log_spec);
+        let file = std::fs::File::create(&path)?;
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_writer(file)
+            .with_ansi(force_ansi);
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(file_layer)
+            .with(MessageLogLayer::new(log.clone()))
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(MessageLogLayer::new(log.clone()))
+            .init();
+    }
 
     let config_live = Arc::new(LiveConfig::new(AppConfig::from(&cli)));
 

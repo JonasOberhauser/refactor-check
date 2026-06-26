@@ -377,13 +377,9 @@ async fn split_function(
         let response = resp.value;
 
         let pieces = parse_split_pieces(response, &func_ctx, file, fid, body, pm);
-        let valid_pieces: Vec<(ArcCodePiece, ContextId)> = pieces
-            .into_iter()
-            .filter(|(p, _)| !p.code().trim().is_empty())
-            .collect();
 
-        if !valid_pieces.is_empty() {
-            return Ok(valid_pieces);
+        if !pieces.is_empty() {
+            return Ok(pieces);
         }
         warn!(attempt = attempt + 1, %func_ctx, function = %fid.display_name(), "splitter produced no valid pieces, retrying");
     }
@@ -412,9 +408,6 @@ fn parse_split_pieces(
     let mut pieces = Vec::new();
     for (_, content) in blocks {
         let code = content.trim().to_string();
-        if code.is_empty() {
-            continue;
-        }
         let end_line = fid.line + code.lines().count() as u32;
         let (piece, ctx) = pm.new_piece(
             func_ctx,
