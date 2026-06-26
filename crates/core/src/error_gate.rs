@@ -223,15 +223,15 @@ impl ErrorShell {
             })
             .collect();
 
-        eprintln!("[Interactive error shell — type 'help' for commands]");
+        println!("[Interactive error shell — type 'help' for commands]");
 
         let plugins = self.plugins;
 
         loop {
             while let Ok(error) = rx.try_recv() {
-                eprintln!("\n--- ERROR ---\n{error}\n-------------");
-                eprint!("> ");
-                let _ = std::io::stderr().flush();
+                println!("\n--- ERROR ---\n{error}\n-------------");
+                print!("> ");
+                let _ = std::io::stdout().flush();
             }
 
             loop {
@@ -255,13 +255,13 @@ impl ErrorShell {
                             Some(plugin) => {
                                 let msg = plugin.handle(args, &ctx);
                                 if !msg.is_empty() {
-                                    eprintln!("{msg}");
+                                    println!("{msg}");
                                 }
-                                eprint!("> ");
-                                let _ = std::io::stderr().flush();
+                                print!("> ");
+                                let _ = std::io::stdout().flush();
                             }
                             None => {
-                                eprintln!(
+                                println!(
                                     "[unknown command: '{cmd}' — type 'help' for available commands]"
                                 );
                             }
@@ -269,7 +269,7 @@ impl ErrorShell {
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        eprintln!("[EOF — exiting]");
+                        println!("[EOF — exiting]");
                         std::process::exit(0);
                     }
                 }
