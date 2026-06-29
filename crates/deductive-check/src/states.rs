@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use refactor_check_core::context_id::ContextId;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::code_piece::{ArcCodePiece, FunctionId};
 use crate::formula::FormulaSource;
@@ -81,27 +81,32 @@ impl AlgorithmState for Initializer {
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
         let branch_name = format!("verification/{timestamp}");
 
+        info!("IO: git CreateBranch");
         let resp = providers
             .git
             .invoke(GitRequest::CreateBranch {
                 name: branch_name.clone(),
             })
             .await?;
+        info!("IO response: git CreateBranch");
         if !resp.success {
             anyhow::bail!("Failed to create verification branch: {}", resp.output);
         }
 
         let verification_dir = self.project_path.join("verification").join(&timestamp);
+        info!("IO: git CreateDirectory");
         let resp = providers
             .git
             .invoke(GitRequest::CreateDirectory {
                 path: verification_dir.clone(),
             })
             .await?;
+        info!("IO response: git CreateDirectory");
         if !resp.success {
             anyhow::bail!("Failed to create verification directory: {}", resp.output);
         }
 
+        info!("IO: git WalkRustFiles");
         let resp = providers
             .git
             .invoke(GitRequest::WalkRustFiles {
@@ -116,6 +121,7 @@ impl AlgorithmState for Initializer {
             .collect();
         let mut seen = std::collections::HashSet::new();
         all_rust_files.retain(|f| seen.insert(f.clone()));
+        info!("IO response: {} rust files", all_rust_files.len());
 
         Ok(Step::State(Box::new(FunctionLister {
             project_path: self.project_path,
@@ -140,6 +146,7 @@ impl AlgorithmState for FunctionLister {
         providers: &Providers<'_>,
         _pm: &dyn crate::piece_manager::DeductivePieceManager,
     ) -> Result<Step> {
+        info!("IO: rust-analyzer ListFunctions");
         let resp = providers
             .rust_analyzer
             .invoke(RustAnalyzerRequest::ListFunctions {
@@ -147,6 +154,7 @@ impl AlgorithmState for FunctionLister {
                 cfg_verification: true,
             })
             .await?;
+        info!("IO response: rust-analyzer ListFunctions");
 
         let functions = match resp {
             RustAnalyzerResponse::FunctionList(fns) => fns,
@@ -266,12 +274,14 @@ impl AlgorithmState for FunctionAnalyzer {
                 let file = file.clone();
                 let fid = fid.clone();
                 let fut = async {
+                    debug!("IO: rust-analyzer GetFunctionCode");
                     let resp = providers
                         .rust_analyzer
                         .invoke(RustAnalyzerRequest::GetFunctionCode {
                             function_id: fid.clone(),
                         })
                         .await?;
+                    debug!("IO response: rust-analyzer GetFunctionCode");
                     let body = match resp {
                         RustAnalyzerResponse::FunctionCode(code) => code,
                         _ => anyhow::bail!("Expected FunctionCode from rust-analyzer"),
@@ -365,6 +375,7 @@ async fn split_function(
             )),
         ];
 
+        info!(%func_ctx, "IO: splitter");
         let resp = providers
             .llm
             .invoke(LlmRequest {
@@ -374,6 +385,7 @@ async fn split_function(
             })
             .await?;
         func_ctx = *resp.context_id;
+        info!(%func_ctx, "IO response: splitter");
         let response = resp.value;
 
         let pieces = parse_split_pieces(response, &func_ctx, file, fid, body, pm);
@@ -461,9 +473,11 @@ struct PieceOutcome {
 
 async fn gather_context(
     piece: &ArcCodePiece,
+    ctx: &ContextId,
     providers: &Providers<'_>,
 ) -> Result<String> {
     assert!(piece.type_invariant());
+    debug!(%ctx, "IO: rust-analyzer GetCalledFunctions");
     let resp = providers
         .rust_analyzer
         .invoke(RustAnalyzerRequest::GetCalledFunctions {
@@ -475,16 +489,19 @@ async fn gather_context(
         RustAnalyzerResponse::CalledFunctionList(fns) => fns,
         _ => Vec::new(),
     };
+    debug!(%ctx, "IO response: {} called functions", called_functions.len());
 
     let futs: Vec<_> = called_functions.into_iter().map(|cf| {
         async move {
             let name = cf.name.clone();
+            debug!(%ctx, "IO: rust-analyzer GetCalledFunctionCode");
             let resp = providers
                 .rust_analyzer
                 .invoke(RustAnalyzerRequest::GetCalledFunctionCode {
                     called: cf,
                 })
                 .await?;
+            debug!(%ctx, "IO response: rust-analyzer GetCalledFunctionCode");
             let result = match resp {
                 RustAnalyzerResponse::CalledFunctionCode(r) => r,
                 _ => return Ok::<_, anyhow::Error>(None),
@@ -534,6 +551,7 @@ async fn formalize_piece(
         )),
     ];
 
+    info!(%ctx, "IO: formalizer");
     let resp = providers
         .llm
         .invoke(LlmRequest {
@@ -542,8 +560,10 @@ async fn formalize_piece(
                 context_id: Box::new(ctx),
             })
             .await?;
+    let ctx = *resp.context_id;
+    info!(%ctx, "IO response: formalizer");
 
-    Ok((resp.value, *resp.context_id))
+    Ok((resp.value, ctx))
 }
 
 async fn check_formula(
@@ -567,6 +587,7 @@ async fn check_formula(
         }
     };
 
+    info!(%fctx, "IO: solver");
     let resp = providers
         .solver
             .invoke(SolverRequest {
@@ -576,6 +597,7 @@ async fn check_formula(
             .await?;
     let fctx = *resp.context_id;
     let result = resp.value;
+    info!(%fctx, outcome = ?result.outcome, "IO response: solver");
 
     let outcome = result.outcome.clone();
 
@@ -597,6 +619,7 @@ async fn fix_formula(
         crate::llm::user_message(&prompts::fixer_user(formula_content, error, context, docs_section)),
     ];
 
+    info!(%fctx, "IO: fixer");
     let resp = providers
         .llm
         .invoke(LlmRequest {
@@ -605,8 +628,10 @@ async fn fix_formula(
                 context_id: Box::new(fctx),
             })
             .await?;
+    let fctx = *resp.context_id;
+    info!(%fctx, "IO response: fixer");
 
-    Ok((resp.value, *resp.context_id))
+    Ok((resp.value, fctx))
 }
 
 async fn translate_formula(
@@ -618,12 +643,14 @@ async fn translate_formula(
     match source {
         FormulaSource::SmtLib => Ok(content.to_string()),
         FormulaSource::PyZ3 => {
+            debug!(%formula_ctx, "IO: python translate");
             let resp = providers
                 .python
                 .invoke(PythonRequest {
                     script: content.to_string(),
                 })
                 .await?;
+            debug!(%formula_ctx, "IO response: python translated");
 
             if resp.smtlib.is_empty() {
                 anyhow::bail!("Python script produced no SMT output for ctx {}", formula_ctx);
@@ -681,6 +708,7 @@ async fn check_and_fix_formula(
             FormulaPhase::Check,
         );
 
+        info!(%fctx, "IO: solver retry");
         let resp = providers
             .solver
             .invoke(SolverRequest {
@@ -690,6 +718,7 @@ async fn check_and_fix_formula(
             .await?;
         fctx = *resp.context_id;
         let fixed_result = resp.value;
+        info!(%fctx, outcome = ?fixed_result.outcome, "IO response: solver");
 
         outcome = fixed_result.outcome.clone();
         current_smt = translated;
@@ -722,6 +751,7 @@ async fn judge_piece(
         crate::llm::user_message(&prompts::judge_user(piece.code(), formulas_summary, &piece_ctx_info.called_functions, &piece_ctx_info.docs_section)),
     ];
 
+    info!(%ctx, "IO: judge");
     let resp = providers
         .llm
         .invoke(LlmRequest {
@@ -733,6 +763,7 @@ async fn judge_piece(
 
     let mut response = resp.value;
     let mut ctx = *resp.context_id;
+    info!(%ctx, "IO response: judge");
 
     for retry in 0..crate::consts::MAX_JUDGE_CLARIFICATION_RETRIES {
         let trimmed_upper = response.trim().to_uppercase();
@@ -748,6 +779,7 @@ async fn judge_piece(
         messages.push(crate::llm::assistant_message(&response));
         messages.push(crate::llm::user_message(&prompts::judge_retry(&response)));
 
+        info!(%ctx, "IO: judge retry");
         let resp = providers
             .llm
             .invoke(LlmRequest {
@@ -759,6 +791,7 @@ async fn judge_piece(
 
         response = resp.value;
         ctx = *resp.context_id;
+        info!(%ctx, "IO response: judge retry");
     }
 
     Ok((response, ctx))
@@ -775,7 +808,7 @@ async fn process_piece(
 
     pm.expect_piece_phase_and_set(&ctx, &[CodePiecePhase::Open], CodePiecePhase::GetContext);
 
-    let context = gather_context(piece, providers).await?;
+    let context = gather_context(piece, &ctx, providers).await?;
     info!(%ctx, "Gathered context for piece");
 
     let own_docs = pm.get_function_docs(piece.function_id());
@@ -793,7 +826,7 @@ async fn process_piece(
 
         let (formalizer_response, ctx2) = formalize_piece(piece, ctx, &context, &elaboration, &own_docs_section, providers).await?;
         ctx = ctx2;
-        info!(%ctx, judge_attempt, "Formalizer responded");
+        info!(%ctx, judge_attempt, "formalizer step done");
 
         let extracted = crate::formula::extract_formulas_from_response(&formalizer_response);
         if extracted.is_empty() {
@@ -859,6 +892,7 @@ async fn process_piece(
                 FormulaSource::PyZ3 => "py",
             };
             let filename = format!("ctx{}_iter{}_attempt{}.{}", fctx, iteration, judge_attempt, ext);
+            debug!(%ctx, "IO: filesystem write formula");
             let _ = providers
                 .filesystem
                 .invoke(FileSystemRequest {
@@ -867,27 +901,32 @@ async fn process_piece(
                     content: ef.content.clone(),
                 })
                 .await;
+            debug!(%ctx, "IO response: formula written");
         }
 
+        debug!(%ctx, "IO: git AddFiles");
         let _ = providers
             .git
             .invoke(GitRequest::AddFiles {
                 paths: vec![verification_dir.to_path_buf()],
             })
             .await;
+        debug!(%ctx, "IO response: files added");
+        debug!(%ctx, "IO: git Commit");
         let _ = providers
             .git
             .invoke(GitRequest::Commit {
                 message: format!("Add formulas for ctx {} (iteration {})", ctx, judge_attempt),
             })
             .await;
+        debug!(%ctx, "IO response: committed");
 
         pm.advance_piece(&ctx, Some(CodePiecePhase::Check), CodePiecePhase::Judge);
 
         let formulas_summary = formula_summaries.join("\n");
         let (judge_response, ctx2) = judge_piece(piece, ctx, &formulas_summary, &piece_ctx_info, providers).await?;
         ctx = ctx2;
-        info!(%ctx, judge_attempt, "Judge responded");
+        info!(%ctx, judge_attempt, "judge step done");
 
         let trimmed_upper = judge_response.trim().to_uppercase();
         let is_exact = trimmed_upper == crate::consts::JUDGE_REASONABLE;
@@ -1053,13 +1092,13 @@ impl AlgorithmState for ProblemAnalyzer {
         let mut files_to_recheck = self.recheck_files.clone();
 
         let base_commit = if self.base_commit.is_empty() {
-            info!("ProblemAnalyzer: getting current commit hash");
+            info!("IO: git CurrentCommitHash");
             let resp = providers.git.invoke(GitRequest::CurrentCommitHash).await?;
             resp.output.trim().to_string()
         } else {
             self.base_commit.clone()
         };
-        info!(%base_commit, "ProblemAnalyzer: base commit resolved");
+        info!(%base_commit, "IO response: git CurrentCommitHash");
 
         for (i, piece) in self.unverified.iter().enumerate() {
             info!(
@@ -1069,6 +1108,7 @@ impl AlgorithmState for ProblemAnalyzer {
                 function = %piece.function_id.display_name(),
                 "ProblemAnalyzer: processing unverified piece",
             );
+            info!("IO: rust-analyzer GetFileContent");
             let source = match providers
                 .rust_analyzer
                 .invoke(RustAnalyzerRequest::GetFileContent {
@@ -1160,6 +1200,7 @@ If you respond RETRY, make sure to commit your changes first."#,
                 source,
             );
 
+            info!("IO: agent problem analysis");
             let agent_resp = providers
                 .agent
                 .invoke(AgentRequest {
@@ -1168,22 +1209,27 @@ If you respond RETRY, make sure to commit your changes first."#,
                     files_to_read: vec![piece.file.clone()],
                 })
                 .await?;
+            info!("IO response: agent responded");
 
             let response = agent_resp.stdout.trim().to_string();
 
             if response.to_uppercase().starts_with("RETRY") {
+                info!("IO: git AddFiles");
                 let _ = providers
                     .git
                     .invoke(GitRequest::AddFiles {
                         paths: vec![piece.file.clone()],
                     })
                     .await;
+                info!("IO response: files added");
+                info!("IO: git Commit");
                 let _ = providers
                     .git
                     .invoke(GitRequest::Commit {
                         message: format!("Agent fix for {} at {}:{}", piece.function_id.display_name(), piece.file.display(), piece.start_line),
                     })
                     .await;
+                info!("IO response: committed");
 
                 remaining_unverified.push(piece.clone());
                 files_to_recheck.push(piece.file.clone());
@@ -1238,6 +1284,7 @@ impl AlgorithmState for Restarter {
         providers: &Providers<'_>,
         _pm: &dyn crate::piece_manager::DeductivePieceManager,
     ) -> Result<Step> {
+        info!("IO: git FindChangedRustFiles");
         let resp = providers
             .git
             .invoke(GitRequest::FindChangedRustFiles {
@@ -1254,6 +1301,7 @@ impl AlgorithmState for Restarter {
         } else {
             Vec::new()
         };
+        info!("IO response: {} changed files", changed_files.len());
 
         let mut all_files: Vec<PathBuf> = self
             .recheck_files
