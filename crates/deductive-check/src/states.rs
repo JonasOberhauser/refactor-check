@@ -477,7 +477,7 @@ async fn gather_context(
     providers: &Providers<'_>,
 ) -> Result<String> {
     assert!(piece.type_invariant());
-    debug!(%ctx, "IO: rust-analyzer GetCalledFunctions");
+    info!(%ctx, "IO: rust-analyzer GetCalledFunctions");
     let resp = providers
         .rust_analyzer
         .invoke(RustAnalyzerRequest::GetCalledFunctions {
@@ -489,19 +489,19 @@ async fn gather_context(
         RustAnalyzerResponse::CalledFunctionList(fns) => fns,
         _ => Vec::new(),
     };
-    debug!(%ctx, "IO response: {} called functions", called_functions.len());
+    info!(%ctx, "IO response: {} called functions", called_functions.len());
 
     let futs: Vec<_> = called_functions.into_iter().map(|cf| {
         async move {
             let name = cf.name.clone();
-            debug!(%ctx, "IO: rust-analyzer GetCalledFunctionCode");
+            info!(%ctx, "IO: rust-analyzer GetCalledFunctionCode");
             let resp = providers
                 .rust_analyzer
                 .invoke(RustAnalyzerRequest::GetCalledFunctionCode {
                     called: cf,
                 })
                 .await?;
-            debug!(%ctx, "IO response: rust-analyzer GetCalledFunctionCode");
+            info!(%ctx, "IO response: rust-analyzer GetCalledFunctionCode");
             let result = match resp {
                 RustAnalyzerResponse::CalledFunctionCode(r) => r,
                 _ => return Ok::<_, anyhow::Error>(None),
@@ -643,14 +643,14 @@ async fn translate_formula(
     match source {
         FormulaSource::SmtLib => Ok(content.to_string()),
         FormulaSource::PyZ3 => {
-            debug!(%formula_ctx, "IO: python translate");
+            info!(%formula_ctx, "IO: python translate");
             let resp = providers
                 .python
                 .invoke(PythonRequest {
                     script: content.to_string(),
                 })
                 .await?;
-            debug!(%formula_ctx, "IO response: python translated");
+            info!(%formula_ctx, "IO response: python translated");
 
             if resp.smtlib.is_empty() {
                 anyhow::bail!("Python script produced no SMT output for ctx {}", formula_ctx);
@@ -892,7 +892,7 @@ async fn process_piece(
                 FormulaSource::PyZ3 => "py",
             };
             let filename = format!("ctx{}_iter{}_attempt{}.{}", fctx, iteration, judge_attempt, ext);
-            debug!(%ctx, "IO: filesystem write formula");
+            info!(%ctx, "IO: filesystem write formula");
             let _ = providers
                 .filesystem
                 .invoke(FileSystemRequest {
@@ -901,25 +901,25 @@ async fn process_piece(
                     content: ef.content.clone(),
                 })
                 .await;
-            debug!(%ctx, "IO response: formula written");
+            info!(%ctx, "IO response: formula written");
         }
 
-        debug!(%ctx, "IO: git AddFiles");
+        info!(%ctx, "IO: git AddFiles");
         let _ = providers
             .git
             .invoke(GitRequest::AddFiles {
                 paths: vec![verification_dir.to_path_buf()],
             })
             .await;
-        debug!(%ctx, "IO response: files added");
-        debug!(%ctx, "IO: git Commit");
+        info!(%ctx, "IO response: files added");
+        info!(%ctx, "IO: git Commit");
         let _ = providers
             .git
             .invoke(GitRequest::Commit {
                 message: format!("Add formulas for ctx {} (iteration {})", ctx, judge_attempt),
             })
             .await;
-        debug!(%ctx, "IO response: committed");
+        info!(%ctx, "IO response: committed");
 
         pm.advance_piece(&ctx, Some(CodePiecePhase::Check), CodePiecePhase::Judge);
 
