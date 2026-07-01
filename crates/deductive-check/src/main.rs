@@ -92,25 +92,14 @@ fn looks_like_path(s: &str) -> bool {
     s.contains('/') || s.starts_with('~') || s.starts_with('.')
 }
 
-fn expand_tilde(s: &str) -> std::path::PathBuf {
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return std::path::PathBuf::from(home).join(rest);
-        }
-    } else if s == "~" {
-        if let Ok(home) = std::env::var("HOME") {
-            return std::path::PathBuf::from(home);
-        }
-    }
-    std::path::PathBuf::from(s)
-}
-
 fn resolve_api_key(key: Option<&str>) -> Result<String> {
     match key {
         Some(s) if looks_like_path(s) => {
-            let path = expand_tilde(s);
+            let expanded = shellexpand::full(s)
+                .map_err(|e| anyhow::anyhow!("cannot expand path {s}: {e}"))?;
+            let path = std::path::Path::new(&*expanded);
             if path.is_file() {
-                let content = std::fs::read_to_string(&path)
+                let content = std::fs::read_to_string(path)
                     .map_err(|e| anyhow::anyhow!("cannot read api key file {}: {e}", path.display()))?;
                 Ok(content.trim().to_string())
             } else {

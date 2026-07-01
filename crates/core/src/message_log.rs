@@ -321,6 +321,7 @@ impl ShowPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     fn test_entry(log: &MessageLog, message: &str) -> LogEntry {
         LogEntry {
@@ -374,7 +375,8 @@ mod tests {
         let plugin = ShowPlugin::new(log);
         let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let infos: Vec<crate::error_gate::PluginInfo> = vec![];
-        let ctx = ShellContext::new(&epoch, &infos);
+        let exit = AtomicBool::new(false);
+        let ctx = ShellContext::new(&epoch, &exit, &infos);
         let result = plugin.handle("", &ctx);
         assert!(result.contains("No pieces recorded"));
 
@@ -393,7 +395,8 @@ mod tests {
         let plugin = ShowPlugin::new(log);
         let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let infos: Vec<crate::error_gate::PluginInfo> = vec![];
-        let ctx = ShellContext::new(&epoch, &infos);
+        let exit = AtomicBool::new(false);
+        let ctx = ShellContext::new(&epoch, &exit, &infos);
         let result = plugin.handle("", &ctx);
         assert!(result.contains("1"));
         assert!(result.contains("2"));
@@ -408,7 +411,8 @@ mod tests {
         let plugin = ShowPlugin::new(log);
         let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let infos: Vec<crate::error_gate::PluginInfo> = vec![];
-        let ctx = ShellContext::new(&epoch, &infos);
+        let exit = AtomicBool::new(false);
+        let ctx = ShellContext::new(&epoch, &exit, &infos);
         let result = plugin.handle("1.2.3", &ctx);
         assert!(result.contains("No messages found"));
     }
@@ -422,7 +426,8 @@ mod tests {
         let plugin = ShowPlugin::new(log);
         let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let infos: Vec<crate::error_gate::PluginInfo> = vec![];
-        let ctx = ShellContext::new(&epoch, &infos);
+        let exit = AtomicBool::new(false);
+        let ctx = ShellContext::new(&epoch, &exit, &infos);
         let result = plugin.handle("1.3", &ctx);
         assert!(result.contains("No messages found"));
     }
@@ -437,7 +442,8 @@ mod tests {
         let plugin = ShowPlugin::new(log);
         let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let infos: Vec<crate::error_gate::PluginInfo> = vec![];
-        let ctx = ShellContext::new(&epoch, &infos);
+        let exit = AtomicBool::new(false);
+        let ctx = ShellContext::new(&epoch, &exit, &infos);
         let result = plugin.handle("1.2", &ctx);
         let first_pos = result.find("first").unwrap();
         let second_pos = result.find("second").unwrap();
@@ -465,7 +471,8 @@ mod tests {
         let plugin = ShowPlugin::new(log);
         let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let infos: Vec<crate::error_gate::PluginInfo> = vec![];
-        let ctx = ShellContext::new(&epoch, &infos);
+        let exit = AtomicBool::new(false);
+        let ctx = ShellContext::new(&epoch, &exit, &infos);
         let result = plugin.handle("1.2", &ctx);
         assert!(result.contains("--- 1.2 ---"));
         assert!(result.contains("--- 1 ---"));

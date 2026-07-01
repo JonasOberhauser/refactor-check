@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,21 +45,23 @@ pub struct PluginInfo {
 
 pub struct ShellContext<'a> {
     epoch: &'a Arc<AtomicU64>,
+    exit_flag: &'a AtomicBool,
     plugin_infos: &'a [PluginInfo],
 }
 
 impl<'a> ShellContext<'a> {
-    pub fn new(epoch: &'a Arc<AtomicU64>, plugin_infos: &'a [PluginInfo]) -> Self {
-        Self { epoch, plugin_infos }
+    pub fn new(epoch: &'a Arc<AtomicU64>, exit_flag: &'a AtomicBool, plugin_infos: &'a [PluginInfo]) -> Self {
+        Self { epoch, exit_flag, plugin_infos }
     }
 
     pub fn resume(&self) -> u64 {
         self.epoch.fetch_add(1, Ordering::Release)
     }
 
-    pub fn exit(&self) -> ! {
+    pub fn exit(&self) -> String {
         println!("[exiting...]");
-        std::process::exit(0);
+        self.exit_flag.store(true, Ordering::Release);
+        String::new()
     }
 
     pub fn plugins(&self) -> &'a [PluginInfo] {
@@ -228,6 +230,7 @@ impl ErrorShell {
         }
 
         let epoch = Arc::new(AtomicU64::new(0));
+        let exit_flag = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel::<String>();
         let gate = Arc::new(ErrorGate::new(epoch.clone(), tx));
 
@@ -257,22 +260,29 @@ impl ErrorShell {
 
         println!("[Interactive error shell — type 'help' for commands]");
 
+        let mut bg_done = false;
         loop {
-            if bg_handle.is_finished() {
-                break;
+            if !bg_done && bg_handle.is_finished() {
+                bg_done = true;
+                while let Ok(error) = rx.try_recv() {
+                    println!("\n--- ERROR ---\n{error}\n-------------");
+                }
+                println!("[Background work finished — type 'exit' to quit]");
             }
 
-            let mut pending_errors = String::new();
-            while let Ok(error) = rx.try_recv() {
-                if !pending_errors.is_empty() {
-                    pending_errors.push('\n');
+            if !bg_done {
+                let mut pending_errors = String::new();
+                while let Ok(error) = rx.try_recv() {
+                    if !pending_errors.is_empty() {
+                        pending_errors.push('\n');
+                    }
+                    pending_errors.push_str("\n--- ERROR ---\n");
+                    pending_errors.push_str(&error);
+                    pending_errors.push_str("\n-------------");
                 }
-                pending_errors.push_str("\n--- ERROR ---\n");
-                pending_errors.push_str(&error);
-                pending_errors.push_str("\n-------------");
-            }
-            if !pending_errors.is_empty() {
-                println!("{pending_errors}");
+                if !pending_errors.is_empty() {
+                    println!("{pending_errors}");
+                }
             }
 
             let line = match editor.readline("$ ") {
@@ -280,7 +290,8 @@ impl ErrorShell {
                 Err(ReadlineError::Interrupted) => continue,
                 Err(ReadlineError::Eof) => {
                     println!("[EOF — exiting]");
-                    std::process::exit(0);
+                    exit_flag.store(true, Ordering::Release);
+                    break;
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -299,6 +310,7 @@ impl ErrorShell {
 
             let ctx = ShellContext {
                 epoch: &epoch,
+                exit_flag: &exit_flag,
                 plugin_infos: &plugin_infos,
             };
 
@@ -314,6 +326,10 @@ impl ErrorShell {
                         "[unknown command: '{cmd}' — type 'help' for available commands]"
                     );
                 }
+            }
+
+            if exit_flag.load(Ordering::Acquire) {
+                break;
             }
         }
 
@@ -383,9 +399,11 @@ mod tests {
     #[test]
     fn test_continue_plugin_increments_epoch() {
         let epoch = Arc::new(AtomicU64::new(5));
+        let exit_flag = AtomicBool::new(false);
         let infos: Vec<PluginInfo> = vec![];
         let ctx = ShellContext {
             epoch: &epoch,
+            exit_flag: &exit_flag,
             plugin_infos: &infos,
         };
         let plugin = ContinuePlugin;
@@ -398,6 +416,7 @@ mod tests {
     #[test]
     fn test_help_plugin_lists_all() {
         let epoch = Arc::new(AtomicU64::new(0));
+        let exit_flag = AtomicBool::new(false);
         let infos = vec![
             PluginInfo {
                 name: "continue".to_string(),
@@ -410,6 +429,7 @@ mod tests {
         ];
         let ctx = ShellContext {
             epoch: &epoch,
+            exit_flag: &exit_flag,
             plugin_infos: &infos,
         };
         let plugin = HelpPlugin;
