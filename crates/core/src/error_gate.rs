@@ -18,12 +18,13 @@ use crate::live_config::LiveConfig;
 
 pub struct ErrorGate {
     epoch: Arc<AtomicU64>,
+    shutdown: Arc<AtomicBool>,
     tx: mpsc::Sender<String>,
 }
 
 impl ErrorGate {
-    fn new(epoch: Arc<AtomicU64>, tx: mpsc::Sender<String>) -> Self {
-        Self { epoch, tx }
+    fn new(epoch: Arc<AtomicU64>, shutdown: Arc<AtomicBool>, tx: mpsc::Sender<String>) -> Self {
+        Self { epoch, shutdown, tx }
     }
 
     pub async fn report_and_wait(&self, error: &str) {
@@ -31,6 +32,9 @@ impl ErrorGate {
         let _ = self.tx.send(error.to_string());
         loop {
             if self.epoch.load(Ordering::Acquire) != my_epoch {
+                break;
+            }
+            if self.shutdown.load(Ordering::Acquire) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -216,7 +220,36 @@ impl ErrorShell {
         self.plugins.push(plugin);
         Ok(())
     }
+}
 
+fn shutdown_bg(
+    shutdown: &Arc<AtomicBool>,
+    epoch: &Arc<AtomicU64>,
+    bg_handle: std::thread::JoinHandle<Result<()>>,
+) {
+    shutdown.store(true, Ordering::Release);
+    epoch.fetch_add(1, Ordering::Release);
+
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(bg_handle.join());
+    });
+    match done_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => {
+            eprintln!("[background work error: {e:#}]");
+        }
+        Ok(Err(_)) => {
+            eprintln!("[background thread panicked]");
+        }
+        Err(_) => {
+            eprintln!("[background did not finish in 5s, forcing exit]");
+            std::process::exit(1);
+        }
+    }
+}
+
+impl ErrorShell {
     pub fn run<F, Fut>(self, work: F) -> Result<()>
     where
         F: FnOnce(Option<Arc<ErrorGate>>) -> Fut + Send + 'static,
@@ -230,9 +263,10 @@ impl ErrorShell {
         }
 
         let epoch = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
         let exit_flag = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel::<String>();
-        let gate = Arc::new(ErrorGate::new(epoch.clone(), tx));
+        let gate = Arc::new(ErrorGate::new(epoch.clone(), shutdown.clone(), tx));
 
         let bg_handle = std::thread::Builder::new()
             .name("verification".to_string())
@@ -289,9 +323,9 @@ impl ErrorShell {
                 Ok(line) => line,
                 Err(ReadlineError::Interrupted) => continue,
                 Err(ReadlineError::Eof) => {
-                    println!("[EOF — exiting]");
-                    exit_flag.store(true, Ordering::Release);
-                    break;
+                    println!("[EOF — shutting down...]");
+                    shutdown_bg(&shutdown, &epoch, bg_handle);
+                    return Ok(());
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -329,13 +363,11 @@ impl ErrorShell {
             }
 
             if exit_flag.load(Ordering::Acquire) {
-                break;
+                println!("[shutting down...]");
+                shutdown_bg(&shutdown, &epoch, bg_handle);
+                return Ok(());
             }
         }
-
-        bg_handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("background thread panicked"))?
     }
 }
 
