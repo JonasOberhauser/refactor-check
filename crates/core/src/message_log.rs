@@ -109,18 +109,20 @@ impl Visit for EventVisitor {
     }
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        if CTX_FIELD_NAMES.contains(&field.name()) {
+        let name = normalize_field_name(field.name());
+        if CTX_FIELD_NAMES.contains(&name) {
             self.context_ids.push(value.to_string());
         } else {
-            self.fields.push((field.name().to_string(), value.to_string()));
+            self.fields.push((name.to_string(), value.to_string()));
         }
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-        if CTX_FIELD_NAMES.contains(&field.name()) {
+        let name = normalize_field_name(field.name());
+        if CTX_FIELD_NAMES.contains(&name) {
             self.context_ids.push(value.to_string());
         } else {
-            self.fields.push((field.name().to_string(), value.to_string()));
+            self.fields.push((name.to_string(), value.to_string()));
         }
     }
 

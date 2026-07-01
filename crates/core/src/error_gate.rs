@@ -252,13 +252,13 @@ fn shutdown_bg(
     match done_rx.recv_timeout(Duration::from_secs(5)) {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(e))) => {
-            eprintln!("[background work error: {e:#}]");
+            println!("[background work error: {e:#}]");
         }
         Ok(Err(_)) => {
-            eprintln!("[background thread panicked]");
+            println!("[background thread panicked]");
         }
         Err(_) => {
-            eprintln!("[background did not finish in 5s, forcing exit]");
+            println!("[background did not finish in 5s, forcing exit]");
             std::process::exit(1);
         }
     }
@@ -279,7 +279,7 @@ impl ErrorShell {
 
         let epoch = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let exit_flag = Arc::new(AtomicBool::new(false));
+        let exit_flag = AtomicBool::new(false);
         let (tx, rx) = mpsc::channel::<String>();
         let gate = Arc::new(ErrorGate::new(epoch.clone(), shutdown.clone(), tx));
 
