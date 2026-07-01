@@ -80,25 +80,31 @@ struct EventVisitor {
 
 const CTX_FIELD_NAMES: &[&str] = &["ctx", "context_id", "func_ctx", "fctx"];
 
+fn normalize_field_name(name: &str) -> &str {
+    name.strip_prefix("self.").unwrap_or(name)
+}
+
 impl Visit for EventVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
         let formatted = format!("{:?}", value);
-        if field.name() == "message" {
+        let name = normalize_field_name(field.name());
+        if name == "message" {
             self.message = formatted;
-        } else if CTX_FIELD_NAMES.contains(&field.name()) {
+        } else if CTX_FIELD_NAMES.contains(&name) {
             self.context_ids.push(formatted);
         } else {
-            self.fields.push((field.name().to_string(), formatted));
+            self.fields.push((name.to_string(), formatted));
         }
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "message" {
+        let name = normalize_field_name(field.name());
+        if name == "message" {
             self.message = value.to_string();
-        } else if CTX_FIELD_NAMES.contains(&field.name()) {
+        } else if CTX_FIELD_NAMES.contains(&name) {
             self.context_ids.push(value.to_string());
         } else {
-            self.fields.push((field.name().to_string(), value.to_string()));
+            self.fields.push((name.to_string(), value.to_string()));
         }
     }
 
