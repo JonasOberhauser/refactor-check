@@ -88,24 +88,42 @@ struct Cli {
     log: Option<String>,
 }
 
-fn resolve_api_key(key: Option<&str>) -> String {
-    let raw = key
-        .map(|s| {
-            let path = std::path::Path::new(s);
+fn looks_like_path(s: &str) -> bool {
+    s.contains('/') || s.starts_with('~') || s.starts_with('.')
+}
+
+fn expand_tilde(s: &str) -> std::path::PathBuf {
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home).join(rest);
+        }
+    } else if s == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home);
+        }
+    }
+    std::path::PathBuf::from(s)
+}
+
+fn resolve_api_key(key: Option<&str>) -> Result<String> {
+    match key {
+        Some(s) if looks_like_path(s) => {
+            let path = expand_tilde(s);
             if path.is_file() {
-                std::fs::read_to_string(path)
-                    .unwrap_or_else(|e| {
-                        warn!("could not read api key file {s}: {e}");
-                        s.to_string()
-                    })
-                    .trim()
-                    .to_string()
+                let content = std::fs::read_to_string(&path)
+                    .map_err(|e| anyhow::anyhow!("cannot read api key file {}: {e}", path.display()))?;
+                Ok(content.trim().to_string())
             } else {
-                s.to_string()
+                Err(anyhow::anyhow!(
+                    "api key file not found: {}\n\
+                     Create the file with your API key, or pass the key directly with --api-key <KEY>",
+                    path.display()
+                ))
             }
-        })
-        .unwrap_or_else(|| std::env::var("OPENROUTER_API_KEY").unwrap_or_default());
-    raw
+        }
+        Some(s) => Ok(s.to_string()),
+        None => Ok(std::env::var("OPENROUTER_API_KEY").unwrap_or_default()),
+    }
 }
 
 impl From<&Cli> for LlmConfig {
@@ -113,7 +131,7 @@ impl From<&Cli> for LlmConfig {
         let api_model = cli.api_model.clone();
         let judge_model = cli.judge_model.clone().unwrap_or_else(|| api_model.clone());
         LlmConfig {
-            api_key: resolve_api_key(cli.api_key.as_deref()),
+            api_key: cli.api_key.clone().unwrap_or_default(),
             judge_api_key: None,
             formalizer_api_key: None,
             fixer_api_key: None,
@@ -197,6 +215,7 @@ fn main() -> Result<()> {
     let agent_model = cli.agent_model.clone();
     let agent_skip_permissions = cli.agent_skip_permissions;
     let result_file = cli.result_file.clone();
+    let api_key_raw = cli.api_key.clone();
 
     let shell = ErrorShell::with_base_plugins()
         .with_config::<UpdateArgs, AppConfig>("set", config_live.clone())?
@@ -204,6 +223,20 @@ fn main() -> Result<()> {
 
     shell.run(
         move |gate| async move {
+            let api_key = loop {
+                match resolve_api_key(api_key_raw.as_deref()) {
+                    Ok(key) => break key,
+                    Err(e) => {
+                        if let Some(g) = &gate {
+                            g.report_and_wait(&format!("{e:#}")).await;
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
+            };
+            config_live.update(|cfg| cfg.llm.api_key = api_key.clone());
+
             let mut llm = refactor_check_core::llm::LlmClient::with_live_config(config_live.clone());
             let mut solver = Z3Solver::with_live_config(config_live.clone());
             if let Some(g) = &gate {
