@@ -46,7 +46,7 @@ struct Cli {
     #[arg(long, default_value = "https://openrouter.ai/api/v1")]
     api_base: String,
 
-    #[arg(long, env = "OPENROUTER_API_KEY", default_value = "***REDACTED***")]  // free key: no credits
+    #[arg(long, env = "OPENROUTER_API_KEY")]
     api_key: Option<String>,
 
     #[arg(long, env = "JUDGE_API_KEY")]
@@ -79,7 +79,7 @@ impl From<&Cli> for LlmConfig {
         let api_model = cli.api_model.clone();
         let judge_model = cli.judge_model.clone().unwrap_or_else(|| api_model.clone());
         LlmConfig {
-            api_key: cli.api_key.clone().expect("api_key has a default value"),
+            api_key: cli.api_key.clone().unwrap_or_default(),
             judge_api_key: cli.judge_api_key.clone(),
             formalizer_api_key: cli.formalizer_api_key.clone(),
             fixer_api_key: cli.fixer_api_key.clone(),
