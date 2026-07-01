@@ -217,7 +217,7 @@ fn main() -> Result<()> {
                     Ok(key) => break key,
                     Err(e) => {
                         if let Some(g) = &gate {
-                            g.report_and_wait(&format!("{e:#}")).await;
+                            g.report_and_wait(&format!("{e:#}")).await?;
                         } else {
                             return Err(e);
                         }

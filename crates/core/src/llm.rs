@@ -643,7 +643,7 @@ impl IOProvider<LlmRequest, WithContext<String>> for LlmClient {
                 Ok(content) => return Ok(WithContext { value: content, context_id }),
                 Err(e) => {
                     if let Some(gate) = &self.error_gate {
-                        gate.report_and_wait(&format!("{e:#}")).await;
+                        gate.report_and_wait(&format!("{e:#}")).await?;
                         continue;
                     }
                     return Err(e);

@@ -299,7 +299,7 @@ impl IOProvider<SolverRequest, WithContext<SolverResult>> for Z3Solver {
                 Ok(result) => return Ok(WithContext { value: result, context_id }),
                 Err(e) => {
                     if let Some(gate) = &self.error_gate {
-                        gate.report_and_wait(&format!("{e:#}")).await;
+                        gate.report_and_wait(&format!("{e:#}")).await?;
                         continue;
                     }
                     return Err(e);

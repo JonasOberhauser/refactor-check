@@ -1,3 +1,4 @@
+use std::fmt;
 use std::future::Future;
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,6 +17,19 @@ use rustyline::Editor;
 use crate::config_update::{ApplyTo, SetPlugin};
 use crate::live_config::LiveConfig;
 
+/// Returned by [`ErrorGate::report_and_wait`] when the shell is shutting down.
+/// Callers should propagate this error to unwind the background thread.
+#[derive(Debug)]
+pub struct ShutdownRequested;
+
+impl fmt::Display for ShutdownRequested {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "shutdown requested")
+    }
+}
+
+impl std::error::Error for ShutdownRequested {}
+
 pub struct ErrorGate {
     epoch: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
@@ -27,18 +41,19 @@ impl ErrorGate {
         Self { epoch, shutdown, tx }
     }
 
-    pub async fn report_and_wait(&self, error: &str) {
+    pub async fn report_and_wait(&self, error: &str) -> Result<(), ShutdownRequested> {
         let my_epoch = self.epoch.load(Ordering::Acquire);
         let _ = self.tx.send(error.to_string());
         loop {
-            if self.epoch.load(Ordering::Acquire) != my_epoch {
-                break;
-            }
             if self.shutdown.load(Ordering::Acquire) {
+                return Err(ShutdownRequested);
+            }
+            if self.epoch.load(Ordering::Acquire) != my_epoch {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+        Ok(())
     }
 }
 

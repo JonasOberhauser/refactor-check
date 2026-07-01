@@ -1215,7 +1215,7 @@ impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
                              - Install the binary and ensure it is in PATH\n\
                              - Restart with --agent-binary /correct/path/to/binary",
                             self.binary,
-                        )).await;
+                        )).await?;
                         continue;
                     }
                     return Err(e.into());
@@ -1233,7 +1233,7 @@ impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
                         self.binary,
                         output.status.code(),
                         stderr_raw.trim(),
-                    )).await;
+                    )).await?;
                     continue;
                 }
             }
