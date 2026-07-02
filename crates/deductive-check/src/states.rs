@@ -81,6 +81,35 @@ impl AlgorithmState for Initializer {
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
         let branch_name = format!("verification/{timestamp}");
 
+        // Ensure the project is a git repo
+        let git_dir = self.project_path.join(".git");
+        if !git_dir.exists() {
+            info!(project = %self.project_path.display(), "no .git found, initializing git repo");
+            let resp = providers
+                .git
+                .invoke(GitRequest::Init { path: self.project_path.clone() })
+                .await?;
+            if !resp.success {
+                anyhow::bail!("Failed to init git repo: {}", resp.output);
+            }
+            info!("adding rust files to git");
+            let resp = providers
+                .git
+                .invoke(GitRequest::AddAll { path: self.project_path.clone() })
+                .await?;
+            if !resp.success {
+                anyhow::bail!("Failed to add files: {}", resp.output);
+            }
+            let resp = providers
+                .git
+                .invoke(GitRequest::Commit { message: "Initial commit".to_string() })
+                .await?;
+            if !resp.success {
+                anyhow::bail!("Failed to create initial commit: {}", resp.output);
+            }
+            info!("git repo initialized with initial commit");
+        }
+
         info!("IO: git CreateBranch");
         let resp = providers
             .git

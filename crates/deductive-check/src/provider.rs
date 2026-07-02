@@ -87,6 +87,8 @@ pub enum GitRequest {
     CurrentCommitHash,
     CreateDirectory { path: PathBuf },
     WalkRustFiles { path: PathBuf },
+    Init { path: PathBuf },
+    AddAll { path: PathBuf },
 }
 
 #[derive(Debug, Clone)]
@@ -1028,6 +1030,22 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
                     success: true,
                     output: files.into_iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>().join("\n"),
                 })
+            }
+            GitRequest::Init { path } => {
+                let output = tokio::process::Command::new("git")
+                    .args(["init"])
+                    .current_dir(&path)
+                    .output()
+                    .await?;
+                Ok(git_response(output))
+            }
+            GitRequest::AddAll { path } => {
+                let output = tokio::process::Command::new("git")
+                    .args(["add", "*.rs", "*.toml", "*.lock"])
+                    .current_dir(&path)
+                    .output()
+                    .await?;
+                Ok(git_response(output))
             }
         }
     }
