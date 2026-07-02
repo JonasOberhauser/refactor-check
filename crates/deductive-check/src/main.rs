@@ -95,12 +95,20 @@ fn looks_like_path(s: &str) -> bool {
 fn resolve_api_key(key: Option<&str>) -> Result<String> {
     match key {
         Some(s) if looks_like_path(s) => {
+            info!(raw = %s, "expanding path");
             let expanded = shellexpand::full(s)
                 .map_err(|e| anyhow::anyhow!("cannot expand path {s}: {e}"))?;
-            let path = std::path::Path::new(&*expanded);
-            if path.is_file() {
+            let expanded = expanded.into_owned();
+            info!(expanded = %expanded, "path expanded");
+            let path = std::path::Path::new(&expanded);
+            info!(path = %path.display(), "checking is_file");
+            let is_file = path.is_file();
+            info!(is_file, "is_file result");
+            if is_file {
+                info!("reading file");
                 let content = std::fs::read_to_string(path)
                     .map_err(|e| anyhow::anyhow!("cannot read api key file {}: {e}", path.display()))?;
+                info!(len = content.len(), "file read");
                 Ok(content.trim().to_string())
             } else {
                 Err(anyhow::anyhow!(
