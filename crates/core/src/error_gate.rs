@@ -310,13 +310,29 @@ impl ErrorShell {
         println!("[Interactive error shell — type 'help' for commands]");
 
         let mut bg_done = false;
+        let mut bg_handle_opt = Some(bg_handle);
         loop {
-            if !bg_done && bg_handle.is_finished() {
-                bg_done = true;
-                while let Ok(error) = rx.try_recv() {
-                    println!("\n--- ERROR ---\n{error}\n-------------");
+            if !bg_done {
+                if let Some(ref handle) = bg_handle_opt {
+                    if handle.is_finished() {
+                        bg_done = true;
+                        while let Ok(error) = rx.try_recv() {
+                            println!("\n--- ERROR ---\n{error}\n-------------");
+                        }
+                        let handle = bg_handle_opt.take().unwrap();
+                        match handle.join() {
+                            Ok(Ok(())) => {
+                                println!("[Background work finished — type 'exit' to quit]");
+                            }
+                            Ok(Err(e)) => {
+                                println!("[Background work error: {e:#}]");
+                            }
+                            Err(_) => {
+                                println!("[Background thread panicked — type 'exit' to quit]");
+                            }
+                        }
+                    }
                 }
-                println!("[Background work finished — type 'exit' to quit]");
             }
 
             if !bg_done {
@@ -339,7 +355,9 @@ impl ErrorShell {
                 Err(ReadlineError::Interrupted) => continue,
                 Err(ReadlineError::Eof) => {
                     println!("[EOF — shutting down...]");
-                    shutdown_bg(&shutdown, &epoch, bg_handle);
+                    if let Some(handle) = bg_handle_opt.take() {
+                        shutdown_bg(&shutdown, &epoch, handle);
+                    }
                     return Ok(());
                 }
                 Err(e) => return Err(e.into()),
@@ -379,7 +397,9 @@ impl ErrorShell {
 
             if exit_flag.load(Ordering::Acquire) {
                 println!("[shutting down...]");
-                shutdown_bg(&shutdown, &epoch, bg_handle);
+                if let Some(handle) = bg_handle_opt.take() {
+                    shutdown_bg(&shutdown, &epoch, handle);
+                }
                 return Ok(());
             }
         }
