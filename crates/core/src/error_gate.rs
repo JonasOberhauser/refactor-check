@@ -249,7 +249,7 @@ fn shutdown_bg(
     std::thread::spawn(move || {
         let _ = done_tx.send(bg_handle.join());
     });
-    match done_rx.recv_timeout(Duration::from_secs(5)) {
+    match done_rx.recv_timeout(Duration::from_secs(2)) {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(e))) => {
             println!("[background work error: {e:#}]");
@@ -258,8 +258,8 @@ fn shutdown_bg(
             println!("[background thread panicked]");
         }
         Err(_) => {
-            println!("[background did not finish in 5s, forcing exit]");
-            std::process::exit(1);
+            // Force exit — don't let blocking I/O in the bg thread prevent exit
+            std::process::exit(0);
         }
     }
 }
@@ -380,7 +380,7 @@ impl ErrorShell {
                 Ok(ShellInput::Line(line)) => line,
                 Ok(ShellInput::Interrupted) => continue,
                 Ok(ShellInput::Eof) => {
-                    println!("[EOF — shutting down...]");
+                    println!("[EOF — exiting]");
                     if let Some(handle) = bg_handle_opt.take() {
                         shutdown_bg(&shutdown, &epoch, handle);
                     }
@@ -389,7 +389,7 @@ impl ErrorShell {
                 Ok(ShellInput::Error(e)) => return Err(e.into()),
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    println!("[input thread disconnected — shutting down]");
+                    println!("[input thread disconnected — exiting]");
                     if let Some(handle) = bg_handle_opt.take() {
                         shutdown_bg(&shutdown, &epoch, handle);
                     }
@@ -428,7 +428,7 @@ impl ErrorShell {
             }
 
             if exit_flag.load(Ordering::Acquire) {
-                println!("[shutting down...]");
+                println!("[exiting]");
                 if let Some(handle) = bg_handle_opt.take() {
                     shutdown_bg(&shutdown, &epoch, handle);
                 }
