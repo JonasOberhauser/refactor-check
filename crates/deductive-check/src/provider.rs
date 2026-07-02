@@ -964,22 +964,26 @@ impl IOProvider<RustAnalyzerRequest, RustAnalyzerResponse> for CliRustAnalyzerPr
     }
 }
 
-pub struct CliGitProvider;
+pub struct CliGitProvider {
+    project_path: PathBuf,
+}
 
 impl CliGitProvider {
     #[must_use]
-    pub fn new() -> Self {
-        Self
+    pub fn new(project_path: PathBuf) -> Self {
+        Self { project_path }
     }
 }
 
 #[async_trait]
 impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
     async fn invoke(&self, input: GitRequest) -> Result<GitResponse> {
+        let dir = &self.project_path;
         match input {
             GitRequest::CreateBranch { name } => {
                 let output = tokio::process::Command::new("git")
                     .args(["checkout", "-b", &name])
+                    .current_dir(dir)
                     .output()
                     .await?;
                 Ok(git_response(output))
@@ -987,6 +991,7 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
             GitRequest::Commit { message } => {
                 let output = tokio::process::Command::new("git")
                     .args(["commit", "-m", &message])
+                    .current_dir(dir)
                     .output()
                     .await?;
                 Ok(git_response(output))
@@ -998,6 +1003,7 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
                 }
                 let output = tokio::process::Command::new("git")
                     .args(&args)
+                    .current_dir(dir)
                     .output()
                     .await?;
                 Ok(git_response(output))
@@ -1005,6 +1011,7 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
             GitRequest::FindChangedRustFiles { base_commit } => {
                 let output = tokio::process::Command::new("git")
                     .args(["diff", "--name-only", &base_commit])
+                    .current_dir(dir)
                     .output()
                     .await?;
                 Ok(git_response(output))
@@ -1012,6 +1019,7 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
             GitRequest::CurrentCommitHash => {
                 let output = tokio::process::Command::new("git")
                     .args(["rev-parse", "HEAD"])
+                    .current_dir(dir)
                     .output()
                     .await?;
                 Ok(git_response(output))
@@ -1031,18 +1039,18 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
                     output: files.into_iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>().join("\n"),
                 })
             }
-            GitRequest::Init { path } => {
+            GitRequest::Init { path: _ } => {
                 let output = tokio::process::Command::new("git")
                     .args(["init"])
-                    .current_dir(&path)
+                    .current_dir(dir)
                     .output()
                     .await?;
                 Ok(git_response(output))
             }
-            GitRequest::AddAll { path } => {
+            GitRequest::AddAll { path: _ } => {
                 let output = tokio::process::Command::new("git")
                     .args(["add", "*.rs", "*.toml", "*.lock"])
-                    .current_dir(&path)
+                    .current_dir(dir)
                     .output()
                     .await?;
                 Ok(git_response(output))
@@ -1108,7 +1116,7 @@ impl IOProvider<FileSystemRequest, FileSystemResponse> for LocalFileSystemProvid
 
 impl Default for CliGitProvider {
     fn default() -> Self {
-        Self::new()
+        Self::new(PathBuf::from("."))
     }
 }
 

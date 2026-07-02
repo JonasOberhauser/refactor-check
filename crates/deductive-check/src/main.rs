@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -252,7 +253,7 @@ fn main() -> Result<()> {
             info!(project = %project, "loading rust-analyzer workspace");
             let rust_analyzer = deductive_check::provider::CliRustAnalyzerProvider::new(project.clone())?;
             info!("rust-analyzer workspace loaded");
-            let git = deductive_check::provider::CliGitProvider::new();
+            let git = deductive_check::provider::CliGitProvider::new(PathBuf::from(project.clone()));
             let filesystem = deductive_check::provider::LocalFileSystemProvider::new();
             let python = deductive_check::provider::ProcessPythonProvider::new();
 
