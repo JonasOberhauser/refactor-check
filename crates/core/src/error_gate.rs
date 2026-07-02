@@ -309,16 +309,56 @@ impl ErrorShell {
 
         println!("[Interactive error shell — type 'help' for commands]");
 
+        // Run readline on a dedicated thread so the main loop can poll for
+        // background errors/completion without blocking.
+        enum ShellInput {
+            Line(String),
+            Eof,
+            Interrupted,
+            Error(rustyline::error::ReadlineError),
+        }
+        let (input_tx, input_rx) = mpsc::channel::<ShellInput>();
+        let editor_prompt = "$ ".to_string();
+        std::thread::spawn(move || {
+            loop {
+                match editor.readline(&editor_prompt) {
+                    Ok(line) => {
+                        if input_tx.send(ShellInput::Line(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(ReadlineError::Interrupted) => {
+                        if input_tx.send(ShellInput::Interrupted).is_err() {
+                            break;
+                        }
+                    }
+                    Err(ReadlineError::Eof) => {
+                        let _ = input_tx.send(ShellInput::Eof);
+                        break;
+                    }
+                    Err(e) => {
+                        let _ = input_tx.send(ShellInput::Error(e));
+                        break;
+                    }
+                }
+            }
+        });
+
         let mut bg_done = false;
         let mut bg_handle_opt = Some(bg_handle);
         loop {
+            // Drain and display errors from background thread
+            while let Ok(error) = rx.try_recv() {
+                println!("\n--- ERROR ---\n{error}\n-------------");
+            }
+
+            // Check if background thread finished
             if !bg_done {
                 if let Some(ref handle) = bg_handle_opt {
                     if handle.is_finished() {
                         bg_done = true;
-                        while let Ok(error) = rx.try_recv() {
-                            println!("\n--- ERROR ---\n{error}\n-------------");
-                        }
+                        // Give error thread a moment to flush
+                        std::thread::sleep(Duration::from_millis(50));
                         let handle = bg_handle_opt.take().unwrap();
                         match handle.join() {
                             Ok(Ok(())) => {
@@ -335,40 +375,32 @@ impl ErrorShell {
                 }
             }
 
-            if !bg_done {
-                let mut pending_errors = String::new();
-                while let Ok(error) = rx.try_recv() {
-                    if !pending_errors.is_empty() {
-                        pending_errors.push('\n');
-                    }
-                    pending_errors.push_str("\n--- ERROR ---\n");
-                    pending_errors.push_str(&error);
-                    pending_errors.push_str("\n-------------");
-                }
-                if !pending_errors.is_empty() {
-                    println!("{pending_errors}");
-                }
-            }
-
-            let line = match editor.readline("$ ") {
-                Ok(line) => line,
-                Err(ReadlineError::Interrupted) => continue,
-                Err(ReadlineError::Eof) => {
+            // Wait for user input, but poll for background completion
+            let input = match input_rx.recv_timeout(if bg_done { Duration::from_secs(60) } else { Duration::from_millis(500) }) {
+                Ok(ShellInput::Line(line)) => line,
+                Ok(ShellInput::Interrupted) => continue,
+                Ok(ShellInput::Eof) => {
                     println!("[EOF — shutting down...]");
                     if let Some(handle) = bg_handle_opt.take() {
                         shutdown_bg(&shutdown, &epoch, handle);
                     }
                     return Ok(());
                 }
-                Err(e) => return Err(e.into()),
+                Ok(ShellInput::Error(e)) => return Err(e.into()),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    println!("[input thread disconnected — shutting down]");
+                    if let Some(handle) = bg_handle_opt.take() {
+                        shutdown_bg(&shutdown, &epoch, handle);
+                    }
+                    return Ok(());
+                }
             };
 
-            let cmd = line.trim();
+            let cmd = input.trim();
             if cmd.is_empty() {
                 continue;
             }
-
-            let _ = editor.add_history_entry(cmd);
 
             let (name, args) = match cmd.split_once(char::is_whitespace) {
                 Some((n, a)) => (n, a.trim()),
