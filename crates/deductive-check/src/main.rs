@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use tracing::warn;
+use tracing::{info, warn};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
@@ -212,6 +212,7 @@ fn main() -> Result<()> {
 
     shell.run(
         move |gate| async move {
+            info!("starting verification worker");
             let api_key = loop {
                 match resolve_api_key(api_key_raw.as_deref()) {
                     Ok(key) => break key,
@@ -233,7 +234,9 @@ fn main() -> Result<()> {
                 solver = solver.with_error_gate(g.clone());
             }
 
+            info!(project = %project, "loading rust-analyzer workspace");
             let rust_analyzer = deductive_check::provider::CliRustAnalyzerProvider::new(project.clone())?;
+            info!("rust-analyzer workspace loaded");
             let git = deductive_check::provider::CliGitProvider::new();
             let filesystem = deductive_check::provider::LocalFileSystemProvider::new();
             let python = deductive_check::provider::ProcessPythonProvider::new();
