@@ -980,20 +980,14 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
                     .args(["checkout", "-b", &name])
                     .output()
                     .await?;
-                Ok(GitResponse {
-                    success: output.status.success(),
-                    output: String::from_utf8_lossy(&output.stdout).to_string(),
-                })
+                Ok(git_response(output))
             }
             GitRequest::Commit { message } => {
                 let output = tokio::process::Command::new("git")
                     .args(["commit", "-m", &message])
                     .output()
                     .await?;
-                Ok(GitResponse {
-                    success: output.status.success(),
-                    output: String::from_utf8_lossy(&output.stdout).to_string(),
-                })
+                Ok(git_response(output))
             }
             GitRequest::AddFiles { paths } => {
                 let mut args = vec!["add".to_string()];
@@ -1004,30 +998,21 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
                     .args(&args)
                     .output()
                     .await?;
-                Ok(GitResponse {
-                    success: output.status.success(),
-                    output: String::from_utf8_lossy(&output.stdout).to_string(),
-                })
+                Ok(git_response(output))
             }
             GitRequest::FindChangedRustFiles { base_commit } => {
                 let output = tokio::process::Command::new("git")
                     .args(["diff", "--name-only", &base_commit])
                     .output()
                     .await?;
-                Ok(GitResponse {
-                    success: output.status.success(),
-                    output: String::from_utf8_lossy(&output.stdout).to_string(),
-                })
+                Ok(git_response(output))
             }
             GitRequest::CurrentCommitHash => {
                 let output = tokio::process::Command::new("git")
                     .args(["rev-parse", "HEAD"])
                     .output()
                     .await?;
-                Ok(GitResponse {
-                    success: output.status.success(),
-                    output: String::from_utf8_lossy(&output.stdout).to_string(),
-                })
+                Ok(git_response(output))
             }
             GitRequest::CreateDirectory { path } => {
                 std::fs::create_dir_all(&path)?;
@@ -1045,6 +1030,21 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
                 })
             }
         }
+    }
+}
+
+fn git_response(output: std::process::Output) -> GitResponse {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = match (stdout.is_empty(), stderr.is_empty()) {
+        (false, false) => format!("{stdout}\n{stderr}").trim().to_string(),
+        (false, true) => stdout.trim().to_string(),
+        (true, false) => stderr.trim().to_string(),
+        (true, true) => String::new(),
+    };
+    GitResponse {
+        success: output.status.success(),
+        output: combined,
     }
 }
 
