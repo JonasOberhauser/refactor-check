@@ -214,8 +214,12 @@ fn main() -> Result<()> {
         move |gate| async move {
             info!("starting verification worker");
             let api_key = loop {
+                info!("resolving api key");
                 match resolve_api_key(api_key_raw.as_deref()) {
-                    Ok(key) => break key,
+                    Ok(key) => {
+                        info!("api key resolved");
+                        break key;
+                    }
                     Err(e) => {
                         if let Some(g) = &gate {
                             g.report_and_wait(&format!("{e:#}")).await?;
@@ -225,9 +229,12 @@ fn main() -> Result<()> {
                     }
                 }
             };
+            info!("updating config");
             config_live.update(|cfg| cfg.llm.api_key = api_key.clone());
 
+            info!("creating llm client");
             let mut llm = refactor_check_core::llm::LlmClient::with_live_config(config_live.clone());
+            info!("creating solver");
             let mut solver = Z3Solver::with_live_config(config_live.clone());
             if let Some(g) = &gate {
                 llm = llm.with_error_gate(g.clone());
