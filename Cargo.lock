@@ -2990,6 +2990,7 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
+ "servyi-ioprovider",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3448,6 +3449,18 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "servyi-ioprovider"
+version = "0.1.0"
+source = "git+https://github.com/servyi/ioprovider.git?branch=main#1efc1bfc2e8d5b85290d8b45ae6af44c7e6f8e26"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "dashmap",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
