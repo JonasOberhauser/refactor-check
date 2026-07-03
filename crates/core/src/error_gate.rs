@@ -37,7 +37,7 @@ pub struct ErrorGate {
 }
 
 impl ErrorGate {
-    fn new(epoch: Arc<AtomicU64>, shutdown: Arc<AtomicBool>, tx: mpsc::Sender<String>) -> Self {
+    pub(crate) fn new(epoch: Arc<AtomicU64>, shutdown: Arc<AtomicBool>, tx: mpsc::Sender<String>) -> Self {
         Self { epoch, shutdown, tx }
     }
 
@@ -96,7 +96,7 @@ pub trait ShellPlugin: Send + Sync {
     fn handle(&self, args: &str, ctx: &ShellContext<'_>) -> String;
 }
 
-struct ContinuePlugin;
+pub struct ContinuePlugin;
 
 impl ShellPlugin for ContinuePlugin {
     fn name(&self) -> &str {
@@ -111,7 +111,7 @@ impl ShellPlugin for ContinuePlugin {
     }
 }
 
-struct ExitPlugin;
+pub struct ExitPlugin;
 
 impl ShellPlugin for ExitPlugin {
     fn name(&self) -> &str {
@@ -125,7 +125,7 @@ impl ShellPlugin for ExitPlugin {
     }
 }
 
-struct HelpPlugin;
+pub struct HelpPlugin;
 
 impl ShellPlugin for HelpPlugin {
     fn name(&self) -> &str {

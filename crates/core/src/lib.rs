@@ -9,3 +9,4 @@ pub mod phase_tracker;
 pub mod provider;
 pub mod smt;
 pub mod state;
+pub mod tui;

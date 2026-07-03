@@ -10,7 +10,7 @@ use tracing_subscriber::EnvFilter;
 use deductive_check::machine;
 use deductive_check::piece_manager::DefaultDeductivePieceManager;
 use refactor_check_core::config_update::{AppConfig, ServiceTierArg, UpdateArgs};
-use refactor_check_core::error_gate::ErrorShell;
+use refactor_check_core::tui::TuiShell;
 use refactor_check_core::llm::LlmConfig;
 use refactor_check_core::live_config::LiveConfig;
 use refactor_check_core::message_log::{MessageLog, MessageLogLayer, ShowPlugin};
@@ -232,7 +232,7 @@ fn main() -> Result<()> {
     let result_file = cli.result_file.clone();
     let api_key_raw = cli.api_key.clone();
 
-    let shell = ErrorShell::with_base_plugins()
+    let shell = TuiShell::with_base_plugins()
         .with_config::<UpdateArgs, AppConfig>("set", config_live.clone())?
         .with_plugin(Box::new(ShowPlugin::new(log.clone())))?;
 

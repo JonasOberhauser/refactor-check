@@ -16,3 +16,6 @@ dashmap = "6"
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = "0.3"
 rustyline = "14"
+ratatui = "0.28"
+tui-input = "0.10"
+crossterm = "0.28"
