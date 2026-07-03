@@ -2991,6 +2991,7 @@ dependencies = [
  "serde",
  "serde_json",
  "servyi-ioprovider",
+ "servyi-states",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3461,6 +3462,19 @@ dependencies = [
  "dashmap",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "servyi-states"
+version = "0.1.0"
+source = "git+https://github.com/servyi/states.git?branch=main#a72cc8d31298a69ce0ff188c8ad679508092b046"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "dashmap",
+ "futures",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
