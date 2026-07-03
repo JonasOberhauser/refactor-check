@@ -1216,6 +1216,7 @@ impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
     async fn invoke(&self, input: AgentRequest) -> Result<AgentResponse> {
         loop {
             let mut args = self.base_args.clone();
+            args.push(input.prompt.clone());
             args.push("--format".to_string());
             args.push("json".to_string());
             args.push("--dir".to_string());
@@ -1224,7 +1225,6 @@ impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
                 args.push("-f".to_string());
                 args.push(file.to_string_lossy().to_string());
             }
-            args.push(input.prompt.clone());
 
             let mut cmd = tokio::process::Command::new(&self.binary);
             cmd.args(&args)
