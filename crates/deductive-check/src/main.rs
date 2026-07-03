@@ -89,6 +89,25 @@ struct Cli {
     log: Option<String>,
 }
 
+fn resolve_binary(name: &str) -> String {
+    if name.contains('/') {
+        return name.to_string();
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates = [
+        format!("{home}/.opencode/bin/{name}"),
+        format!("{home}/.cargo/bin/{name}"),
+        format!("{home}/.local/bin/{name}"),
+        format!("/usr/local/bin/{name}"),
+    ];
+    for c in &candidates {
+        if std::path::Path::new(c).is_file() {
+            return c.clone();
+        }
+    }
+    name.to_string()
+}
+
 fn looks_like_path(s: &str) -> bool {
     s.contains('/') || s.starts_with('~') || s.starts_with('.')
 }
@@ -208,7 +227,7 @@ fn main() -> Result<()> {
     let config_live = Arc::new(LiveConfig::new(AppConfig::from(&cli)));
 
     let project = cli.project.clone();
-    let agent_binary = cli.agent_binary.clone();
+    let agent_binary = resolve_binary(&cli.agent_binary);
     let agent_subcommand = cli.agent_subcommand.clone();
     let agent_model = cli.agent_model.clone();
     let agent_skip_permissions = cli.agent_skip_permissions;
