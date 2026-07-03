@@ -3,5 +3,6 @@ members = [
     "crates/core",
     "crates/refactor-check",
     "crates/deductive-check",
+    "crates/deductive-shell",
 ]
 resolver = "2"

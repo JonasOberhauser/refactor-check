@@ -1,10 +1,10 @@
-use std::io::{self, IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
@@ -19,104 +19,68 @@ use ratatui::{
 };
 use tui_input::{backend::crossterm::EventHandler, Input};
 
-use crate::error_gate::{ErrorGate, ShellContext, ShellPlugin};
+use crate::protocol::{write_msg, ClientMsg, CommandInfo, OutKind, ServerMsg};
 
 struct LogEntry {
     text: String,
-    kind: LogKind,
+    kind: OutKind,
 }
 
-#[derive(Clone, Copy)]
-enum LogKind {
-    Info,
-    Error,
-    Output,
-}
-
-impl LogKind {
+impl OutKind {
     fn style(self) -> Style {
         match self {
-            LogKind::Info => Style::default().fg(Color::DarkGray),
-            LogKind::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            LogKind::Output => Style::default(),
+            OutKind::Info => Style::default().fg(Color::DarkGray),
+            OutKind::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            OutKind::Output => Style::default(),
         }
     }
 }
 
-pub struct TuiShell {
-    plugins: Vec<Box<dyn ShellPlugin>>,
+pub struct TuiClient {
+    socket_path: String,
 }
 
-impl TuiShell {
+impl TuiClient {
     #[must_use]
-    pub fn new() -> Self {
-        Self { plugins: Vec::new() }
+    pub fn new(socket_path: String) -> Self {
+        Self { socket_path }
     }
 
-    #[must_use]
-    pub fn with_base_plugins() -> Self {
-        let mut shell = Self::new();
-        shell.plugins.push(Box::new(crate::error_gate::ContinuePlugin));
-        shell.plugins.push(Box::new(crate::error_gate::ExitPlugin));
-        shell.plugins.push(Box::new(crate::error_gate::HelpPlugin));
-        shell
-    }
-
-    pub fn with_plugin(mut self, plugin: Box<dyn ShellPlugin>) -> Result<Self> {
-        let name = plugin.name().to_string();
-        if self.plugins.iter().any(|p| p.name() == name.as_str()) {
-            anyhow::bail!("plugin '{name}' already registered");
-        }
-        self.plugins.push(plugin);
-        Ok(self)
-    }
-
-    pub fn with_config<A, C>(mut self, name: &'static str, config: Arc<crate::live_config::LiveConfig<C>>) -> Result<Self>
-    where
-        A: crate::config_update::ApplyTo<C>,
-        C: Clone + Send + Sync + 'static,
-    {
-        self.plugins.push(Box::new(crate::config_update::SetPlugin::<A, C>::new(name, config)));
-        Ok(self)
-    }
-
-    pub fn run<F, Fut>(self, work: F) -> Result<()>
-    where
-        F: FnOnce(Option<Arc<ErrorGate>>) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
-    {
+    pub fn run(&self) -> Result<()> {
         if !io::stdin().is_terminal() {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
-            return rt.block_on(work(None));
+            bail!("TUI client requires a terminal");
         }
 
-        let epoch = Arc::new(AtomicU64::new(0));
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let exit_flag = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::channel::<String>();
-        let gate = Arc::new(ErrorGate::new(epoch.clone(), shutdown.clone(), tx));
+        let stream = UnixStream::connect(&self.socket_path)
+            .map_err(|e| anyhow::anyhow!("cannot connect to server at {}: {e}\nIs deductive-check running?", self.socket_path))?;
 
-        let bg_handle = std::thread::Builder::new()
-            .name("verification".to_string())
-            .spawn(move || {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()?;
-                rt.block_on(work(Some(gate)))
-            })?;
+        // Send/receive channels
+        let (server_tx, server_rx) = mpsc::channel::<ServerMsg>();
+        let commands: Arc<Mutex<Vec<CommandInfo>>> = Arc::new(Mutex::new(Vec::new()));
 
-        let plugin_infos: Vec<crate::error_gate::PluginInfo> = self
-            .plugins
-            .iter()
-            .map(|p| crate::error_gate::PluginInfo {
-                name: p.name().to_string(),
-                description: p.description().to_string(),
-            })
-            .collect();
-        let command_names: Vec<String> = plugin_infos.iter().map(|p| p.name.clone()).collect();
-        let plugins = self.plugins;
+        // Reader thread: reads ServerMsgs from socket, forwards to channel
+        let reader_stream = stream.try_clone()?;
+        let reader_cmds = commands.clone();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(reader_stream);
+            for line in reader.lines() {
+                match line {
+                    Ok(line) if !line.is_empty() => {
+                        if let Ok(msg) = serde_json::from_str::<ServerMsg>(&line) {
+                            if let ServerMsg::Commands { list } = &msg {
+                                *reader_cmds.lock().unwrap() = list.clone();
+                            }
+                            let _ = server_tx.send(msg);
+                        }
+                    }
+                    Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        let writer = std::io::BufWriter::new(stream);
+        let writer = Arc::new(Mutex::new(writer));
 
         // TUI state
         let mut log_entries: Vec<LogEntry> = Vec::new();
@@ -124,8 +88,7 @@ impl TuiShell {
         let mut history: Vec<String> = Vec::new();
         let mut history_idx: Option<usize> = None;
         let mut log_scroll_up: u16 = 0;
-        let mut bg_done = false;
-        let mut bg_handle_opt: Option<std::thread::JoinHandle<Result<()>>> = Some(bg_handle);
+        let mut finished = false;
 
         // Terminal setup
         enable_raw_mode()?;
@@ -139,45 +102,43 @@ impl TuiShell {
 
         let tui_result = (|| {
             loop {
-                // Drain errors from background thread
-                while let Ok(error) = rx.try_recv() {
-                    log_entries.push(LogEntry { text: error, kind: LogKind::Error });
-                    log_scroll_up = 0;
-                }
-
-                // Check background completion
-                if !bg_done {
-                    if let Some(handle) = bg_handle_opt.as_ref() {
-                        if handle.is_finished() {
-                            bg_done = true;
-                            let handle = bg_handle_opt.take().unwrap();
-                            match handle.join() {
-                                Ok(Ok(())) => {
-                                    log_entries.push(LogEntry {
-                                        text: "[Background work finished]".to_string(),
-                                        kind: LogKind::Info,
-                                    });
-                                }
-                                Ok(Err(e)) => {
-                                    log_entries.push(LogEntry {
-                                        text: format!("[Background work error: {e:#}]"),
-                                        kind: LogKind::Error,
-                                    });
-                                }
-                                Err(_) => {
-                                    log_entries.push(LogEntry {
-                                        text: "[Background thread panicked]".to_string(),
-                                        kind: LogKind::Error,
-                                    });
-                                }
+                // Drain server messages
+                while let Ok(msg) = server_rx.try_recv() {
+                    match msg {
+                        ServerMsg::Output { text, kind } => {
+                            log_entries.push(LogEntry { text, kind });
+                            log_scroll_up = 0;
+                        }
+                        ServerMsg::Error { text } => {
+                            log_entries.push(LogEntry { text, kind: OutKind::Error });
+                            log_scroll_up = 0;
+                        }
+                        ServerMsg::Status { state, message } => {
+                            let label = match state {
+                                crate::protocol::WorkState::Running => "running",
+                                crate::protocol::WorkState::Finished => "finished",
+                                crate::protocol::WorkState::Failed => "failed",
+                            };
+                            log_entries.push(LogEntry {
+                                text: if message.is_empty() {
+                                    format!("[Background work {label}]")
+                                } else {
+                                    format!("[Background work {label}: {message}]")
+                                },
+                                kind: if state == crate::protocol::WorkState::Failed {
+                                    OutKind::Error
+                                } else {
+                                    OutKind::Info
+                                },
+                            });
+                            if state != crate::protocol::WorkState::Running {
+                                finished = true;
                             }
                             log_scroll_up = 0;
                         }
+                        ServerMsg::Commands { .. } | ServerMsg::Done => {}
                     }
                 }
-
-                // Clamp scroll
-                let total = log_entries.len();
 
                 // Draw
                 terminal.draw(|f| {
@@ -187,7 +148,9 @@ impl TuiShell {
                         .split(f.area());
 
                     let log_height_inner = chunks[0].height.saturating_sub(2) as usize;
+                    let total = log_entries.len();
                     let max_scroll = total.saturating_sub(log_height_inner);
+                    log_scroll_up = log_scroll_up.min(max_scroll as u16);
                     let scroll = max_scroll.saturating_sub(log_scroll_up as usize);
 
                     let lines: Vec<Line> = log_entries
@@ -195,7 +158,7 @@ impl TuiShell {
                         .map(|e| Line::from(Span::styled(&e.text, e.kind.style())))
                         .collect();
 
-                    let title = if bg_done { "Output (finished)" } else { "Output (running)" };
+                    let title = if finished { "Output (finished)" } else { "Output (running)" };
 
                     f.render_widget(
                         Paragraph::new(lines)
@@ -225,15 +188,14 @@ impl TuiShell {
                     f.set_cursor_position((input_x, input_y));
                 })?;
 
-                // Poll for events
-                let poll_timeout = if bg_done { Duration::from_secs(5) } else { Duration::from_millis(300) };
+                let poll_timeout = if finished { Duration::from_secs(5) } else { Duration::from_millis(300) };
 
                 if event::poll(poll_timeout)? {
                     let ev = event::read()?;
                     if let Event::Key(key) = ev {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-                        // Ctrl+Up/Down for history (check before plain Up/Down scroll)
+                        // Ctrl+Up/Down for history
                         if ctrl && key.code == KeyCode::Up {
                             if !history.is_empty() {
                                 history_idx = match history_idx {
@@ -273,50 +235,48 @@ impl TuiShell {
                                     history_idx = None;
 
                                     let (name, args) = match cmd.split_once(char::is_whitespace) {
-                                        Some((n, a)) => (n, a.trim()),
-                                        None => (cmd.as_str(), ""),
+                                        Some((n, a)) => (n.to_string(), a.trim().to_string()),
+                                        None => (cmd.clone(), String::new()),
                                     };
 
-                                    let ctx = ShellContext::new(
-                                        &epoch,
-                                        &exit_flag,
-                                        &plugin_infos,
-                                    );
+                                    // Send command to server
+                                    let msg = ClientMsg::Command { name, args };
+                                    let mut w = writer.lock().unwrap();
+                                    let _ = write_msg(&mut *w, &msg);
+                                    let _ = w.flush();
+                                    drop(w);
 
-                                    match plugins.iter().find(|p| p.name() == name) {
-                                        Some(plugin) => {
-                                            let msg = plugin.handle(args, &ctx);
-                                            if !msg.is_empty() {
-                                                for line in msg.lines() {
-                                                    log_entries.push(LogEntry {
-                                                        text: line.to_string(),
-                                                        kind: LogKind::Output,
-                                                    });
+                                    // Read responses until Done
+                                    while let Ok(resp) = server_rx.recv_timeout(Duration::from_secs(30)) {
+                                        match resp {
+                                            ServerMsg::Output { text, kind } => {
+                                                log_entries.push(LogEntry { text, kind });
+                                            }
+                                            ServerMsg::Done => break,
+                                            ServerMsg::Error { text } => {
+                                                log_entries.push(LogEntry { text, kind: OutKind::Error });
+                                            }
+                                            ServerMsg::Status { state, .. } => {
+                                                if state != crate::protocol::WorkState::Running {
+                                                    finished = true;
                                                 }
                                             }
-                                        }
-                                        None => {
-                                            log_entries.push(LogEntry {
-                                                text: format!(
-                                                    "[unknown command: '{cmd}' — type 'help']"
-                                                ),
-                                                kind: LogKind::Info,
-                                            });
+                                            ServerMsg::Commands { .. } => {}
                                         }
                                     }
-
-                                    input.reset();
                                     log_scroll_up = 0;
+                                    input.reset();
                                 }
                             }
 
                             KeyCode::Tab => {
                                 let current = input.value();
-                                if let Some(completion) = command_names
+                                let cmds = commands.lock().unwrap();
+                                if let Some(completion) = cmds
                                     .iter()
-                                    .find(|name| name.starts_with(current) && name.len() > current.len())
+                                    .find(|c| c.name.starts_with(current) && c.name.len() > current.len())
                                 {
-                                    input = Input::new(completion.clone());
+                                    input = Input::new(completion.name.clone());
                                 }
                             }
 
@@ -326,9 +286,6 @@ impl TuiShell {
                             }
 
                             KeyCode::Char('d') if ctrl && input.value().is_empty() => {
-                                shutdown.store(true, Ordering::Release);
-                                epoch.fetch_add(1, Ordering::Release);
-                                drop(bg_handle_opt.take());
                                 return Ok(());
                             }
 
@@ -338,17 +295,10 @@ impl TuiShell {
                         }
                     }
                 }
-
-                if exit_flag.load(Ordering::Acquire) {
-                    shutdown.store(true, Ordering::Release);
-                    epoch.fetch_add(1, Ordering::Release);
-                    drop(bg_handle_opt.take());
-                    return Ok(());
-                }
             }
         })();
 
-        // Cleanup terminal
+        // Cleanup
         {
             let stdout = terminal.backend_mut();
             write!(stdout, "\x1b[?1007l")?;
@@ -356,27 +306,6 @@ impl TuiShell {
         disable_raw_mode()?;
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-        // Wait for bg thread to finish
-        if let Some(handle) = bg_handle_opt.take() {
-            let (done_tx, done_rx) = mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = done_tx.send(handle.join());
-            });
-            match done_rx.recv_timeout(Duration::from_secs(2)) {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(e))) => {
-                    eprintln!("[background work error: {e:#}]");
-                }
-                _ => {}
-            }
-        }
-
         tui_result
-    }
-}
-
-impl Default for TuiShell {
-    fn default() -> Self {
-        Self::new()
     }
 }
