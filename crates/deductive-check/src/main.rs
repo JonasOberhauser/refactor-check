@@ -93,16 +93,14 @@ fn resolve_binary(name: &str) -> String {
     if name.contains('/') {
         return name.to_string();
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let candidates = [
-        format!("{home}/.opencode/bin/{name}"),
-        format!("{home}/.cargo/bin/{name}"),
-        format!("{home}/.local/bin/{name}"),
-        format!("/usr/local/bin/{name}"),
-    ];
-    for c in &candidates {
-        if std::path::Path::new(c).is_file() {
-            return c.clone();
+    let Ok(path) = std::env::var("PATH") else { return name.to_string(); };
+    for dir in path.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = std::path::Path::new(dir).join(name);
+        if candidate.is_file() {
+            return candidate.to_string_lossy().to_string();
         }
     }
     name.to_string()
