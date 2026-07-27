@@ -639,6 +639,8 @@ dependencies = [
  "refactor-check-core",
  "serde",
  "serde_json",
+ "servyi-ioprovider",
+ "servyi-servatui",
  "shellexpand",
  "tokio",
  "tracing",
@@ -653,6 +655,9 @@ dependencies = [
  "anyhow",
  "clap",
  "refactor-check-core",
+ "serde",
+ "serde_json",
+ "servyi-servatui",
 ]
 
 [[package]]
@@ -2991,6 +2996,7 @@ dependencies = [
  "serde",
  "serde_json",
  "servyi-ioprovider",
+ "servyi-servatui",
  "servyi-states",
  "tokio",
  "tracing",
@@ -3462,6 +3468,18 @@ dependencies = [
  "dashmap",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "servyi-servatui"
+version = "0.2.0"
+source = "git+https://github.com/servyi/servatui.git?branch=main#1fb190b6d4464651e872468757c50716e867b94a"
+dependencies = [
+ "crossterm",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tui-input",
 ]
 
 [[package]]
