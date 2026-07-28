@@ -889,17 +889,18 @@ impl CliRustAnalyzerProvider {
                     if end <= source.len() {
                         let code = source[start..end].to_string();
                         let docs = fetch_docs(&analysis, file_id, node.navigation_range.start());
+                        let impl_ctx = extract_impl_context(&source, start);
+                        let full_code = if impl_ctx.is_empty() {
+                            code
+                        } else {
+                            format!("{}\n{}", impl_ctx, code)
+                        };
                         debug!(
                             name = %node.label,
-                            node_range_start = usize::from(node.node_range.start()),
-                            node_range_end = usize::from(node.node_range.end()),
-                            nav_range_start = usize::from(node.navigation_range.start()),
-                            nav_range_end = usize::from(node.navigation_range.end()),
-                            source_len = source.len(),
-                            docs_len = docs.len(),
+                            impl_ctx = %impl_ctx,
                             "get_called_function_code: resolved node",
                         );
-                        return Ok(CalledFunctionCode { code, docs });
+                        return Ok(CalledFunctionCode { code: full_code, docs });
                     }
                 }
             }
@@ -1072,6 +1073,73 @@ fn git_response(output: std::process::Output) -> GitResponse {
         success: output.status.success(),
         output: combined,
     }
+}
+
+/// Extract contract attributes (#[invariant], #[requires], #[ensures]) and
+/// doc comments from the parent impl block and struct definition of a function.
+/// Uses ra_ap_syntax AST traversal per AGENTS.md rules.
+fn extract_impl_context(source: &str, func_offset: usize) -> String {
+    use ra_ap_syntax::{ast::{self, AstNode, HasAttrs}, SourceFile, TextSize};
+
+    let parse = SourceFile::parse(source, ra_ap_syntax::Edition::CURRENT);
+    let tree = parse.tree();
+
+    let offset = TextSize::from(func_offset as u32);
+    let Some(token) = tree.syntax().token_at_offset(offset).next() else {
+        return String::new();
+    };
+
+    let mut node = token.parent();
+    while let Some(parent) = node {
+        if let Some(impl_node) = ast::Impl::cast(parent.clone()) {
+            let mut context = String::new();
+
+            for attr in impl_node.attrs() {
+                let text = attr.syntax().text().to_string();
+                if text.contains("invariant")
+                    || text.contains("requires")
+                    || text.contains("ensures")
+                {
+                    context.push_str(&text);
+                    context.push('\n');
+                }
+            }
+
+            for token in impl_node.syntax().descendants_with_tokens() {
+                if let ra_ap_syntax::SyntaxElement::Token(t) = token {
+                    let text = t.text();
+                    if text.trim_start().starts_with("///") || text.trim_start().starts_with("//!") {
+                        context.push_str(text.trim());
+                        context.push('\n');
+                    }
+                }
+            }
+
+            if let Some(self_ty) = impl_node.self_ty() {
+                let type_name = self_ty.syntax().text().to_string();
+                for item in tree.syntax().descendants() {
+                    if let Some(s) = ast::Struct::cast(item.clone()) {
+                        if s.name().is_some_and(|n| n.text() == type_name) {
+                            for token in s.syntax().descendants_with_tokens() {
+                                if let ra_ap_syntax::SyntaxElement::Token(t) = token {
+                                    let text = t.text();
+                                    if text.trim_start().starts_with("///") {
+                                        context.push_str(text.trim());
+                                        context.push('\n');
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            return context.trim().to_string();
+        }
+        node = parent.parent();
+    }
+
+    String::new()
 }
 
 fn walkdir_rust_files(path: &PathBuf) -> Vec<PathBuf> {
