@@ -4,7 +4,6 @@ use std::sync::Arc;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
-use crate::error_gate::{ShellContext, ShellPlugin};
 use crate::llm::{LlmConfig, ServiceTier};
 use crate::live_config::LiveConfig;
 use crate::smt::SolverConfig;
@@ -211,28 +210,14 @@ where
     pub fn new(name: &'static str, config: Arc<LiveConfig<C>>) -> Self {
         Self { name, config, _phantom: PhantomData }
     }
-}
 
-impl<A, C> ShellPlugin for SetPlugin<A, C>
-where
-    A: ApplyTo<C>,
-    C: Clone + Send + Sync + 'static,
-{
-    fn name(&self) -> &str {
-        self.name
-    }
-
-    fn description(&self) -> &str {
-        "Update runtime config (use '<name> --help' for options)"
-    }
-
-    fn handle(&self, args: &str, _ctx: &ShellContext<'_>) -> String {
+    pub fn handle(&self, args: &str) -> String {
         let mut tokens = vec![self.name];
         tokens.extend(args.split_whitespace());
         match A::try_parse_from(tokens) {
             Ok(update) => {
                 let version = self.config.update(|c| update.apply_to(c));
-                format!("[config updated to v{version} — type 'continue' to resume]")
+                format!("[config updated to v{version}]")
             }
             Err(e) => e.to_string(),
         }
