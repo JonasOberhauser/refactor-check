@@ -260,6 +260,25 @@ fn main() -> Result<()> {
                 }
             };
 
+            // Create error gate for recoverable errors in LLM/SMT/Agent
+            let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+            let gate = std::sync::Arc::new(
+                refactor_check_core::error_gate::ErrorGate::new(
+                    bg_epoch.clone(),
+                    bg_shutdown.clone(),
+                    gate_tx,
+                )
+            );
+            // Forward gate errors to server state for status/continue protocols
+            {
+                let gate_state = bg_state.clone();
+                std::thread::spawn(move || {
+                    while let Ok(e) = gate_rx.recv() {
+                        gate_state.push_error(e);
+                    }
+                });
+            }
+
             let result: anyhow::Result<()> = rt.block_on(async move {
                 info!("starting verification worker");
 
@@ -290,9 +309,11 @@ fn main() -> Result<()> {
                 bg_config.update(|cfg| cfg.llm.api_key = api_key.clone());
 
                 info!("creating llm client");
-                let llm = refactor_check_core::llm::LlmClient::with_live_config(bg_config.clone());
+                let llm = refactor_check_core::llm::LlmClient::with_live_config(bg_config.clone())
+                    .with_error_gate(gate.clone());
                 info!("creating solver");
-                let solver = Z3Solver::with_live_config(bg_config.clone());
+                let solver = Z3Solver::with_live_config(bg_config.clone())
+                    .with_error_gate(gate.clone());
 
                 info!(project = %bg_project, "loading rust-analyzer workspace");
                 let rust_analyzer = deductive_check::provider::CliRustAnalyzerProvider::new(bg_project.clone())?;
@@ -309,7 +330,8 @@ fn main() -> Result<()> {
                     agent_args.push("-m".to_string());
                     agent_args.push(agent_model);
                 }
-                let agent = deductive_check::provider::CliAgentProvider::new(agent_binary, agent_args);
+                let agent = deductive_check::provider::CliAgentProvider::new(agent_binary, agent_args)
+                    .with_error_gate(gate.clone());
 
                 let providers = deductive_check::provider::Providers {
                     llm: &llm,
