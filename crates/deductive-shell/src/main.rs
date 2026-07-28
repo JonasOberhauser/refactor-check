@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
 use clap::Parser;
 
 use refactor_check_core::protocols::all_protocols;
@@ -12,7 +11,7 @@ struct Cli {
     socket_path: PathBuf,
 }
 
-fn main() -> Result<()> {
+fn main() {
     let cli = Cli::parse();
 
     let app = App::builder(&cli.socket_path)
@@ -21,8 +20,12 @@ fn main() -> Result<()> {
         .build();
 
     if !app.server_running() {
-        anyhow::bail!("Cannot connect to server at {}. Is deductive-check running?", cli.socket_path.display());
+        eprintln!("Cannot connect to server at {}. Is deductive-check running?", cli.socket_path.display());
+        std::process::exit(1);
     }
 
-    app.run_tui().map_err(|e| anyhow::anyhow!("{e}"))
+    if let Err(e) = app.run_tui() {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
 }
