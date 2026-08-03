@@ -82,7 +82,7 @@ struct Cli {
     #[arg(long, default_value = "run")]
     agent_subcommand: String,
 
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "opencode/big-pickle")]
     agent_model: String,
 
     #[arg(long, default_value_t = true)]
@@ -232,6 +232,8 @@ fn main() -> Result<()> {
     let agent_skip_permissions = cli.agent_skip_permissions;
     let result_file = cli.result_file.clone().unwrap_or_else(|| "result.json".to_string());
     let api_key_raw = cli.api_key.clone();
+    let solver_path = cli.solver_path.clone();
+    let solver_args = cli.solver_args.clone();
 
     // Server state shared with all protocol handlers
     let server_state = Arc::new(ServerState::new(log.clone()));
@@ -345,7 +347,7 @@ fn main() -> Result<()> {
 
                 let pm = deductive_check::piece_manager::DefaultDeductivePieceManager::new(bg_log.clone());
 
-                let result = deductive_check::machine::run(&bg_project, &providers, &pm).await?;
+                let result = deductive_check::machine::run(&bg_project, &providers, &pm, &solver_path, &solver_args).await?;
 
                 let result_path = std::path::PathBuf::from(&result_file);
                 if let Some(parent) = result_path.parent() {

@@ -71,6 +71,134 @@ impl Initializer {
     }
 }
 
+/// Preflight: verify all external tools are installed and working before
+/// starting the verification pipeline.
+pub struct Preflight {
+    project_path: PathBuf,
+    solver_path: String,
+    solver_args: Vec<String>,
+}
+
+impl Preflight {
+    pub fn new(project_path: PathBuf, solver_path: String, solver_args: Vec<String>) -> Self {
+        Self { project_path, solver_path, solver_args }
+    }
+}
+
+#[async_trait]
+impl AlgorithmState for Preflight {
+    async fn execute(
+        self: Box<Self>,
+        providers: &Providers<'_>,
+        _pm: &dyn crate::piece_manager::DeductivePieceManager,
+    ) -> Result<Step> {
+        let mut failures = Vec::new();
+
+        // 1. git
+        info!("preflight: checking git");
+        match tokio::process::Command::new("git")
+            .args(["--version"])
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => {
+                info!("preflight: git OK ({})", String::from_utf8_lossy(&o.stdout).trim());
+            }
+            Ok(o) => failures.push(format!("git --version failed: {}", String::from_utf8_lossy(&o.stderr))),
+            Err(e) => failures.push(format!("git not found: {e}")),
+        }
+
+        // 2. z3 solver
+        info!("preflight: checking z3 solver");
+        let mut solver_cmd = tokio::process::Command::new(&self.solver_path);
+        solver_cmd.args(&self.solver_args);
+        solver_cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        match solver_cmd.spawn() {
+            Ok(mut child) => {
+                use tokio::io::AsyncWriteExt;
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(b"(check-sat)\n").await;
+                    drop(stdin);
+                }
+                let output = child.wait_with_output().await;
+                match output {
+                    Ok(o) if o.status.success() => {
+                        info!("preflight: z3 OK ({} bytes output)", o.stdout.len());
+                    }
+                    Ok(o) => failures.push(format!(
+                        "z3 failed (exit {:?}): {}",
+                        o.status.code(),
+                        String::from_utf8_lossy(&o.stderr).trim(),
+                    )),
+                    Err(e) => failures.push(format!("z3 error: {e}")),
+                }
+            }
+            Err(e) => failures.push(format!("z3 '{}' not found: {e}", self.solver_path)),
+        }
+
+        // 3. python3
+        info!("preflight: checking python3");
+        match tokio::process::Command::new("python3")
+            .args(["--version"])
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => {
+                info!("preflight: python3 OK ({} bytes)", o.stdout.len());
+            }
+            Ok(o) => failures.push(format!("python3 --version failed: {}", String::from_utf8_lossy(&o.stderr))),
+            Err(e) => failures.push(format!("python3 not found: {e}")),
+        }
+
+        // 4. opencode agent
+        info!("preflight: checking opencode agent");
+        match tokio::process::Command::new("opencode")
+            .args(["--version"])
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => {
+                info!("preflight: opencode OK");
+            }
+            Ok(o) => failures.push(format!("opencode --version failed: {}", String::from_utf8_lossy(&o.stderr))),
+            Err(e) => failures.push(format!("opencode not found: {e}")),
+        }
+
+        // 5. rust files exist and rust-analyzer workspace is loaded
+        info!("preflight: checking project rust files");
+        match providers
+            .git
+            .invoke(GitRequest::WalkRustFiles {
+                path: self.project_path.clone(),
+            })
+            .await
+        {
+            Ok(resp) => {
+                let count = resp.output.lines().filter(|l| !l.is_empty()).count();
+                if count == 0 {
+                    failures.push("no .rs files found in project".to_string());
+                } else {
+                    info!("preflight: project OK ({count} rust files)");
+                }
+            }
+            Err(e) => failures.push(format!("file walk error: {e}")),
+        }
+
+        if failures.is_empty() {
+            info!("preflight: all checks passed");
+            Ok(Step::State(Box::new(Initializer::new(self.project_path))))
+        } else {
+            let msg = failures.iter()
+                .map(|f| format!("  - {f}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::bail!("Preflight checks failed:\n{msg}");
+        }
+    }
+}
+
 #[async_trait]
 impl AlgorithmState for Initializer {
     async fn execute(
@@ -1241,6 +1369,7 @@ If you respond RETRY, make sure to commit your changes first."#,
             info!("IO response: agent responded");
 
             let response = agent_resp.stdout.trim().to_string();
+            info!(response_preview = %response.chars().take(500).collect::<String>(), success = agent_resp.success, "agent response");
 
             if response.to_uppercase().starts_with("RETRY") {
                 info!("IO: git AddFiles");

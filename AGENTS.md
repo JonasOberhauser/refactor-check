@@ -51,6 +51,17 @@ No code duplication. Use good abstractions and put common code into logically se
 
 **Never do parsing yourself.** For any syntax analysis (unsafe detection, assertions, macro calls, method calls, cfg attributes, etc.), use `ra_ap_syntax::ast` tree traversal (`descendants()`, `descendants_with_tokens()`, `cast()`). Never write hand-rolled text lexers or substring matching on source code.
 
+## Preflight Checks
+
+Before beginning any verification work, the state machine must run a `Preflight` state that verifies all external tools are installed and working:
+- **git** — `git --version` succeeds
+- **z3 solver** — spawns and responds to `(check-sat)`
+- **python3** — `python3 --version` succeeds
+- **opencode** — `opencode --version` succeeds
+- **project** — contains at least one `.rs` file
+
+If any check fails, bail immediately with a clear error listing all failures. Do not proceed to the `Initializer` state.
+
 ## ContextId Rules
 
 - **`ContextId` Clone is illegal.** Cloning resets `child_counter`, producing duplicate child IDs. There is no `Clone` impl and there must never be one.
