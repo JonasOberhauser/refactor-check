@@ -4,21 +4,15 @@ use tracing::info;
 use crate::piece_manager::DeductivePieceManager;
 use crate::provider::Providers;
 use crate::result::VerificationResult;
-use crate::states::{AlgorithmState, Preflight, Step};
+use crate::states::{AlgorithmState, PreflightGit, Step};
 
 pub async fn run(
     project_path: &str,
     providers: &Providers<'_>,
     pm: &dyn DeductivePieceManager,
-    solver_path: &str,
-    solver_args: &[String],
 ) -> Result<VerificationResult> {
     let project_path = std::path::PathBuf::from(project_path);
-    let mut state: Box<dyn AlgorithmState> = Box::new(Preflight::new(
-        project_path.clone(),
-        solver_path.to_string(),
-        solver_args.to_vec(),
-    ));
+    let mut state: Box<dyn AlgorithmState> = Box::new(PreflightGit::new(project_path));
 
     loop {
         state = match state.execute(providers, pm).await? {

@@ -72,130 +72,96 @@ impl Initializer {
 }
 
 /// Preflight: verify all external tools are installed and working before
-/// starting the verification pipeline.
-pub struct Preflight {
+/// starting the verification pipeline. Each check is a separate state using
+/// the appropriate IOProvider, so failures are individually recoverable via
+/// the error gate.
+pub struct PreflightGit {
     project_path: PathBuf,
-    solver_path: String,
-    solver_args: Vec<String>,
 }
-
-impl Preflight {
-    pub fn new(project_path: PathBuf, solver_path: String, solver_args: Vec<String>) -> Self {
-        Self { project_path, solver_path, solver_args }
+impl PreflightGit {
+    pub fn new(project_path: PathBuf) -> Self {
+        Self { project_path }
+    }
+}
+#[async_trait]
+impl AlgorithmState for PreflightGit {
+    async fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
+        info!("preflight: checking git");
+        providers.git.invoke(GitRequest::CurrentCommitHash).await?;
+        info!("preflight: git OK");
+        Ok(Step::State(Box::new(PreflightSolver { project_path: self.project_path })))
     }
 }
 
+pub struct PreflightSolver {
+    project_path: PathBuf,
+}
 #[async_trait]
-impl AlgorithmState for Preflight {
-    async fn execute(
-        self: Box<Self>,
-        providers: &Providers<'_>,
-        _pm: &dyn crate::piece_manager::DeductivePieceManager,
-    ) -> Result<Step> {
-        let mut failures = Vec::new();
-
-        // 1. git
-        info!("preflight: checking git");
-        match tokio::process::Command::new("git")
-            .args(["--version"])
-            .output()
-            .await
-        {
-            Ok(o) if o.status.success() => {
-                info!("preflight: git OK ({})", String::from_utf8_lossy(&o.stdout).trim());
-            }
-            Ok(o) => failures.push(format!("git --version failed: {}", String::from_utf8_lossy(&o.stderr))),
-            Err(e) => failures.push(format!("git not found: {e}")),
-        }
-
-        // 2. z3 solver
+impl AlgorithmState for PreflightSolver {
+    async fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking z3 solver");
-        let mut solver_cmd = tokio::process::Command::new(&self.solver_path);
-        solver_cmd.args(&self.solver_args);
-        solver_cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        match solver_cmd.spawn() {
-            Ok(mut child) => {
-                use tokio::io::AsyncWriteExt;
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(b"(check-sat)\n").await;
-                    drop(stdin);
-                }
-                let output = child.wait_with_output().await;
-                match output {
-                    Ok(o) if o.status.success() => {
-                        info!("preflight: z3 OK ({} bytes output)", o.stdout.len());
-                    }
-                    Ok(o) => failures.push(format!(
-                        "z3 failed (exit {:?}): {}",
-                        o.status.code(),
-                        String::from_utf8_lossy(&o.stderr).trim(),
-                    )),
-                    Err(e) => failures.push(format!("z3 error: {e}")),
-                }
-            }
-            Err(e) => failures.push(format!("z3 '{}' not found: {e}", self.solver_path)),
-        }
+        let root = ContextId::root();
+        let resp = providers.solver.invoke(SolverRequest {
+            formula: "(check-sat)".to_string(),
+            context_id: Box::new(root.new_child()),
+        }).await?;
+        info!(ctx = %resp.context_id, "preflight: solver OK");
+        Ok(Step::State(Box::new(PreflightPython { project_path: self.project_path })))
+    }
+}
 
-        // 3. python3
+pub struct PreflightPython {
+    project_path: PathBuf,
+}
+#[async_trait]
+impl AlgorithmState for PreflightPython {
+    async fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking python3");
-        match tokio::process::Command::new("python3")
-            .args(["--version"])
-            .output()
-            .await
-        {
-            Ok(o) if o.status.success() => {
-                info!("preflight: python3 OK ({} bytes)", o.stdout.len());
-            }
-            Ok(o) => failures.push(format!("python3 --version failed: {}", String::from_utf8_lossy(&o.stderr))),
-            Err(e) => failures.push(format!("python3 not found: {e}")),
-        }
+        providers.python.invoke(PythonRequest {
+            script: r#"print("(check-sat)")"#.to_string(),
+        }).await?;
+        info!("preflight: python3 OK");
+        Ok(Step::State(Box::new(PreflightAgent { project_path: self.project_path })))
+    }
+}
 
-        // 4. opencode agent
+pub struct PreflightAgent {
+    project_path: PathBuf,
+}
+#[async_trait]
+impl AlgorithmState for PreflightAgent {
+    async fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking opencode agent");
-        match tokio::process::Command::new("opencode")
-            .args(["--version"])
-            .output()
-            .await
-        {
-            Ok(o) if o.status.success() => {
-                info!("preflight: opencode OK");
-            }
-            Ok(o) => failures.push(format!("opencode --version failed: {}", String::from_utf8_lossy(&o.stderr))),
-            Err(e) => failures.push(format!("opencode not found: {e}")),
+        let resp = providers.agent.invoke(AgentRequest {
+            prompt: "Say OK".to_string(),
+            working_directory: self.project_path.clone(),
+            files_to_read: vec![],
+        }).await?;
+        if !resp.success {
+            anyhow::bail!("agent check failed: {}", resp.stdout);
         }
+        info!("preflight: opencode OK");
+        Ok(Step::State(Box::new(PreflightProject { project_path: self.project_path })))
+    }
+}
 
-        // 5. rust files exist and rust-analyzer workspace is loaded
-        info!("preflight: checking project rust files");
-        match providers
-            .git
-            .invoke(GitRequest::WalkRustFiles {
-                path: self.project_path.clone(),
-            })
-            .await
-        {
-            Ok(resp) => {
-                let count = resp.output.lines().filter(|l| !l.is_empty()).count();
-                if count == 0 {
-                    failures.push("no .rs files found in project".to_string());
-                } else {
-                    info!("preflight: project OK ({count} rust files)");
-                }
-            }
-            Err(e) => failures.push(format!("file walk error: {e}")),
+pub struct PreflightProject {
+    project_path: PathBuf,
+}
+#[async_trait]
+impl AlgorithmState for PreflightProject {
+    async fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
+        info!("preflight: checking project files");
+        let resp = providers.git.invoke(GitRequest::WalkRustFiles {
+            path: self.project_path.clone(),
+        }).await?;
+        let count = resp.output.lines().filter(|l| !l.is_empty()).count();
+        if count == 0 {
+            anyhow::bail!("no .rs files found in project");
         }
-
-        if failures.is_empty() {
-            info!("preflight: all checks passed");
-            Ok(Step::State(Box::new(Initializer::new(self.project_path))))
-        } else {
-            let msg = failures.iter()
-                .map(|f| format!("  - {f}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            anyhow::bail!("Preflight checks failed:\n{msg}");
-        }
+        info!("preflight: project OK ({count} rust files)");
+        info!("preflight: all checks passed");
+        Ok(Step::State(Box::new(Initializer::new(self.project_path))))
     }
 }
 
