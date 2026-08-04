@@ -22,6 +22,11 @@ struct Cli {
     #[arg(long)]
     project: String,
 
+    /// Directory where the server socket is created (default: /tmp).
+    /// The socket is named deductive-check-{pid}.sock inside this directory.
+    #[arg(long, default_value = "/tmp")]
+    socket_dir: String,
+
     #[arg(long, default_value = "z3")]
     solver_path: String,
 
@@ -390,10 +395,12 @@ fn main() -> Result<()> {
     });
 
     // Build the server
-    let socket_path = format!("/tmp/deductive-check-{}.sock", std::process::id());
-    info!(socket = %socket_path, "server listening");
-    println!("Server listening on {socket_path}");
-    println!("Connect with: deductive-shell {socket_path}");
+    let socket_dir = std::path::Path::new(&cli.socket_dir);
+    std::fs::create_dir_all(socket_dir)?;
+    let socket_path = socket_dir.join(format!("deductive-check-{}.sock", std::process::id()));
+    info!(socket = %socket_path.display(), "server listening");
+    println!("Server listening on {}", socket_path.display());
+    println!("Connect with: deductive-shell {}", socket_path.display());
 
     let app = App::builder(&socket_path)
         .version("0.1.0")

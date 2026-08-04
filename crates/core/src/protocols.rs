@@ -162,12 +162,46 @@ pub fn exit_protocol() -> Protocol {
         .finalize(|| Ok(ShellAction::Exit))
 }
 
+/// Identity returned by the `identify` handshake. Used by clients (e.g.
+/// `deductive-shell`'s connect resolver) to recognize a matching server among
+/// candidate socket files.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct IdentifyResponse {
+    pub name: String,
+    pub version: String,
+    pub pid: u32,
+}
+
+/// Handshake protocol: a client probes a socket with `identify` to learn
+/// whether it speaks the deductive-check protocol and which process owns it.
+pub fn identify_protocol() -> Protocol {
+    Plugin::new("identify", "Server identity handshake")
+        .parse(|_args: &str| Ok(()))
+        .client(|req: (), _out, _input| Ok(req))
+        .server_ctx(|_req: (), _ctx: &ServerState| {
+            Ok(IdentifyResponse {
+                name: "deductive-check".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                pid: std::process::id(),
+            })
+        })
+        .client(|resp: IdentifyResponse, out, _input| {
+            out.print_line(&format!(
+                "[{} v{} pid={}]",
+                resp.name, resp.version, resp.pid
+            ));
+            Ok(())
+        })
+        .finalize(|| Ok(ShellAction::Continue))
+}
+
 pub fn all_protocols() -> Vec<Protocol> {
     vec![
         continue_protocol(),
         show_protocol(),
         status_protocol(),
         exit_protocol(),
+        identify_protocol(),
     ]
 }
 
