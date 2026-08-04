@@ -405,4 +405,45 @@ mod tests {
             run_with_deadline(data, 15).unwrap_or_else(|e| panic!("len {len}: {e}"));
         }
     }
+
+    /// Pick the largest corpus input (richest execution) for a representative trace.
+    fn pick_corpus_input() -> Option<Vec<u8>> {
+        let dir = std::path::PathBuf::from("corpus/state_machine");
+        let mut entries: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(&dir)
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|e| Some((e.metadata().ok()?.len(), e.path())))
+            .collect();
+        entries.sort_by_key(|(len, _)| *len);
+        entries.last().map(|(_, p)| std::fs::read(p).ok())?
+    }
+
+    /// Runs one state-machine execution with a tracing subscriber writing the
+    /// full `deductive_check` event flow to a file. Run with:
+    ///   cargo +nightly test trace_one_run -- --nocapture
+    #[test]
+    fn trace_one_run() {
+        use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+        let trace_path = std::path::PathBuf::from(
+            std::env::var("FUZZ_TRACE_PATH")
+                .unwrap_or_else(|_| "/tmp/opencode/fuzz_trace.log".to_string()),
+        );
+        if let Some(parent) = trace_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let file = std::fs::File::create(&trace_path).expect("create trace file");
+
+        // Thread-local default subscriber; run_state_machine runs on this same
+        // thread (current-thread runtime), so all events are captured.
+        let _guard = tracing_subscriber::registry()
+            .with(EnvFilter::new("deductive_check=info,refactor_check_core=warn,warn"))
+            .with(fmt::layer().with_writer(file).with_ansi(false).with_target(false))
+            .set_default();
+
+        let data = pick_corpus_input().unwrap_or_else(|| vec![123u8; 200]);
+        eprintln!("tracing input of {} bytes -> {}", data.len(), trace_path.display());
+        run_state_machine(&data);
+        eprintln!("trace written to {}", trace_path.display());
+    }
 }

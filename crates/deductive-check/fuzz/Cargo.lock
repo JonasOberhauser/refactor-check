@@ -673,6 +673,8 @@ dependencies = [
  "servyi-ioprovider",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
