@@ -493,7 +493,11 @@ mod tests {
             .with(fmt::layer().with_writer(file).with_ansi(false).with_target(false))
             .set_default();
 
-        let data = pick_corpus_input().unwrap_or_else(|| vec![123u8; 200]);
+        let data = match std::env::var("FUZZ_INPUT_PATH") {
+            Ok(p) => std::fs::read(&p)
+                .unwrap_or_else(|e| panic!("FUZZ_INPUT_PATH read failed ({p}): {e}")),
+            Err(_) => pick_corpus_input().unwrap_or_else(|| vec![123u8; 200]),
+        };
         eprintln!("tracing input of {} bytes -> {}", data.len(), trace_path.display());
         run_state_machine(&data);
         eprintln!("trace written to {}", trace_path.display());
