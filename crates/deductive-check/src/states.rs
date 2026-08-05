@@ -1191,6 +1191,8 @@ impl AlgorithmState for FullFormalizer {
                 recheck_files: Vec::new(),
                 base_commit: String::new(),
                 accumulated_bugs: self.accumulated_bugs,
+                total_pieces,
+                total_functions: functions_count,
             })))
         }
     }
@@ -1205,6 +1207,8 @@ pub struct ProblemAnalyzer {
     recheck_files: Vec<PathBuf>,
     base_commit: String,
     accumulated_bugs: Vec<BugReport>,
+    total_pieces: usize,
+    total_functions: usize,
 }
 
 #[async_trait]
@@ -1391,8 +1395,8 @@ If you respond RETRY, make sure to commit your changes first."#,
                 closed_pieces: self.closed,
                 unverified_pieces: Vec::new(),
                 bug_reports: all_bugs,
-                total_functions: 0,
-                total_pieces: 0,
+                total_functions: self.total_functions,
+                total_pieces: self.total_pieces,
             }))
         } else {
             Ok(Step::State(Box::new(Restarter {
