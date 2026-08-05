@@ -265,3 +265,54 @@ async fn bug_report_survives_restart_cycle() {
         result.bug_reports[0]
     );
 }
+
+#[tokio::test]
+async fn totals_reported_when_terminating_via_problem_analyzer() {
+    // When the machine terminates through ProblemAnalyzer's own Result path
+    // (unverified pieces all reported as bugs, none RETRY), the final
+    // VerificationResult must report the real totals. Previously
+    // ProblemAnalyzer hardcoded total_functions: 0 / total_pieces: 0.
+    let project = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(project.path().join(".git")).expect("create .git marker");
+
+    let mocks = Mocks {
+        llm: MockLlm,
+        solver: MockSolver {
+            outcomes: Mutex::new(VecDeque::from([
+                SolverOutcome::Unsat, // preflight (outcome ignored)
+                SolverOutcome::Sat,   // f0 -> unverified
+                SolverOutcome::Sat,   // f1 -> unverified
+            ])),
+        },
+        ra: MockRa,
+        git: MockGit,
+        fs: MockFs,
+        python: MockPython,
+        agent: MockAgent {
+            responses: Mutex::new(VecDeque::from([
+                (true, "OK".to_string()),             // preflight
+                (true, "Bug in f0.".to_string()),     // f0 -> bug report (no RETRY)
+                (true, "Bug in f1.".to_string()),     // f1 -> bug report (no RETRY)
+            ])),
+        },
+    };
+
+    let pm = DefaultDeductivePieceManager::default();
+    let result = machine::run(
+        project.path().to_str().expect("utf8 temp path"),
+        &mocks.providers(),
+        &pm,
+    )
+    .await
+    .expect("machine ran");
+
+    assert_eq!(
+        result.total_pieces, 2,
+        "total_pieces must reflect the pieces processed (2), not 0"
+    );
+    assert_eq!(
+        result.total_functions, 2,
+        "total_functions must reflect the functions verified (2), not 0"
+    );
+    assert_eq!(result.bug_reports.len(), 2, "both pieces should be bug reports");
+}
