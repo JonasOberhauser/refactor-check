@@ -1107,7 +1107,15 @@ async fn process_piece(
         }
     }
 
-    pm.advance_piece(&ctx, Some(CodePiecePhase::Judge), CodePiecePhase::Unverified);
+    // The piece exhausted its judge attempts without being accepted. Its phase
+    // is Judge if the last attempt reached the judge, or GetContext if the
+    // last attempt hit the "no formulas extracted" branch (Formalizer ->
+    // GetContext -> continue). Accept either.
+    pm.expect_piece_phase_and_set(
+        &ctx,
+        &[CodePiecePhase::Judge, CodePiecePhase::GetContext],
+        CodePiecePhase::Unverified,
+    );
     Ok(PieceOutcome {
         closed: None,
         unverified: Some(unverified_from_piece(
