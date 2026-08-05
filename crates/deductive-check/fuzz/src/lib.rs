@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use arbitrary::Unstructured;
 use async_trait::async_trait;
+use tracing::info;
 
 use deductive_check::consts;
 use deductive_check::provider::{
@@ -85,19 +86,45 @@ where
 // Fuzz impls
 // ---------------------------------------------------------------------------
 
+/// Truncate + collapse newlines for readable trace output.
+fn truncate(s: &str, max: usize) -> String {
+    let collapsed = s.replace('\n', "\\n").replace('\r', "");
+    if collapsed.chars().count() > max {
+        format!("{}…", collapsed.chars().take(max).collect::<String>())
+    } else {
+        collapsed
+    }
+}
+
 // ---- LLM -----------------------------------------------------------------
 
 pub struct FuzzLlm;
 
 impl Fuzz<LlmRequest, String> for FuzzLlm {
     fn fuzz(&self, input: &LlmRequest, u: &mut Unstructured) -> String {
-        match input.role {
+        let result = match input.role {
             LlmRole::Splitter => fuzz_splitter(u),
             LlmRole::Formalizer => fuzz_smt_blocks(u, 1, 2),
             LlmRole::Fixer => fuzz_smt_blocks(u, 1, 1),
             LlmRole::Judge => fuzz_judge(u),
             LlmRole::SplittingJudge | LlmRole::Analyzer => fuzz_text(u),
-        }
+        };
+        let ctx = &*input.context_id;
+        let last_user = input
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, deductive_check::llm::Role::User))
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        info!(
+            %ctx,
+            role = ?input.role,
+            sent = %truncate(last_user, 160),
+            recv = %truncate(&result, 300),
+            "fuzz llm",
+        );
+        result
     }
 }
 
@@ -157,7 +184,7 @@ fn fuzz_text(u: &mut Unstructured) -> String {
 pub struct FuzzSolver;
 
 impl Fuzz<SolverRequest, SolverResult> for FuzzSolver {
-    fn fuzz(&self, _input: &SolverRequest, u: &mut Unstructured) -> SolverResult {
+    fn fuzz(&self, input: &SolverRequest, u: &mut Unstructured) -> SolverResult {
         let outcome = match u.int_in_range(0u8..=9).unwrap_or(4) {
             0..=4 => SolverOutcome::Unsat,
             5..=7 => SolverOutcome::Sat,
@@ -170,7 +197,16 @@ impl Fuzz<SolverRequest, SolverResult> for FuzzSolver {
             SolverOutcome::Unknown => "unknown".to_string(),
             SolverOutcome::Error(e) => format!("(error {e})"),
         };
-        SolverResult { outcome, stdout, stderr: String::new() }
+        let result = SolverResult { outcome, stdout, stderr: String::new() };
+        let ctx = &*input.context_id;
+        info!(
+            %ctx,
+            sent = %truncate(&input.formula, 160),
+            outcome = ?result.outcome,
+            recv = %truncate(&result.stdout, 120),
+            "fuzz solver",
+        );
+        result
     }
 }
 
@@ -180,7 +216,7 @@ pub struct FuzzRustAnalyzer;
 
 impl Fuzz<RustAnalyzerRequest, RustAnalyzerResponse> for FuzzRustAnalyzer {
     fn fuzz(&self, input: &RustAnalyzerRequest, u: &mut Unstructured) -> RustAnalyzerResponse {
-        match input {
+        let resp = match input {
             RustAnalyzerRequest::ListFunctions { files, .. } => {
                 let file = files.first().cloned().unwrap_or_else(|| "src/lib.rs".into());
                 let count = u.int_in_range(1..=3usize).unwrap_or(1);
@@ -226,7 +262,9 @@ impl Fuzz<RustAnalyzerRequest, RustAnalyzerResponse> for FuzzRustAnalyzer {
             RustAnalyzerRequest::GetFileContent { .. } => {
                 RustAnalyzerResponse::FileContent("fn main() {}".to_string())
             }
-        }
+        };
+        info!(req = ?input, recv = ?resp, "fuzz rust-analyzer");
+        resp
     }
 }
 
@@ -244,7 +282,9 @@ impl Fuzz<GitRequest, GitResponse> for FuzzGit {
             GitRequest::FindChangedRustFiles { .. } => (true, String::new()),
             _ => (true, String::new()),
         };
-        GitResponse { success, output }
+        let resp = GitResponse { success, output };
+        info!(req = ?input, success = resp.success, recv = %truncate(&resp.output, 120), "fuzz git");
+        resp
     }
 }
 
@@ -254,9 +294,11 @@ pub struct FuzzFileSystem;
 
 impl Fuzz<FileSystemRequest, FileSystemResponse> for FuzzFileSystem {
     fn fuzz(&self, input: &FileSystemRequest, _u: &mut Unstructured) -> FileSystemResponse {
-        FileSystemResponse {
+        let resp = FileSystemResponse {
             path: input.dir.join(&input.filename),
-        }
+        };
+        info!(filename = %input.filename, recv = %resp.path.display(), "fuzz filesystem");
+        resp
     }
 }
 
@@ -271,7 +313,13 @@ impl Fuzz<PythonRequest, PythonResponse> for FuzzPython {
         } else {
             input.script.clone()
         };
-        PythonResponse { smtlib, explanation: String::new() }
+        let resp = PythonResponse { smtlib, explanation: String::new() };
+        info!(
+            sent_len = input.script.len(),
+            recv = %truncate(&resp.smtlib, 160),
+            "fuzz python",
+        );
+        resp
     }
 }
 
@@ -291,7 +339,9 @@ impl Fuzz<AgentRequest, AgentResponse> for FuzzAgent {
         } else {
             "No bug found; verification inconclusive.".to_string()
         };
-        AgentResponse { stdout, success: true }
+        let resp = AgentResponse { stdout, success: true };
+        info!(retry, recv = %resp.stdout, "fuzz agent");
+        resp
     }
 }
 
@@ -437,7 +487,9 @@ mod tests {
         // Thread-local default subscriber; run_state_machine runs on this same
         // thread (current-thread runtime), so all events are captured.
         let _guard = tracing_subscriber::registry()
-            .with(EnvFilter::new("deductive_check=info,refactor_check_core=warn,warn"))
+            .with(EnvFilter::new(
+                "deductive_check=info,deductive_check_fuzz=info,refactor_check_core=warn,warn",
+            ))
             .with(fmt::layer().with_writer(file).with_ansi(false).with_target(false))
             .set_default();
 
