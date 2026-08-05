@@ -251,6 +251,7 @@ impl AlgorithmState for Initializer {
             verification_dir,
             branch_name,
             files: all_rust_files,
+            accumulated_bugs: Vec::new(),
         })))
     }
 }
@@ -260,6 +261,7 @@ pub struct FunctionLister {
     verification_dir: PathBuf,
     branch_name: String,
     files: Vec<PathBuf>,
+    accumulated_bugs: Vec<BugReport>,
 }
 
 #[async_trait]
@@ -315,6 +317,7 @@ impl AlgorithmState for FunctionLister {
             branch_name: self.branch_name,
             functions: function_map,
             function_docs,
+            accumulated_bugs: self.accumulated_bugs,
         })))
     }
 }
@@ -382,6 +385,7 @@ pub struct FunctionAnalyzer {
     branch_name: String,
     functions: std::collections::HashMap<PathBuf, Vec<FunctionId>>,
     function_docs: HashMap<FunctionId, String>,
+    accumulated_bugs: Vec<BugReport>,
 }
 
 #[async_trait]
@@ -427,6 +431,7 @@ impl AlgorithmState for FunctionAnalyzer {
             branch_name: self.branch_name,
             function_bodies,
             function_docs: self.function_docs,
+            accumulated_bugs: self.accumulated_bugs,
         })))
     }
 }
@@ -437,6 +442,7 @@ pub struct Splitter {
     branch_name: String,
     function_bodies: Vec<(PathBuf, FunctionId, String)>,
     function_docs: HashMap<FunctionId, String>,
+    accumulated_bugs: Vec<BugReport>,
 }
 
 #[async_trait]
@@ -467,6 +473,7 @@ impl AlgorithmState for Splitter {
             branch_name: self.branch_name,
             pieces: code_pieces,
             iteration: 0,
+            accumulated_bugs: self.accumulated_bugs,
         })))
     }
 }
@@ -577,6 +584,7 @@ pub struct FullFormalizer {
     pieces: Vec<(ArcCodePiece, ContextId)>,
     #[allow(dead_code)]
     iteration: usize,
+    accumulated_bugs: Vec<BugReport>,
 }
 
 impl FullFormalizer {
@@ -1169,7 +1177,7 @@ impl AlgorithmState for FullFormalizer {
             Ok(Step::Result(VerificationResult {
                 closed_pieces,
                 unverified_pieces,
-                bug_reports: Vec::new(),
+                bug_reports: self.accumulated_bugs,
                 total_functions: functions_count,
                 total_pieces,
             }))
@@ -1182,6 +1190,7 @@ impl AlgorithmState for FullFormalizer {
                 unverified: unverified_pieces,
                 recheck_files: Vec::new(),
                 base_commit: String::new(),
+                accumulated_bugs: self.accumulated_bugs,
             })))
         }
     }
@@ -1195,6 +1204,7 @@ pub struct ProblemAnalyzer {
     unverified: Vec<UnverifiedPiece>,
     recheck_files: Vec<PathBuf>,
     base_commit: String,
+    accumulated_bugs: Vec<BugReport>,
 }
 
 #[async_trait]
@@ -1373,11 +1383,14 @@ If you respond RETRY, make sure to commit your changes first."#,
             }
         }
 
+        let mut all_bugs = self.accumulated_bugs;
+        all_bugs.extend(bug_reports);
+
         if remaining_unverified.is_empty() {
             Ok(Step::Result(VerificationResult {
                 closed_pieces: self.closed,
                 unverified_pieces: Vec::new(),
-                bug_reports,
+                bug_reports: all_bugs,
                 total_functions: 0,
                 total_pieces: 0,
             }))
@@ -1388,6 +1401,7 @@ If you respond RETRY, make sure to commit your changes first."#,
                 branch_name: self.branch_name,
                 base_commit,
                 recheck_files: files_to_recheck,
+                accumulated_bugs: all_bugs,
             })))
         }
     }
@@ -1399,6 +1413,7 @@ pub struct Restarter {
     branch_name: String,
     base_commit: String,
     recheck_files: Vec<PathBuf>,
+    accumulated_bugs: Vec<BugReport>,
 }
 
 #[async_trait]
@@ -1441,6 +1456,7 @@ impl AlgorithmState for Restarter {
             verification_dir: self.verification_dir,
             branch_name: self.branch_name,
             files: all_files,
+            accumulated_bugs: self.accumulated_bugs,
         })))
     }
 }
