@@ -75,11 +75,29 @@ where
     async fn invoke(&self, input: I) -> Result<WithContext<T>> {
         let value = {
             let mut guard = self.stream.lock().expect("fuzz stream poisoned");
+            // Occasionally inject a synthetic provider error, modelling the
+            // network/rate-limit failures the real LLM client and the solver
+            // subprocess can raise. Rare and suppressed on an exhausted stream
+            // so deep state-machine paths are still reached on most runs and
+            // exhausted streams still terminate cleanly.
+            if let Some(err) = maybe_fail(&mut guard) {
+                return Err(err);
+            }
             guard.draw(|u| self.fuzz.fuzz(&input, u))
         };
         let context_id = input.take_context_id();
         Ok(WithContext { value, context_id })
     }
+}
+
+/// Draw a byte and, ~0.4% of the time (only on a non-exhausted stream, since
+/// `int_in_range` returns `Ok(start)` = 0 when empty), return a synthetic
+/// provider error. This exercises the state machine's provider-error paths
+/// (which either propagate to run termination or demote a piece to
+/// "unverified: Processing error").
+fn maybe_fail(guard: &mut FuzzData) -> Option<anyhow::Error> {
+    let b: u8 = guard.draw(|u| u.int_in_range(0u8..=255).unwrap_or(0));
+    (b == 255).then(|| anyhow::anyhow!("synthetic provider failure (fuzz-injected)"))
 }
 
 // ---------------------------------------------------------------------------
@@ -104,7 +122,7 @@ impl Fuzz<LlmRequest, String> for FuzzLlm {
     fn fuzz(&self, input: &LlmRequest, u: &mut Unstructured) -> String {
         let result = match input.role {
             LlmRole::Splitter => fuzz_splitter(u),
-            LlmRole::Formalizer => fuzz_smt_blocks(u, 1, 2),
+            LlmRole::Formalizer => fuzz_formalizer(u),
             LlmRole::Fixer => fuzz_smt_blocks(u, 1, 1),
             LlmRole::Judge => fuzz_judge(u),
             LlmRole::SplittingJudge | LlmRole::Analyzer => fuzz_text(u),
@@ -140,6 +158,18 @@ fn fuzz_splitter(u: &mut Unstructured) -> String {
         ));
     }
     out
+}
+
+/// Formalizer: usually fenced ```smt2 blocks, but ~10% of the time (only on a
+/// non-exhausted stream) emit plain prose with no parseable formula. That
+/// exercises process_piece's "no formulas extracted" branch, which appends an
+/// elaboration and retries up to MAX_JUDGE_ATTEMPTS. Range-start (0, the
+/// exhausted value) maps to a normal formula so exhausted streams still close.
+fn fuzz_formalizer(u: &mut Unstructured) -> String {
+    if u.int_in_range(0u8..=9).unwrap_or(0) == 9 {
+        return "I cannot produce a formula for this code piece.".to_string();
+    }
+    fuzz_smt_blocks(u, 1, 2)
 }
 
 /// Formalizer/Fixer: `count` fenced ```smt2 blocks so `extract_formulas_from_response` picks them up.
@@ -307,8 +337,14 @@ impl Fuzz<FileSystemRequest, FileSystemResponse> for FuzzFileSystem {
 pub struct FuzzPython;
 
 impl Fuzz<PythonRequest, PythonResponse> for FuzzPython {
-    fn fuzz(&self, input: &PythonRequest, _u: &mut Unstructured) -> PythonResponse {
-        let smtlib = if input.script.trim().is_empty() {
+    fn fuzz(&self, input: &PythonRequest, u: &mut Unstructured) -> PythonResponse {
+        // ~10% of the time (non-exhausted only) return empty smtlib so
+        // translate_formula bails and check_formula marks the formula Unknown.
+        // Exhausted (0) -> normal echo, preserving clean termination.
+        let empty = u.int_in_range(0u8..=9).unwrap_or(0) == 9;
+        let smtlib = if empty {
+            String::new()
+        } else if input.script.trim().is_empty() {
             "(check-sat)".to_string()
         } else {
             input.script.clone()
