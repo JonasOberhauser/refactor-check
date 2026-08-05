@@ -35,14 +35,16 @@ const SMT_OUT: &str = "```smt2\n(set-logic ALL)\n(declare-const x Int)\n(assert 
 
 // ── LLM: role-fixed responses (judge always REASONABLE) ────────────────────
 
-struct MockLlm;
+struct MockLlm {
+    formalizer_out: String,
+}
 
 #[async_trait]
 impl IOProvider<LlmRequest, WithContext<String>> for MockLlm {
     async fn invoke(&self, input: LlmRequest) -> Result<WithContext<String>> {
         let resp = match input.role {
             LlmRole::Splitter => SPLITTER_OUT.to_string(),
-            LlmRole::Formalizer | LlmRole::Fixer => SMT_OUT.to_string(),
+            LlmRole::Formalizer | LlmRole::Fixer => self.formalizer_out.clone(),
             LlmRole::Judge => "REASONABLE".to_string(),
             LlmRole::SplittingJudge | LlmRole::Analyzer => String::new(),
         };
@@ -218,7 +220,7 @@ async fn bug_report_survives_restart_cycle() {
     std::fs::create_dir_all(project.path().join(".git")).expect("create .git marker");
 
     let mocks = Mocks {
-        llm: MockLlm,
+        llm: MockLlm { formalizer_out: SMT_OUT.to_string() },
         solver: MockSolver {
             outcomes: Mutex::new(VecDeque::from([
                 SolverOutcome::Unsat, // preflight (outcome ignored)
@@ -276,7 +278,7 @@ async fn totals_reported_when_terminating_via_problem_analyzer() {
     std::fs::create_dir_all(project.path().join(".git")).expect("create .git marker");
 
     let mocks = Mocks {
-        llm: MockLlm,
+        llm: MockLlm { formalizer_out: SMT_OUT.to_string() },
         solver: MockSolver {
             outcomes: Mutex::new(VecDeque::from([
                 SolverOutcome::Unsat, // preflight (outcome ignored)
@@ -315,4 +317,49 @@ async fn totals_reported_when_terminating_via_problem_analyzer() {
         "total_functions must reflect the functions verified (2), not 0"
     );
     assert_eq!(result.bug_reports.len(), 2, "both pieces should be bug reports");
+}
+
+#[tokio::test]
+async fn no_formula_on_last_judge_attempt_does_not_panic() {
+    // When the formalizer yields 0 parseable formulas, process_piece's judge
+    // loop exhausts all attempts via the "no formulas extracted" branch,
+    // leaving the piece in GetContext. The post-loop transition must not
+    // assume the piece is in Judge (it used to -> phase-tracker panic).
+    let project = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(project.path().join(".git")).expect("create .git marker");
+
+    let mocks = Mocks {
+        llm: MockLlm { formalizer_out: "I cannot produce a formula.".to_string() },
+        solver: MockSolver {
+            outcomes: Mutex::new(VecDeque::from([
+                SolverOutcome::Unsat, // preflight only (0 formulas -> no solver checks)
+            ])),
+        },
+        ra: MockRa,
+        git: MockGit,
+        fs: MockFs,
+        python: MockPython,
+        agent: MockAgent {
+            responses: Mutex::new(VecDeque::from([
+                (true, "OK".to_string()),                                  // preflight
+                (true, "Bug: no formula could be produced.".to_string()),  // ProblemAnalyzer
+            ])),
+        },
+    };
+
+    let pm = DefaultDeductivePieceManager::default();
+    // Before the fix this panics inside process_piece; after, the piece
+    // surfaces as unverified/bug.
+    let result = machine::run(
+        project.path().to_str().expect("utf8 temp path"),
+        &mocks.providers(),
+        &pm,
+    )
+    .await
+    .expect("machine must not panic; piece should surface as bug/unverified");
+
+    assert!(
+        !result.bug_reports.is_empty() || !result.unverified_pieces.is_empty(),
+        "the no-formula piece should surface as a bug or unverified, not crash"
+    );
 }
