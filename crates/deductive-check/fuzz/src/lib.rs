@@ -334,10 +334,14 @@ impl Fuzz<AgentRequest, AgentResponse> for FuzzAgent {
         // report. So an exhausted stream never retries and ProblemAnalyzer
         // drains. Non-exhausted: ~10% RETRY keeps expected cycles geometric.
         let retry = u.int_in_range(0u8..=9).unwrap_or(0) == 9;
+        // Per the ProblemAnalyzer contract, a non-RETRY response IS a bug
+        // report. The mock must therefore emit a bug description (not a
+        // non-committal "no bug" string, which the state machine would still
+        // classify as a bug, producing misleading traces).
         let stdout = if retry {
             "RETRY".to_string()
         } else {
-            "No bug found; verification inconclusive.".to_string()
+            "Bug: SAT counterexample indicates a possible precondition violation or overly strong assertion.".to_string()
         };
         let resp = AgentResponse { stdout, success: true };
         info!(retry, recv = %resp.stdout, "fuzz agent");
