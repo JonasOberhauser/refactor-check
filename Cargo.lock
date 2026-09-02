@@ -2939,6 +2939,7 @@ dependencies = [
  "servyi-ioprovider",
  "servyi-servatui",
  "servyi-states",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

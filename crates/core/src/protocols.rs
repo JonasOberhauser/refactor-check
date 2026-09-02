@@ -1,8 +1,9 @@
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use servyi_servatui::{Plugin, Protocol, ShellAction};
+use servyi_servatui::{BufferConsole, NoInput, Plugin, Protocol, ShellAction, SocketConnection, TypedConnection};
 use crate::message_log::{MessageLog, LogEntry, ancestors, is_valid_ctx_id};
 
 /// Shared server state passed to all server_ctx steps.
@@ -71,6 +72,80 @@ struct StatusResponse {
 
 // ── Protocol builders ──
 
+/// Cap on tab-completion suggestions so Tab cycling stays usable even for
+/// large message logs.
+const MAX_SUGGESTIONS: usize = 50;
+
+/// Compare dotted piece ids numerically ("1.2" < "1.10" < "2").
+fn cmp_dotted(a: &str, b: &str) -> std::cmp::Ordering {
+    let sa: Vec<u64> = a.split('.').filter_map(|s| s.parse().ok()).collect();
+    let sb: Vec<u64> = b.split('.').filter_map(|s| s.parse().ok()).collect();
+    sa.cmp(&sb)
+}
+
+fn sort_piece_ids(ids: &mut [String]) {
+    ids.sort_by(|a, b| cmp_dotted(a, b));
+}
+
+/// Ask the server for all piece ids over the socket. Returns an empty list
+/// whenever the server is unreachable or the conversation fails — completion
+/// is best-effort and must never break the input line.
+fn query_piece_ids(socket: &Path) -> Vec<String> {
+    let Ok(mut conn) = SocketConnection::connect(socket) else {
+        return Vec::new();
+    };
+    if conn.send_typed(&"pieces".to_string()).is_err() {
+        return Vec::new();
+    }
+    let mut console = BufferConsole::new();
+    let mut input = NoInput;
+    match pieces_protocol().run_client("", &mut conn, &mut console, &mut input) {
+        Ok(_) => console.lines,
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Full-line `show <id>` suggestions for the confirmed input, filtered by
+/// the typed prefix and capped at [`MAX_SUGGESTIONS`].
+fn piece_id_suggestions(input: &str, ids: &[String]) -> Vec<String> {
+    let Some(rest) = input.strip_prefix("show") else {
+        return Vec::new();
+    };
+    let arg = rest.trim_start();
+    let mut matching: Vec<String> = ids.iter().filter(|id| id.starts_with(arg)).cloned().collect();
+    sort_piece_ids(&mut matching);
+    matching
+        .into_iter()
+        .take(MAX_SUGGESTIONS)
+        .map(|id| format!("show {id}"))
+        .collect()
+}
+
+fn show_completions(socket: &Path, input: &str) -> Vec<String> {
+    piece_id_suggestions(input, &query_piece_ids(socket))
+}
+
+/// `pieces` — list all piece ids in the message log, numerically sorted.
+/// Used by `show`'s tab completion (which polls the server) and available
+/// as a plain command.
+pub fn pieces_protocol() -> Protocol {
+    Plugin::new("pieces", "List all piece ids")
+        .parse(|_args: &str| Ok(()))
+        .client(|req: (), _out, _input| Ok(req))
+        .server_ctx(|_req: (), ctx: &ServerState| {
+            let mut ids = ctx.message_log.keys();
+            sort_piece_ids(&mut ids);
+            Ok(ids)
+        })
+        .client(|ids: Vec<String>, out, _input| {
+            for id in &ids {
+                out.print_line(id);
+            }
+            Ok(())
+        })
+        .finalize(|| Ok(ShellAction::Continue))
+}
+
 pub fn continue_protocol() -> Protocol {
     Plugin::new("continue", "Resume blocked tasks after error")
         .parse(|_args: &str| Ok(ContinueRequest {}))
@@ -94,7 +169,8 @@ pub fn continue_protocol() -> Protocol {
         .finalize(|| Ok(ShellAction::Continue))
 }
 
-pub fn show_protocol() -> Protocol {
+pub fn show_protocol(socket: impl AsRef<Path>) -> Protocol {
+    let socket: PathBuf = socket.as_ref().to_path_buf();
     Plugin::new("show", "Show message history for a piece id (e.g. 'show 1.2.3'), or list all with no args")
         .parse(|args: &str| Ok(ShowRequest { piece_id: args.trim().to_string() }))
         .client(|req: ShowRequest, _out, _input| Ok(req))
@@ -113,6 +189,9 @@ pub fn show_protocol() -> Protocol {
             Ok(())
         })
         .finalize(|| Ok(ShellAction::Continue))
+        // Tab completion polls the server's message log over the socket
+        // (see `query_piece_ids`); unreachable server => no suggestions.
+        .complete(move |input: &str| show_completions(&socket, input))
 }
 
 pub fn status_protocol() -> Protocol {
@@ -162,12 +241,13 @@ pub fn exit_protocol() -> Protocol {
         .finalize(|| Ok(ShellAction::Exit))
 }
 
-pub fn all_protocols() -> Vec<Protocol> {
+pub fn all_protocols(socket: impl AsRef<Path>) -> Vec<Protocol> {
     vec![
         continue_protocol(),
-        show_protocol(),
+        show_protocol(socket),
         status_protocol(),
         exit_protocol(),
+        pieces_protocol(),
     ]
 }
 
@@ -179,11 +259,7 @@ fn show_tree(log: &MessageLog) -> String {
         return "No pieces recorded yet".to_string();
     }
     let mut sorted = keys;
-    sorted.sort_by(|a, b| {
-        let sa: Vec<u64> = a.split('.').filter_map(|s| s.parse().ok()).collect();
-        let sb: Vec<u64> = b.split('.').filter_map(|s| s.parse().ok()).collect();
-        sa.cmp(&sb)
-    });
+    sort_piece_ids(&mut sorted);
     let max_id_len = sorted
         .iter()
         .map(|k| k.len() + k.matches('.').count() * 2)
@@ -258,5 +334,73 @@ fn show_piece(log: &MessageLog, ctx_id: &str) -> String {
         format!("No messages found for {ctx_id}")
     } else {
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suggestions_filter_by_prefix_and_sort_numerically() {
+        let ids: Vec<String> = ["2", "1.2", "1", "10", "1.10"]
+            .iter().map(|s| s.to_string()).collect();
+        // Dotted-numeric order: 1 < 1.2 < 1.10 < 2 < 10
+        assert_eq!(
+            piece_id_suggestions("show ", &ids),
+            ["show 1", "show 1.2", "show 1.10", "show 2", "show 10"]
+        );
+        assert_eq!(piece_id_suggestions("show 1", &ids), ["show 1", "show 1.2", "show 1.10", "show 10"]);
+        assert_eq!(piece_id_suggestions("show 1.", &ids), ["show 1.2", "show 1.10"]);
+        assert_eq!(piece_id_suggestions("show 2", &ids), ["show 2"]);
+        assert!(piece_id_suggestions("show 3", &ids).is_empty());
+        // Only our own command ever reaches this completer.
+        assert!(piece_id_suggestions("status ", &ids).is_empty());
+    }
+
+    #[test]
+    fn suggestions_are_capped() {
+        let ids: Vec<String> = (0..(MAX_SUGGESTIONS as u64 + 10)).map(|i| i.to_string()).collect();
+        assert_eq!(piece_id_suggestions("show ", &ids).len(), MAX_SUGGESTIONS);
+    }
+
+    #[test]
+    fn pieces_completion_queries_live_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("comp.sock");
+
+        let log = Arc::new(MessageLog::new());
+        for (id, seq) in [("2", 3), ("1.2", 2), ("1", 1)] {
+            log.push(
+                id.to_string(),
+                LogEntry {
+                    seq,
+                    level: tracing::Level::INFO,
+                    target: "test".to_string(),
+                    message: "m".to_string(),
+                    fields: vec![],
+                },
+            );
+        }
+        let state = Arc::new(ServerState::new(log));
+        let handle = servyi_servatui::ServerHandle {
+            socket: socket.clone(),
+            protocols: all_protocols(&socket),
+        };
+        std::thread::spawn(move || handle.run(state).ok());
+
+        for _ in 0..100 {
+            if SocketConnection::server_exists(&socket) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(query_piece_ids(&socket), ["1", "1.2", "2"]);
+        assert_eq!(show_completions(&socket, "show 1."), ["show 1.2"]);
+        assert_eq!(show_completions(&socket, "show 1"), ["show 1", "show 1.2"]);
+        assert!(show_completions(&socket, "show 9").is_empty());
+
+        let _ = std::fs::remove_file(&socket);
     }
 }

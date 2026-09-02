@@ -18,3 +18,5 @@ tracing-subscriber = "0.3"
 servyi-ioprovider = { git = "https://github.com/servyi/ioprovider.git", branch = "main" }
 servyi-states = { git = "https://github.com/servyi/states.git", branch = "main" }
 servyi-servatui = { git = "https://github.com/servyi/servatui.git", branch = "main", default-features = false }
+[dev-dependencies]
+tempfile = "3"

@@ -16,7 +16,7 @@ fn main() {
 
     let app = App::builder(&cli.socket_path)
         .version("0.1.0")
-        .protocol_all(all_protocols())
+        .protocol_all(all_protocols(&cli.socket_path))
         .build();
 
     if !app.server_running() {

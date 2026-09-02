@@ -397,7 +397,7 @@ fn main() -> Result<()> {
 
     let app = App::builder(&socket_path)
         .version("0.1.0")
-        .protocol_all(all_protocols())
+        .protocol_all(all_protocols(&socket_path))
         .build();
 
     // Run server (blocks until shutdown)
