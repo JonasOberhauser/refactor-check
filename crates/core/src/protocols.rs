@@ -125,6 +125,58 @@ pub fn query_status(socket: &Path) -> Option<StatusSnapshot> {
     }
 }
 
+/// Whether the server on this socket is one of OURS: handshake by running
+/// the `pieces` protocol — a foreign servatui server answers
+/// `Unknown command: pieces` as an error, ours succeeds (even with zero
+/// pieces). A short read timeout keeps foreign daemons that never answer
+/// from blocking the probe.
+pub fn server_matches(socket: &Path) -> bool {
+    let Ok(mut conn) = SocketConnection::connect(socket) else {
+        return false;
+    };
+    // The probe connection is dropped afterwards, so a lingering timeout
+    // setting cannot affect later connections.
+    let _ = conn
+        .stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(1000)));
+    if conn.send_typed(&"pieces".to_string()).is_err() {
+        return false;
+    }
+    pieces_protocol()
+        .run_client("", &mut conn, &mut BufferConsole::new(), &mut NoInput)
+        .is_ok()
+}
+
+/// Resolve what the user passed to the shell: a socket file is used
+/// directly (if it handshakes); a FOLDER is scanned for live unix sockets
+/// and the first one whose server handshakes wins — newest first, so with
+/// several running servers the most recent one is preferred.
+pub fn resolve_active_server(path: &Path) -> Option<PathBuf> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_dir() {
+        return if server_matches(path) { Some(path.to_path_buf()) } else { None };
+    }
+
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(path)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let p = entry.path();
+            let m = std::fs::metadata(&p).ok()?;
+            use std::os::unix::fs::FileTypeExt as _;
+            if !m.file_type().is_socket() {
+                return None;
+            }
+            Some((m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), p))
+        })
+        .collect();
+    candidates.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime)); // newest first
+    candidates
+        .into_iter()
+        .map(|(_, p)| p)
+        .find(|p| server_matches(p))
+}
+
 /// Ask the server for all piece ids over the socket. Returns an empty list
 /// whenever the server is unreachable or the conversation fails — completion
 /// is best-effort and must never break the input line.
