@@ -518,3 +518,93 @@ mod tests {
         let _ = std::fs::remove_file(&socket);
     }
 }
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+
+    fn wait_online(socket: &Path) {
+        for _ in 0..200 {
+            if SocketConnection::server_exists(socket) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("server never came online: {}", socket.display());
+    }
+
+    fn spawn_server(socket: &Path, protocols: Vec<Protocol>) {
+        let state = Arc::new(ServerState::new(Arc::new(MessageLog::new())));
+        let handle = servyi_servatui::ServerHandle {
+            socket: socket.to_path_buf(),
+            protocols,
+        };
+        std::thread::spawn(move || handle.run(state).ok());
+        wait_online(socket);
+    }
+
+    fn foreign_protocol() -> Protocol {
+        // A perfectly valid servatui server — just not OURS (no `pieces`).
+        Plugin::new("echo", "foreign server")
+            .parse(|_args: &str| Ok(()))
+            .client(|req: (), _out, _input| Ok(req))
+            .server(|_: ()| Ok(()))
+            .client(|_: (), _out, _input| Ok(()))
+            .finalize(|| Ok(ShellAction::Continue))
+    }
+
+    #[test]
+    fn handshake_distinguishes_our_servers_from_foreign_ones() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let ours = dir.path().join("ours.sock");
+        spawn_server(&ours, all_protocols(&ours));
+        assert!(server_matches(&ours), "our server must handshake");
+
+        let foreign = dir.path().join("foreign.sock");
+        spawn_server(&foreign, vec![foreign_protocol()]);
+        assert!(!server_matches(&foreign), "foreign server must not match");
+
+        let _ = std::fs::remove_file(&ours);
+        let _ = std::fs::remove_file(&foreign);
+    }
+
+    #[test]
+    fn resolve_scans_folder_and_skips_newer_foreign_socket() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Ours first (older mtime), the foreign one second (newer, tried
+        // first by the resolver) — proving the handshake decides, not the
+        // ordering.
+        let ours = dir.path().join("deductive-check-1.sock");
+        spawn_server(&ours, all_protocols(&ours));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let foreign = dir.path().join("something-else.sock");
+        spawn_server(&foreign, vec![foreign_protocol()]);
+
+        let resolved = resolve_active_server(dir.path());
+        assert_eq!(resolved.as_deref(), Some(ours.as_path()));
+
+        // A folder with only foreign sockets, an empty folder, and a
+        // nonexistent path all resolve to nothing.
+        let other = tempfile::tempdir().unwrap();
+        let lonely = other.path().join("lonely.sock");
+        spawn_server(&lonely, vec![foreign_protocol()]);
+        assert_eq!(resolve_active_server(other.path()), None);
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_active_server(empty.path()), None);
+        assert_eq!(resolve_active_server(Path::new("/nonexistent-dir-xyz")), None);
+
+        let _ = std::fs::remove_file(&ours);
+        let _ = std::fs::remove_file(&foreign);
+    }
+
+    #[test]
+    fn resolve_accepts_a_direct_socket_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = dir.path().join("direct.sock");
+        spawn_server(&ours, all_protocols(&ours));
+        assert_eq!(resolve_active_server(&ours).as_deref(), Some(ours.as_path()));
+        let _ = std::fs::remove_file(&ours);
+    }
+}
