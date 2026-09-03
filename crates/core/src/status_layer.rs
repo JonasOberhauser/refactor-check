@@ -11,7 +11,7 @@ use std::time::Duration;
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::widgets::{Block, Borders, Paragraph};
-use servatui_display::{DisplayLayer, EventResult, LayerCtx};
+use servatui_display::{DisplayLayer, EventResult, LayerCtx, StackIntent};
 use servyi_servatui::WidgetEntry;
 
 use crate::protocols::{query_status, StatusSnapshot};
@@ -102,8 +102,10 @@ impl DisplayLayer for StatusLayer {
         '!'
     }
 
-    fn on_overlay(&mut self, ctx: &mut LayerCtx, widgets: &mut Vec<WidgetEntry>) {
-        let Some(lines) = self.current_banner() else { return };
+    fn on_overlay(&mut self, ctx: &mut LayerCtx, widgets: &mut Vec<WidgetEntry>) -> StackIntent {
+        let Some(lines) = self.current_banner() else {
+            return StackIntent::Keep;
+        };
         let area = banner_area(ctx.terminal_area, lines.len());
         widgets.push(WidgetEntry {
             name: "shell.status.banner",
@@ -112,6 +114,7 @@ impl DisplayLayer for StatusLayer {
             ),
             area,
         });
+        StackIntent::Keep
     }
 
     fn on_event(&mut self, ev: &Event, _ctx: &LayerCtx) -> EventResult {
