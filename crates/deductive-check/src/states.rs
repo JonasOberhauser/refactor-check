@@ -175,10 +175,13 @@ impl AlgorithmState for Initializer {
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
         let branch_name = format!("verification/{timestamp}");
 
-        // Ensure the project is a git repo
-        let git_dir = self.project_path.join(".git");
-        if !git_dir.exists() {
-            info!(project = %self.project_path.display(), "no .git found, initializing git repo");
+        // Ensure the project is inside a git work tree. Ask git itself — a
+        // subcrate of a bigger repo has no .git of its own, and git-init'ing
+        // a nested repo there would be wrong; we branch in the enclosing
+        // repo instead.
+        let repo_root = providers.git.invoke(GitRequest::RepoRoot).await?;
+        if !repo_root.success {
+            info!(project = %self.project_path.display(), "not inside a git work tree, initializing git repo");
             let resp = providers
                 .git
                 .invoke(GitRequest::Init { path: self.project_path.clone() })
@@ -202,6 +205,8 @@ impl AlgorithmState for Initializer {
                 anyhow::bail!("Failed to create initial commit: {}", resp.output);
             }
             info!("git repo initialized with initial commit");
+        } else {
+            info!(root = %repo_root.output.trim(), "using existing git work tree");
         }
 
         info!("IO: git CreateBranch");

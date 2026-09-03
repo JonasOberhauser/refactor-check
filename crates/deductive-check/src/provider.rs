@@ -80,6 +80,9 @@ pub type DynRustAnalyzerProvider = dyn IOProvider<RustAnalyzerRequest, RustAnaly
 
 #[derive(Debug, Clone)]
 pub enum GitRequest {
+    /// Whether the project directory lies inside a git work tree (and if
+    /// so, which repo's toplevel). `git rev-parse --show-toplevel`.
+    RepoRoot,
     CreateBranch { name: String },
     Commit { message: String },
     AddFiles { paths: Vec<PathBuf> },
@@ -1049,8 +1052,45 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
                 Ok(git_response(output))
             }
             GitRequest::AddAll { path: _ } => {
+                // Expand the patterns (*.rs/*.toml/*.lock) ourselves: git
+                // has no flag for "pattern may match nothing" and dies on
+                // unmatched pathspecs. Concrete paths, chunked for argv.
+                let mut matches: Vec<String> = Vec::new();
+                for entry in walkdir::WalkDir::new(dir)
+                    .into_iter()
+                    .filter_entry(|e| {
+                        let name = e.file_name().to_string_lossy();
+                        name != ".git" && name != "target"
+                    })
+                    .flatten()
+                {
+                    let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) else {
+                        continue;
+                    };
+                    if matches!(ext, "rs" | "toml" | "lock") {
+                        if let Ok(rel) = entry.path().strip_prefix(dir) {
+                            matches.push(rel.to_string_lossy().to_string());
+                        }
+                    }
+                }
+                for chunk in matches.chunks(200) {
+                    let mut args = vec!["add".to_string(), "--".to_string()];
+                    args.extend(chunk.iter().cloned());
+                    let output = tokio::process::Command::new("git")
+                        .args(&args)
+                        .current_dir(dir)
+                        .output()
+                        .await?;
+                    let resp = git_response(output);
+                    if !resp.success {
+                        return Ok(resp);
+                    }
+                }
+                Ok(GitResponse { success: true, output: String::new() })
+            }
+            GitRequest::RepoRoot => {
                 let output = tokio::process::Command::new("git")
-                    .args(["add", "*.rs", "*.toml", "*.lock"])
+                    .args(["rev-parse", "--show-toplevel"])
                     .current_dir(dir)
                     .output()
                     .await?;

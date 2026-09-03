@@ -1,7 +1,6 @@
 //! Real-git tests for the git provider's repo detection and the
 //! init/add flow the Initializer relies on.
 
-use async_trait::async_trait;
 use deductive_check::provider::{CliGitProvider, GitRequest, GitResponse};
 use servyi_ioprovider::IOProvider;
 
@@ -25,8 +24,8 @@ async fn add_all_tolerates_unmatched_globs() {
     // pathspec ('fatal: pathspec '*.lock' did not match any files').
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init"]);
-    std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
     std::fs::create_dir_all(dir.path().join("src/nested")).unwrap();
+    std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
     std::fs::write(dir.path().join("src/nested/lib.rs"), "pub fn f() {}").unwrap();
 
     let provider = CliGitProvider::new(dir.path().to_path_buf());
