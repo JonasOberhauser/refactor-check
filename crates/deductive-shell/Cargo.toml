@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 refactor-check-core = { path = "../core" }
 servyi-servatui = { git = "https://github.com/servyi/servatui.git", branch = "main" }
+servatui-display = { git = "https://github.com/servyi/servatui.git", branch = "main" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

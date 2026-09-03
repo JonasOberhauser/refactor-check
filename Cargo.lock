@@ -649,6 +649,7 @@ dependencies = [
  "refactor-check-core",
  "serde",
  "serde_json",
+ "servatui-display",
  "servyi-servatui",
 ]
 
@@ -2932,10 +2933,13 @@ dependencies = [
  "async-openai",
  "async-trait",
  "clap",
+ "crossterm",
  "dashmap",
  "futures",
+ "ratatui",
  "serde",
  "serde_json",
+ "servatui-display",
  "servyi-ioprovider",
  "servyi-servatui",
  "servyi-states",
@@ -3378,6 +3382,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "servatui-display"
+version = "0.1.0"
+source = "git+https://github.com/servyi/servatui.git?branch=main#2f977df1355aded015831b83875642e2fe68a66b"
+dependencies = [
+ "crossterm",
+ "ratatui",
+ "servyi-servatui",
+]
+
+[[package]]
 name = "servyi-ioprovider"
 version = "0.1.0"
 source = "git+https://github.com/servyi/ioprovider.git?branch=main#c5ea06a74a20d12f9a7282d2ae34c821f06d278c"
@@ -3390,8 +3404,8 @@ dependencies = [
 
 [[package]]
 name = "servyi-servatui"
-version = "0.7.0"
-source = "git+https://github.com/servyi/servatui.git?branch=main#69e79586a0121d202304c332f6084fc2ad2e8a22"
+version = "0.7.1"
+source = "git+https://github.com/servyi/servatui.git?branch=main#2f977df1355aded015831b83875642e2fe68a66b"
 dependencies = [
  "base64",
  "crossterm",

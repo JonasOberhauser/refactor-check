@@ -87,6 +87,44 @@ fn sort_piece_ids(ids: &mut [String]) {
     ids.sort_by(|a, b| cmp_dotted(a, b));
 }
 
+/// A point-in-time view of the server's work status, as surfaced by the
+/// `status` protocol.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusSnapshot {
+    pub running: bool,
+    pub result: Option<String>,
+    pub pending_errors: Vec<String>,
+}
+
+/// Ask the server for its work status over the socket. `None` when the
+/// server is unreachable or the conversation fails — status polling is
+/// best-effort.
+pub fn query_status(socket: &Path) -> Option<StatusSnapshot> {
+    let Ok(mut conn) = SocketConnection::connect(socket) else {
+        return None;
+    };
+    if conn.send_typed(&"watch".to_string()).is_err() {
+        return None;
+    }
+    let mut console = BufferConsole::new();
+    let mut input = NoInput;
+    match watch_protocol().run_client("", &mut conn, &mut console, &mut input) {
+        Ok(raw) => {
+            // The last server response is the serialized StatusResponse.
+            let resp: serde_json::Result<StatusResponse> = serde_json::from_slice(&raw);
+            match resp {
+                Ok(r) => Some(StatusSnapshot {
+                    running: r.running,
+                    result: r.result,
+                    pending_errors: r.pending_errors,
+                }),
+                Err(_) => None,
+            }
+        }
+        Err(_) => None,
+    }
+}
+
 /// Ask the server for all piece ids over the socket. Returns an empty list
 /// whenever the server is unreachable or the conversation fails — completion
 /// is best-effort and must never break the input line.
@@ -194,6 +232,38 @@ pub fn show_protocol(socket: impl AsRef<Path>) -> Protocol {
         .complete(move |input: &str| show_completions(&socket, input))
 }
 
+/// `watch` — read-only status for pollers: identical to `status` except it
+/// never drains the pending errors, so background watchers cannot steal
+/// them from the interactive `status`/`continue` commands.
+pub fn watch_protocol() -> Protocol {
+    Plugin::new("watch", "Read-only status (does not drain pending errors)")
+        .parse(|_args: &str| Ok(StatusRequest {}))
+        .client(|req: StatusRequest, _out, _input| Ok(req))
+        .server_ctx(|_req: StatusRequest, ctx: &ServerState| {
+            let pending = ctx.pending_errors.lock().unwrap().clone();
+            Ok(StatusResponse {
+                running: !ctx.work_finished.load(Ordering::Acquire),
+                result: ctx.work_result.lock().unwrap().clone(),
+                pending_errors: pending,
+            })
+        })
+        .client(|resp: StatusResponse, out, _input| {
+            if resp.running {
+                out.print_line("[work running]");
+            } else {
+                match &resp.result {
+                    Some(msg) => out.print_line(&format!("[work finished: {msg}]")),
+                    None => out.print_line("[work finished]"),
+                }
+            }
+            for err in &resp.pending_errors {
+                out.print_error(err);
+            }
+            Ok(())
+        })
+        .finalize(|| Ok(ShellAction::Continue))
+}
+
 pub fn status_protocol() -> Protocol {
     Plugin::new("status", "Show work status and pending errors")
         .parse(|_args: &str| Ok(StatusRequest {}))
@@ -246,6 +316,7 @@ pub fn all_protocols(socket: impl AsRef<Path>) -> Vec<Protocol> {
         continue_protocol(),
         show_protocol(socket),
         status_protocol(),
+        watch_protocol(),
         exit_protocol(),
         pieces_protocol(),
     ]
@@ -362,6 +433,49 @@ mod tests {
     fn suggestions_are_capped() {
         let ids: Vec<String> = (0..(MAX_SUGGESTIONS as u64 + 10)).map(|i| i.to_string()).collect();
         assert_eq!(piece_id_suggestions("show ", &ids).len(), MAX_SUGGESTIONS);
+    }
+
+    #[test]
+    fn watch_queries_status_without_draining_pending_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("watch.sock");
+
+        let state = Arc::new(ServerState::new(Arc::new(MessageLog::new())));
+        state.push_error("boom".to_string());
+        let handle = servyi_servatui::ServerHandle {
+            socket: socket.clone(),
+            protocols: all_protocols(&socket),
+        };
+        std::thread::spawn(move || handle.run(state).ok());
+
+        for _ in 0..100 {
+            if SocketConnection::server_exists(&socket) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // The read-only watch sees the pending error …
+        let snap = query_status(&socket).expect("watch must succeed");
+        assert!(snap.running);
+        assert_eq!(snap.pending_errors, ["boom"]);
+        // … repeatedly, without draining it (the interactive `status`
+        // command still sees it afterwards).
+        let snap = query_status(&socket).expect("watch must succeed again");
+        assert_eq!(snap.pending_errors, ["boom"]);
+
+        let mut console = BufferConsole::new();
+        let mut input = NoInput;
+        let mut conn = SocketConnection::connect(&socket).unwrap();
+        conn.send_typed(&"status".to_string()).unwrap();
+        status_protocol().run_client("", &mut conn, &mut console, &mut input).unwrap();
+        assert!(
+            console.lines.iter().any(|l| l.contains("boom")),
+            "interactive status must still see the error: {:?}",
+            console.lines
+        );
+
+        let _ = std::fs::remove_file(&socket);
     }
 
     #[test]
