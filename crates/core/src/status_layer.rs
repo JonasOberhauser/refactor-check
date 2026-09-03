@@ -102,6 +102,13 @@ impl DisplayLayer for StatusLayer {
         '!'
     }
 
+    /// No taskbar button (and nothing clickable) while there is no banner —
+    /// the reserved slot means the button returns at the same position as
+    /// soon as something needs attention.
+    fn hide_when_empty(&self) -> bool {
+        true
+    }
+
     fn on_overlay(&mut self, ctx: &mut LayerCtx, widgets: &mut Vec<WidgetEntry>) -> StackIntent {
         let Some(lines) = self.current_banner() else {
             return StackIntent::Keep;
@@ -147,7 +154,7 @@ mod tests {
     use super::*;
     use servatui_display::Display;
 
-    fn snap(running: bool, result: Option<&str>, errors: &[&str]) -> StatusSnapshot {
+    pub(super) fn snap(running: bool, result: Option<&str>, errors: &[&str]) -> StatusSnapshot {
         StatusSnapshot {
             running,
             result: result.map(String::from),
@@ -155,7 +162,7 @@ mod tests {
         }
     }
 
-    fn frame() -> Vec<WidgetEntry> {
+    pub(super) fn frame() -> Vec<WidgetEntry> {
         let w = |name: &'static str, area: Rect| WidgetEntry {
             name,
             widget: Box::new(Paragraph::new("x")),
@@ -238,5 +245,46 @@ mod tests {
         let mut f = frame();
         display.frame(&mut f);
         assert!(!f.iter().any(|w| w.name == banner_name()), "click must dismiss");
+    }
+}
+
+#[cfg(test)]
+mod taskbar_tests {
+    use super::tests::{frame, snap};
+    use super::*;
+    use servatui_display::Display;
+
+    fn taskbar_buttons(display: &mut Display) -> usize {
+        let mut f = frame();
+        display.frame(&mut f);
+        f.iter().filter(|w| w.name == "display.taskbar").count()
+    }
+
+    #[test]
+    fn status_button_appears_only_while_the_banner_is_shown() {
+        let slot: StatusSlot = Arc::new(Mutex::new(None));
+        let mut display = Display::with_palette(vec![ratatui::style::Color::Blue]);
+        display.add_layer(Box::new(StatusLayer::new(slot.clone())));
+
+        // Idle (running, no errors, no result): no banner, taskbar shows
+        // only the builtin button.
+        *slot.lock().unwrap() = Some(snap(true, None, &[]));
+        assert_eq!(taskbar_buttons(&mut display), 1);
+
+        // Pending errors: banner and the status button appear.
+        *slot.lock().unwrap() = Some(snap(true, None, &["boom"]));
+        assert_eq!(taskbar_buttons(&mut display), 2);
+
+        // Dismissed: banner gone, button gone again (slot stays reserved).
+        let esc = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(display.route_event(&esc));
+        assert_eq!(taskbar_buttons(&mut display), 1);
+
+        // New errors: the button is back at its reserved slot.
+        *slot.lock().unwrap() = Some(snap(true, None, &["boom", "bang"]));
+        assert_eq!(taskbar_buttons(&mut display), 2);
     }
 }
