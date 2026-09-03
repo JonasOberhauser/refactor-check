@@ -136,6 +136,9 @@ impl AlgorithmState for PreflightAgent {
             prompt: "Say OK".to_string(),
             working_directory: self.project_path.clone(),
             files_to_read: vec![],
+            // A broken agent is a configuration error: fail fast instead
+            // of waiting behind the error gate.
+            recoverable: false,
         }).await?;
         if !resp.success {
             anyhow::bail!("agent check failed: {}", resp.stdout);
@@ -1357,6 +1360,7 @@ If you respond RETRY, make sure to commit your changes first."#,
                     prompt,
                     working_directory: self.project_path.clone(),
                     files_to_read: vec![piece.file.clone()],
+                    recoverable: true,
                 })
                 .await?;
             info!("IO response: agent responded");

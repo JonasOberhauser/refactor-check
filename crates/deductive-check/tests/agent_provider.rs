@@ -4,7 +4,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{mpsc, Arc};
 
-use async_trait::async_trait;
 use deductive_check::provider::{AgentRequest, CliAgentProvider};
 use servyi_ioprovider::IOProvider;
 
@@ -19,24 +18,29 @@ fn agent_request(prompt: &str, dir: &std::path::Path, recoverable: bool) -> Agen
 
 #[tokio::test]
 async fn passes_the_api_key_to_the_agent_binary_via_env() {
-    // /bin/sh -c "<prompt> --format json ..." lets the prompt inspect the
-    // child process's environment.
+    // /bin/sh -c "<script> --format json --dir ..." — the script writes the
+    // child's env var to a file we then inspect (the provider extracts
+    // opencode-style JSON events from stdout, so plain echo is filtered).
     let dir = tempfile::tempdir().unwrap();
+    let keyfile = dir.path().join("key.txt");
     let provider = CliAgentProvider::new(
         "/bin/sh".to_string(),
         vec!["-c".to_string()],
     )
-    .with_api_key("OPENROUTER_API_KEY", "sk-test-42");
+    .with_api_key("OPENROUTER_API_KEY", "sk-test-42".to_string());
 
+    let script = format!("printenv OPENROUTER_API_KEY > {}", keyfile.display());
     let resp = provider
-        .invoke(agent_request("echo KEY=$OPENROUTER_API_KEY", dir.path(), true))
+        .invoke(agent_request(&script, dir.path(), true))
         .await
         .unwrap();
     assert!(resp.success, "shell ran: {}", resp.stdout);
-    assert!(
-        resp.stdout.contains("KEY=sk-test-42"),
-        "the key must reach the agent binary, got: {}",
-        resp.stdout
+
+    let seen = std::fs::read_to_string(&keyfile).unwrap_or_default();
+    assert_eq!(
+        seen.trim(),
+        "sk-test-42",
+        "the key must reach the agent binary's environment"
     );
 }
 

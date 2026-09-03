@@ -125,6 +125,19 @@ fn resolve_api_key(key: Option<&str>) -> Result<String> {
     }
 }
 
+/// The env var the agent CLI expects the API key in, derived from the
+/// LLM api base (default: OpenRouter).
+fn api_key_env_var(api_base: &str) -> &'static str {
+    let base = api_base.to_ascii_lowercase();
+    if base.contains("anthropic") {
+        "ANTHROPIC_API_KEY"
+    } else if base.contains("openai") {
+        "OPENAI_API_KEY"
+    } else {
+        "OPENROUTER_API_KEY"
+    }
+}
+
 fn resolve_binary(name: &str) -> String {
     if name.contains('/') {
         return name.to_string();
@@ -226,6 +239,7 @@ fn main() -> Result<()> {
     let config_live = Arc::new(LiveConfig::new(AppConfig::from(&cli)));
 
     let project = cli.project.clone();
+    let api_base_for_agent = cli.api_base.clone();
     let agent_binary = resolve_binary(&cli.agent_binary);
     let agent_subcommand = cli.agent_subcommand.clone();
     let agent_model = cli.agent_model.clone();
@@ -330,7 +344,9 @@ fn main() -> Result<()> {
                     agent_args.push("-m".to_string());
                     agent_args.push(agent_model);
                 }
+                let key_env = api_key_env_var(&api_base_for_agent);
                 let agent = deductive_check::provider::CliAgentProvider::new(agent_binary, agent_args)
+                    .with_api_key(key_env, api_key.clone())
                     .with_error_gate(gate.clone());
 
                 let providers = deductive_check::provider::Providers {
@@ -376,7 +392,14 @@ fn main() -> Result<()> {
                 Err(e) => {
                     let msg = format!("{e:#}");
                     *bg_state.work_result.lock().unwrap() = Some(msg.clone());
-                    bg_state.push_error(msg);
+                    bg_state.push_error(msg.clone());
+                    // Machine-level failures are unrecoverable: show the
+                    // issue and exit instead of idling in the server.
+                    println!("\n{}", "=".repeat(60));
+                    println!("deductive-check failed:");
+                    println!("{msg}");
+                    println!("{}", "=".repeat(60));
+                    std::process::exit(1);
                 }
             }
         })?;

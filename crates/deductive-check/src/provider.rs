@@ -134,6 +134,10 @@ pub struct AgentRequest {
     pub prompt: String,
     pub working_directory: PathBuf,
     pub files_to_read: Vec<PathBuf>,
+    /// Whether a failure should go through the error gate's wait-for-fix
+    /// loop. Preflight requests set `false`: a broken agent is an
+    /// unrecoverable configuration error and must bail out immediately.
+    pub recoverable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1277,15 +1281,27 @@ pub struct CliAgentProvider {
     binary: String,
     base_args: Vec<String>,
     error_gate: Option<Arc<refactor_check_core::error_gate::ErrorGate>>,
+    /// Environment variables (name -> value) injected into the agent
+    /// subprocess, e.g. the resolved API key the agent CLI must see.
+    env: Vec<(String, String)>,
 }
 
 impl CliAgentProvider {
     pub fn new(binary: String, args: Vec<String>) -> Self {
-        Self { binary, base_args: args, error_gate: None }
+        Self { binary, base_args: args, error_gate: None, env: Vec::new() }
     }
 
     pub fn with_error_gate(mut self, gate: Arc<refactor_check_core::error_gate::ErrorGate>) -> Self {
         self.error_gate = Some(gate);
+        self
+    }
+
+    /// Inject an environment variable into the agent subprocess. Used to
+    /// forward the resolved API key (e.g. OPENROUTER_API_KEY) so the agent
+    /// CLI authenticates with the same credentials as the LLM client.
+    #[must_use]
+    pub fn with_api_key(mut self, env_var: &str, key: String) -> Self {
+        self.env.push((env_var.to_string(), key));
         self
     }
 }
@@ -1338,21 +1354,29 @@ impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
             cmd.args(&args)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
+            for (name, value) in &self.env {
+                cmd.env(name, value);
+            }
 
             let output = match cmd.output().await {
                 Ok(output) => output,
                 Err(e) => {
-                    if let Some(gate) = &self.error_gate {
-                        gate.report_and_wait(&format!(
-                            "Failed to spawn agent binary '{}': {e}\n\
-                             Possible fixes:\n\
-                             - Install the binary and ensure it is in PATH\n\
-                             - Restart with --agent-binary /correct/path/to/binary",
-                            self.binary,
-                        )).await?;
-                        continue;
+                    if input.recoverable {
+                        if let Some(gate) = &self.error_gate {
+                            gate.report_and_wait(&format!(
+                                "Failed to spawn agent binary '{}': {e}\n\
+                                 Possible fixes:\n\
+                                 - Install the binary and ensure it is in PATH\n\
+                                 - Restart with --agent-binary /correct/path/to/binary",
+                                self.binary,
+                            )).await?;
+                            continue;
+                        }
                     }
-                    return Err(e.into());
+                    return Err(anyhow::anyhow!(
+                        "failed to spawn agent binary '{}': {e}",
+                        self.binary
+                    ));
                 }
             };
 
@@ -1361,15 +1385,23 @@ impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
             let extracted = extract_text_from_json_events(&stdout_raw);
 
             if extracted.is_empty() && !output.status.success() {
-                if let Some(gate) = &self.error_gate {
-                    gate.report_and_wait(&format!(
-                        "Agent binary '{}' failed (exit {:?}): {}",
-                        self.binary,
-                        output.status.code(),
-                        stderr_raw.trim(),
-                    )).await?;
-                    continue;
+                if input.recoverable {
+                    if let Some(gate) = &self.error_gate {
+                        gate.report_and_wait(&format!(
+                            "Agent binary '{}' failed (exit {:?}): {}",
+                            self.binary,
+                            output.status.code(),
+                            stderr_raw.trim(),
+                        )).await?;
+                        continue;
+                    }
                 }
+                anyhow::bail!(
+                    "agent binary '{}' failed (exit {:?}): {}",
+                    self.binary,
+                    output.status.code(),
+                    stderr_raw.trim(),
+                );
             }
 
             return Ok(AgentResponse {
