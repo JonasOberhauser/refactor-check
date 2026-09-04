@@ -660,3 +660,48 @@ mod resolve_tests {
         let _ = std::fs::remove_file(&ours);
     }
 }
+
+#[cfg(test)]
+mod parked_tests {
+    use super::*;
+
+    #[test]
+    fn watch_and_status_report_error_gate_parked_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("parked.sock");
+
+        let state = Arc::new(ServerState::new(Arc::new(MessageLog::new())));
+        state.push_error("boom".to_string());
+        state.error_gate_parked.lock().unwrap().push("z3 exploded".to_string());
+        let handle = servyi_servatui::ServerHandle {
+            socket: socket.clone(),
+            protocols: all_protocols(&socket),
+        };
+        let state_for_thread = state.clone();
+        std::thread::spawn(move || handle.run(state_for_thread).ok());
+        for _ in 0..200 {
+            if SocketConnection::server_exists(&socket) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let snap = query_status(&socket).expect("watch");
+        assert_eq!(snap.pending_errors, ["boom"], "pending errors unchanged");
+        assert_eq!(snap.parked, ["z3 exploded"], "parked state must be visible to the shell");
+
+        // The interactive status protocol reports it too.
+        let mut console = BufferConsole::new();
+        let mut input = NoInput;
+        let mut conn = SocketConnection::connect(&socket).unwrap();
+        conn.send_typed(&"status".to_string()).unwrap();
+        status_protocol().run_client("", &mut conn, &mut console, &mut input).unwrap();
+        assert!(
+            console.lines.iter().any(|l| l.contains("z3 exploded")),
+            "status must show the parked gate: {:?}",
+            console.lines
+        );
+
+        let _ = std::fs::remove_file(&socket);
+    }
+}
