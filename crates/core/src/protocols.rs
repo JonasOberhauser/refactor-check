@@ -14,6 +14,10 @@ pub struct ServerState {
     pub pending_errors: Mutex<Vec<String>>,
     pub work_finished: AtomicBool,
     pub work_result: Mutex<Option<String>>,
+    /// Errors whose threads are currently parked in the error gate,
+    /// waiting for 'continue' (retry) or 'exit' (abort). Shared with the
+    /// gate so `watch`/`status` can surface the parked state.
+    pub error_gate_parked: Arc<Mutex<Vec<String>>>,
 }
 
 impl ServerState {
@@ -25,6 +29,7 @@ impl ServerState {
             pending_errors: Mutex::new(Vec::new()),
             work_finished: AtomicBool::new(false),
             work_result: Mutex::new(None),
+            error_gate_parked: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -68,6 +73,8 @@ struct StatusResponse {
     running: bool,
     result: Option<String>,
     pending_errors: Vec<String>,
+    /// Errors whose threads are parked in the error gate right now.
+    parked: Vec<String>,
 }
 
 // ── Protocol builders ──
@@ -94,6 +101,8 @@ pub struct StatusSnapshot {
     pub running: bool,
     pub result: Option<String>,
     pub pending_errors: Vec<String>,
+    /// Errors whose threads are parked in the error gate right now.
+    pub parked: Vec<String>,
 }
 
 /// Ask the server for its work status over the socket. `None` when the
@@ -117,6 +126,7 @@ pub fn query_status(socket: &Path) -> Option<StatusSnapshot> {
                     running: r.running,
                     result: r.result,
                     pending_errors: r.pending_errors,
+                    parked: r.parked,
                 }),
                 Err(_) => None,
             }
@@ -293,10 +303,12 @@ pub fn watch_protocol() -> Protocol {
         .client(|req: StatusRequest, _out, _input| Ok(req))
         .server_ctx(|_req: StatusRequest, ctx: &ServerState| {
             let pending = ctx.pending_errors.lock().unwrap().clone();
+            let parked = ctx.error_gate_parked.lock().unwrap().clone();
             Ok(StatusResponse {
                 running: !ctx.work_finished.load(Ordering::Acquire),
                 result: ctx.work_result.lock().unwrap().clone(),
                 pending_errors: pending,
+                parked,
             })
         })
         .client(|resp: StatusResponse, out, _input| {
@@ -324,10 +336,12 @@ pub fn status_protocol() -> Protocol {
             let errors = ctx.drain_errors();
             let running = !ctx.work_finished.load(Ordering::Acquire);
             let result = ctx.work_result.lock().unwrap().clone();
+            let parked = ctx.error_gate_parked.lock().unwrap().clone();
             Ok(StatusResponse {
                 running,
                 result,
                 pending_errors: errors,
+                parked,
             })
         })
         .client(|resp: StatusResponse, out, _input| {
@@ -338,6 +352,9 @@ pub fn status_protocol() -> Protocol {
                     Some(msg) => out.print_line(&format!("[work finished: {msg}]")),
                     None => out.print_line("[work finished]"),
                 }
+            }
+            for err in &resp.parked {
+                out.print_error(&format!("parked in error gate: {err}"));
             }
             for err in &resp.pending_errors {
                 out.print_error(err);

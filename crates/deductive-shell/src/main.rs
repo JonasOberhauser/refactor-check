@@ -39,7 +39,7 @@ fn main() {
     spawn_status_poller(socket.clone(), slot.clone());
 
     let mut display = Display::new();
-    display.add_layer(Box::new(StatusLayer::new(slot)));
+    display.add_layer(Box::new(StatusLayer::new(socket.clone(), slot)));
 
     let protocols = all_protocols(&socket);
     if let Err(e) = display.run(&socket, &protocols) {

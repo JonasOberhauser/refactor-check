@@ -26,18 +26,32 @@ pub struct ErrorGate {
     epoch: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     tx: mpsc::Sender<String>,
+    /// Errors whose threads are currently parked in `report_and_wait`;
+    /// shared with the server state so `watch`/`status` can show them and
+    /// the shell can offer recovery buttons.
+    parked: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl ErrorGate {
-    pub fn new(epoch: Arc<AtomicU64>, shutdown: Arc<AtomicBool>, tx: mpsc::Sender<String>) -> Self {
-        Self { epoch, shutdown, tx }
+    pub fn new(
+        epoch: Arc<AtomicU64>,
+        shutdown: Arc<AtomicBool>,
+        tx: mpsc::Sender<String>,
+        parked: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Self {
+        Self { epoch, shutdown, tx, parked }
     }
 
     pub async fn report_and_wait(&self, error: &str) -> Result<(), ShutdownRequested> {
         let my_epoch = self.epoch.load(Ordering::Acquire);
         let _ = self.tx.send(error.to_string());
+        self.parked.lock().unwrap().push(error.to_string());
+        eprintln!("[error gate] verification parked: {error}");
+        eprintln!("[error gate] type 'continue' in the deductive-shell to retry, or 'exit' to abort");
         loop {
             if self.shutdown.load(Ordering::Acquire) {
+                self.unregister(error);
+                eprintln!("[error gate] aborting (shutdown requested)");
                 return Err(ShutdownRequested);
             }
             if self.epoch.load(Ordering::Acquire) != my_epoch {
@@ -45,7 +59,16 @@ impl ErrorGate {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+        self.unregister(error);
+        eprintln!("[error gate] resuming (continue received)");
         Ok(())
+    }
+
+    fn unregister(&self, error: &str) {
+        let mut parked = self.parked.lock().unwrap();
+        if let Some(pos) = parked.iter().position(|e| e == error) {
+            parked.remove(pos);
+        }
     }
 }
 

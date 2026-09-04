@@ -281,6 +281,7 @@ fn main() -> Result<()> {
                     bg_epoch.clone(),
                     bg_shutdown.clone(),
                     gate_tx,
+                    bg_state.error_gate_parked.clone(),
                 )
             );
             // Forward gate errors to server state for status/continue protocols

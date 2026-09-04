@@ -54,6 +54,7 @@ async fn unrecoverable_requests_fail_fast_without_the_error_gate() {
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicBool::new(false)),
         tx,
+        Arc::new(std::sync::Mutex::new(Vec::new())),
     ));
 
     // Binary exists but fails: must come back as an Err (preflight bails),
