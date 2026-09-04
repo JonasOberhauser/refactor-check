@@ -136,12 +136,13 @@ impl AlgorithmState for PreflightAgent {
             prompt: "Say OK".to_string(),
             working_directory: self.project_path.clone(),
             files_to_read: vec![],
-            // A broken agent is a configuration error: fail fast instead
-            // of waiting behind the error gate.
-            recoverable: false,
+            // Recoverable: a bad key or missing binary parks in the error
+            // gate, the user fixes it and hits RETRY (the agent re-reads
+            // the live key on every call).
+            recoverable: true,
         }).await?;
         if !resp.success {
-            anyhow::bail!("agent check failed: {}", resp.stdout);
+            anyhow::bail!("opencode agent check failed: {}", resp.stdout);
         }
         info!("preflight: opencode OK");
         Ok(Step::State(Box::new(PreflightProject { project_path: self.project_path })))

@@ -24,13 +24,31 @@ use crate::protocols::{continue_protocol, exit_protocol, query_status, StatusSna
 /// Shared slot the poller publishes into and the layer reads from.
 pub type StatusSlot = Arc<Mutex<Option<StatusSnapshot>>>;
 
-/// Poll the server's `watch` protocol every `interval` and publish the
-/// latest snapshot into `slot`. Best-effort: unreachable server leaves the
-/// last snapshot in place. The thread runs until the process exits.
-pub fn spawn_status_poller(socket: PathBuf, slot: StatusSlot) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(2));
-        if let Some(snap) = query_status(&socket) {
+/// Shared queue of error lines destined for the TUI log box (drained by
+/// the display every frame).
+pub type LogSink = Arc<Mutex<Vec<String>>>;
+
+/// Poll the server's `watch` protocol every 2s and publish the latest
+/// snapshot into `slot`. NEW pending errors (not seen on earlier polls)
+/// are immediately queued into `log_sink` so they land in the log box
+/// without waiting for the user to run anything. Best-effort: unreachable
+/// server leaves the last snapshot in place. Runs until process exit.
+pub fn spawn_status_poller(socket: PathBuf, slot: StatusSlot, log_sink: LogSink) {
+    std::thread::spawn(move || {
+        let mut seen_errors: Vec<String> = Vec::new();
+        loop {
+            std::thread::sleep(Duration::from_secs(2));
+            let Some(snap) = query_status(&socket) else {
+                continue;
+            };
+            if snap.pending_errors != seen_errors {
+                for err in &snap.pending_errors {
+                    if !seen_errors.iter().any(|e| e == err) {
+                        log_sink.lock().unwrap().push(format!("error: {err}"));
+                    }
+                }
+                seen_errors = snap.pending_errors.clone();
+            }
             *slot.lock().unwrap() = Some(snap);
         }
     });

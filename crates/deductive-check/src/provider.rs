@@ -1238,12 +1238,20 @@ impl Default for LocalFileSystemProvider {
     }
 }
 
-pub struct ProcessPythonProvider;
+pub struct ProcessPythonProvider {
+    error_gate: Option<Arc<refactor_check_core::error_gate::ErrorGate>>,
+}
 
 impl ProcessPythonProvider {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self { error_gate: None }
+    }
+
+    #[must_use]
+    pub fn with_error_gate(mut self, gate: Arc<refactor_check_core::error_gate::ErrorGate>) -> Self {
+        self.error_gate = Some(gate);
+        self
     }
 }
 
@@ -1256,24 +1264,41 @@ impl Default for ProcessPythonProvider {
 #[async_trait]
 impl IOProvider<PythonRequest, PythonResponse> for ProcessPythonProvider {
     async fn invoke(&self, input: PythonRequest) -> Result<PythonResponse> {
-        let output = tokio::process::Command::new("python3")
-            .arg("-c")
-            .arg(&input.script)
-            .output()
-            .await?;
+        loop {
+            let output = match tokio::process::Command::new("python3")
+                .arg("-c")
+                .arg(&input.script)
+                .output()
+                .await
+            {
+                Ok(output) => output,
+                Err(e) => {
+                    let message = format!(
+                        "cannot start python3: {e} — install python3 and press RETRY NOW (or type continue)"
+                    );
+                    if let Some(gate) = &self.error_gate {
+                        gate.report_and_wait(&message).await?;
+                        continue;
+                    }
+                    anyhow::bail!("{message}");
+                }
+            };
 
-        if !output.status.success() {
-            anyhow::bail!(
-                "Python script failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+            if output.status.success() {
+                let smtlib = String::from_utf8_lossy(&output.stdout).to_string();
+                return Ok(PythonResponse { smtlib, explanation: String::new() });
+            }
+            let message = format!(
+                "python3 failed (exit {:?}): {} — fix the cause and press RETRY NOW (or type continue)",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim(),
             );
+            if let Some(gate) = &self.error_gate {
+                gate.report_and_wait(&message).await?;
+                continue;
+            }
+            anyhow::bail!("{message}");
         }
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let smtlib = stdout.clone();
-        let explanation = String::new();
-
-        Ok(PythonResponse { smtlib, explanation })
     }
 }
 
@@ -1284,11 +1309,14 @@ pub struct CliAgentProvider {
     /// Environment variables (name -> value) injected into the agent
     /// subprocess, e.g. the resolved API key the agent CLI must see.
     env: Vec<(String, String)>,
+    /// Live-config-backed API key: re-read on every call so `set
+    /// --api-key` + RETRY works without a restart.
+    live_key: Option<(String, Arc<refactor_check_core::live_config::LiveConfig<refactor_check_core::config_update::AppConfig>>)>,
 }
 
 impl CliAgentProvider {
     pub fn new(binary: String, args: Vec<String>) -> Self {
-        Self { binary, base_args: args, error_gate: None, env: Vec::new() }
+        Self { binary, base_args: args, error_gate: None, env: Vec::new(), live_key: None }
     }
 
     pub fn with_error_gate(mut self, gate: Arc<refactor_check_core::error_gate::ErrorGate>) -> Self {
@@ -1303,6 +1331,29 @@ impl CliAgentProvider {
     pub fn with_api_key(mut self, env_var: &str, key: String) -> Self {
         self.env.push((env_var.to_string(), key));
         self
+    }
+
+    /// Like [`with_api_key`], but the key is read from the live config on
+    /// EVERY call — updating it (shell: `set --api-key ...`) and pressing
+    /// RETRY uses the new key without a restart.
+    #[must_use]
+    pub fn with_live_api_key(
+        mut self,
+        env_var: &str,
+        config: Arc<refactor_check_core::live_config::LiveConfig<refactor_check_core::config_update::AppConfig>>,
+    ) -> Self {
+        self.live_key = Some((env_var.to_string(), config));
+        self
+    }
+
+    /// Environment for this call: static entries plus the current live key.
+    fn call_env(&self) -> Vec<(String, String)> {
+        let mut env = self.env.clone();
+        if let Some((var, config)) = &self.live_key {
+            let key = config.snapshot().1.llm.api_key.clone();
+            env.push((var.clone(), key));
+        }
+        env
     }
 }
 
@@ -1354,7 +1405,7 @@ impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
             cmd.args(&args)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
-            for (name, value) in &self.env {
+            for (name, value) in &self.call_env() {
                 cmd.env(name, value);
             }
 
@@ -1374,7 +1425,7 @@ impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
                         }
                     }
                     return Err(anyhow::anyhow!(
-                        "failed to spawn agent binary '{}': {e}",
+                        "cannot start opencode ('{}'): {e} — install it or pass --agent-binary",
                         self.binary
                     ));
                 }
@@ -1384,24 +1435,32 @@ impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
             let stderr_raw = String::from_utf8_lossy(&output.stderr).to_string();
             let extracted = extract_text_from_json_events(&stdout_raw);
 
-            if extracted.is_empty() && !output.status.success() {
+            // A failure is a failure even when the agent printed text:
+            // opencode reports errors like `Invalid API key.` as JSON
+            // events AND exits nonzero. (Exit status alone decides — a
+            // successful run without parseable events is fine.)
+            if !output.status.success() {
+                let detail = if !extracted.is_empty() {
+                    extracted.trim()
+                } else if !stderr_raw.trim().is_empty() {
+                    stderr_raw.trim()
+                } else {
+                    "(no output)"
+                };
+                let message = format!(
+                    "opencode failed (exit {:?}): {detail}\n\
+                     Fixes: correct the API key (shell: `set --api-key <KEY>` then RETRY NOW),\n\
+                     or check the opencode setup; command was `{}`",
+                    output.status.code(),
+                    self.binary,
+                );
                 if input.recoverable {
                     if let Some(gate) = &self.error_gate {
-                        gate.report_and_wait(&format!(
-                            "Agent binary '{}' failed (exit {:?}): {}",
-                            self.binary,
-                            output.status.code(),
-                            stderr_raw.trim(),
-                        )).await?;
+                        gate.report_and_wait(&message).await?;
                         continue;
                     }
                 }
-                anyhow::bail!(
-                    "agent binary '{}' failed (exit {:?}): {}",
-                    self.binary,
-                    output.status.code(),
-                    stderr_raw.trim(),
-                );
+                anyhow::bail!("{message}");
             }
 
             return Ok(AgentResponse {

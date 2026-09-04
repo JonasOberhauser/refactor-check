@@ -149,8 +149,10 @@ async fn live_api_key_is_reread_on_every_call() {
     let dir = tempfile::tempdir().unwrap();
     let keyfile = dir.path().join("key.txt");
     let config = Arc::new(LiveConfig::new(AppConfig::default()));
-    let provider = CliAgentProvider::new("/bin/sh".to_string(), vec!["-c".to_string()])
-        .with_live_api_key("OPENROUTER_API_KEY", config.clone());
+    let provider = Arc::new(
+        CliAgentProvider::new("/bin/sh".to_string(), vec!["-c".to_string()])
+            .with_live_api_key("OPENROUTER_API_KEY", config.clone()),
+    );
 
     let script = format!("printenv OPENROUTER_API_KEY > {}", keyfile.display());
     let probe = |script: String| {

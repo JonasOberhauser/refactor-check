@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use clap::Parser;
 
 use refactor_check_core::protocols::{all_protocols, resolve_active_server, StatusSnapshot};
-use refactor_check_core::status_layer::{spawn_status_poller, StatusLayer};
+use refactor_check_core::status_layer::{spawn_status_poller, StatusLayer, LogSink};
 use servatui_display::Display;
 
 #[derive(Parser)]
@@ -36,9 +36,11 @@ fn main() {
     // Background status poller -> shared snapshot; the StatusLayer shows a
     // dismissable banner whenever the server has pending errors or finishes.
     let slot: Arc<Mutex<Option<StatusSnapshot>>> = Arc::new(Mutex::new(None));
-    spawn_status_poller(socket.clone(), slot.clone());
+    let log_sink: LogSink = Arc::new(Mutex::new(Vec::new()));
+    spawn_status_poller(socket.clone(), slot.clone(), log_sink.clone());
 
     let mut display = Display::new();
+    display.set_log_sink(log_sink);
     display.add_layer(Box::new(StatusLayer::new(socket.clone(), slot)));
 
     let protocols = all_protocols(&socket);

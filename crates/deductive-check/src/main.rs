@@ -335,7 +335,8 @@ fn main() -> Result<()> {
                 info!("rust-analyzer workspace loaded");
                 let git = deductive_check::provider::CliGitProvider::new(PathBuf::from(&bg_project));
                 let filesystem = deductive_check::provider::LocalFileSystemProvider::new();
-                let python = deductive_check::provider::ProcessPythonProvider::new();
+                let python = deductive_check::provider::ProcessPythonProvider::new()
+                    .with_error_gate(gate.clone());
 
                 let mut agent_args = vec![agent_subcommand];
                 if agent_skip_permissions {
@@ -347,6 +348,7 @@ fn main() -> Result<()> {
                 }
                 let key_env = api_key_env_var(&api_base_for_agent);
                 let agent = deductive_check::provider::CliAgentProvider::new(agent_binary, agent_args)
+                    .with_live_api_key(key_env, bg_config.clone())
                     .with_api_key(key_env, api_key.clone())
                     .with_error_gate(gate.clone());
 
@@ -394,11 +396,17 @@ fn main() -> Result<()> {
                     let msg = format!("{e:#}");
                     *bg_state.work_result.lock().unwrap() = Some(msg.clone());
                     bg_state.push_error(msg.clone());
-                    // Machine-level failures are unrecoverable: show the
-                    // issue and exit instead of idling in the server.
                     println!("\n{}", "=".repeat(60));
-                    println!("deductive-check failed:");
-                    println!("{msg}");
+                    if e.downcast_ref::<refactor_check_core::error_gate::ShutdownRequested>()
+                        .is_some()
+                    {
+                        // The user pressed ABORT (or typed exit): not a
+                        // failure.
+                        println!("verification aborted");
+                    } else {
+                        println!("deductive-check failed:");
+                        println!("{msg}");
+                    }
                     println!("{}", "=".repeat(60));
                     std::process::exit(1);
                 }
