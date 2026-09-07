@@ -44,7 +44,11 @@ pub fn spawn_status_poller(socket: PathBuf, slot: StatusSlot, log_sink: LogSink)
             if snap.pending_errors != seen_errors {
                 for err in &snap.pending_errors {
                     if !seen_errors.iter().any(|e| e == err) {
-                        log_sink.lock().unwrap().push(format!("error: {err}"));
+                        // One log line per physical line — embedded
+                        // newlines would render as a single broken entry.
+                        for line in err.lines() {
+                            log_sink.lock().unwrap().push(format!("error: {line}"));
+                        }
                     }
                 }
                 seen_errors = snap.pending_errors.clone();
@@ -89,7 +93,9 @@ fn plain_banner_lines(snap: &StatusSnapshot) -> Option<Vec<String>> {
             if snap.pending_errors.len() == 1 { "" } else { "s" },
         )];
         for err in snap.pending_errors.iter().take(3) {
-            lines.push(err.to_string());
+            for line in err.lines() {
+                lines.push(line.to_string());
+            }
         }
         if snap.pending_errors.len() > 3 {
             lines.push(format!(" … and {} more", snap.pending_errors.len() - 3));
@@ -176,7 +182,9 @@ impl StatusLayer {
                 if snap.parked.len() == 1 { "" } else { "s" },
             )];
             for err in snap.parked.iter().take(2) {
-                lines.push(err.clone());
+                for line in err.lines() {
+                    lines.push(line.to_string());
+                }
             }
             Banner::Gate(lines)
         } else {
@@ -580,5 +588,43 @@ mod gate_tests {
         );
 
         let _ = std::fs::remove_file(&socket);
+    }
+}
+
+#[cfg(test)]
+mod multiline_tests {
+    use super::tests::{frame, has_banner};
+    use super::*;
+    use servatui_display::Display;
+
+    #[test]
+    fn multi_line_errors_split_into_clean_lines() {
+        // Gate messages carry embedded newlines ("opencode failed ... \n
+        // Fixes: ..."); they must not leak control characters into the
+        // banner.
+        let slot: StatusSlot = Arc::new(Mutex::new(None));
+        *slot.lock().unwrap() = Some(StatusSnapshot {
+            running: true,
+            result: None,
+            pending_errors: vec![],
+            parked: vec!["opencode failed (exit 1): Invalid API key.\nFixes: set --api-key".to_string()],
+        });
+        let mut display = Display::with_palette(vec![ratatui::style::Color::Blue]);
+        display.add_layer(Box::new(StatusLayer::new("/nonexistent", slot)));
+
+        let mut f = frame();
+        display.frame(&mut f);
+        let _ = has_banner(&f).expect("gate banner shown");
+        // Rendering the banner must not produce control glyphs: split lines
+        // render as ordinary text.
+        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 24));
+        for e in &f {
+            e.widget.render_ref(e.area, &mut buf);
+        }
+        let bad = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].symbol().chars().any(|c| c.is_control()))
+            .count();
+        assert_eq!(bad, 0, "banner must not contain control characters");
     }
 }
