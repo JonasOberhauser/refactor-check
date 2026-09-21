@@ -37,11 +37,11 @@ fn main() {
     // dismissable banner whenever the server has pending errors or finishes.
     let slot: Arc<Mutex<Option<StatusSnapshot>>> = Arc::new(Mutex::new(None));
     let log_sink: LogSink = Arc::new(Mutex::new(Vec::new()));
-    spawn_status_poller(socket.clone(), slot.clone(), log_sink.clone());
+    let _poller = spawn_status_poller(socket.clone(), slot.clone(), log_sink.clone());
 
     let mut display = Display::new();
     display.set_log_sink(log_sink);
-    display.add_layer(Box::new(StatusLayer::new(socket.clone(), slot)));
+    let _layer = display.add_layer(Box::new(StatusLayer::new(socket.clone(), slot)));
 
     let protocols = all_protocols(&socket);
     if let Err(e) = display.run(&socket, &protocols) {

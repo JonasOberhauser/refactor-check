@@ -33,7 +33,11 @@ pub type LogSink = Arc<Mutex<Vec<String>>>;
 /// are immediately queued into `log_sink` so they land in the log box
 /// without waiting for the user to run anything. Best-effort: unreachable
 /// server leaves the last snapshot in place. Runs until process exit.
-pub fn spawn_status_poller(socket: PathBuf, slot: StatusSlot, log_sink: LogSink) {
+pub fn spawn_status_poller(
+    socket: PathBuf,
+    slot: StatusSlot,
+    log_sink: LogSink,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut seen_errors: Vec<String> = Vec::new();
         loop {
@@ -47,15 +51,15 @@ pub fn spawn_status_poller(socket: PathBuf, slot: StatusSlot, log_sink: LogSink)
                         // One log line per physical line — embedded
                         // newlines would render as a single broken entry.
                         for line in err.lines() {
-                            log_sink.lock().unwrap().push(format!("error: {line}"));
+                            log_sink.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(format!("error: {line}"));
                         }
                     }
                 }
                 seen_errors = snap.pending_errors.clone();
             }
-            *slot.lock().unwrap() = Some(snap);
+            *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snap);
         }
-    });
+    })
 }
 
 /// Button labels on the error-gate popup's last inner row (order matters).
@@ -158,7 +162,7 @@ impl StatusLayer {
     /// The banner to show this frame, after applying dismissal/re-open
     /// logic against the latest snapshot. Idempotent between frames.
     fn current_banner(&mut self) -> Banner {
-        let Some(snap) = self.slot.lock().unwrap().clone() else {
+        let Some(snap) = self.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() else {
             return Banner::None;
         };
         // Content-based: a retry that drains errors and a re-park with a
@@ -392,16 +396,16 @@ mod tests {
     fn banner_appears_for_pending_errors_and_work_finished() {
         let slot: StatusSlot = Arc::new(Mutex::new(None));
         let mut display = Display::with_palette(vec![ratatui::style::Color::Blue]);
-        display.add_layer(Box::new(StatusLayer::new("/nonexistent-status-test.sock", slot.clone())));
+        let _layer_id = display.add_layer(Box::new(StatusLayer::new("/nonexistent-status-test.sock", slot.clone())));
 
         // Clean running state: no banner.
-        *slot.lock().unwrap() = Some(snap(true, None, &[]));
+        *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snap(true, None, &[]));
         let mut f = frame();
         display.frame(&mut f);
         assert!(!f.iter().any(|w| w.name == banner_name()));
 
         // Pending errors: banner in the top-right corner.
-        *slot.lock().unwrap() = Some(snap(true, None, &["boom"]));
+        *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snap(true, None, &["boom"]));
         let mut f = frame();
         display.frame(&mut f);
         let banner = f.iter().find(|w| w.name == banner_name()).expect("banner shown");
@@ -409,7 +413,7 @@ mod tests {
         assert_eq!(banner.area.y, 0);
 
         // Work finished: banner too.
-        *slot.lock().unwrap() = Some(snap(false, Some("ok"), &[]));
+        *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snap(false, Some("ok"), &[]));
         let mut f = frame();
         display.frame(&mut f);
         assert!(f.iter().any(|w| w.name == banner_name()));
@@ -421,7 +425,7 @@ mod tests {
 
         let slot: StatusSlot = Arc::new(Mutex::new(Some(snap(true, None, &["boom"]))));
         let mut display = Display::with_palette(vec![ratatui::style::Color::Blue]);
-        display.add_layer(Box::new(StatusLayer::new("/nonexistent-status-test.sock", slot.clone())));
+        let _layer_id = display.add_layer(Box::new(StatusLayer::new("/nonexistent-status-test.sock", slot.clone())));
 
         let mut f = frame();
         display.frame(&mut f);
@@ -440,7 +444,7 @@ mod tests {
         assert!(!f.iter().any(|w| w.name == banner_name()));
 
         // A changed snapshot re-opens the banner; a click inside dismisses.
-        *slot.lock().unwrap() = Some(snap(true, None, &["boom", "bang"]));
+        *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snap(true, None, &["boom", "bang"]));
         let mut f = frame();
         display.frame(&mut f);
         assert!(f.iter().any(|w| w.name == banner_name()), "new errors re-open");
@@ -474,15 +478,15 @@ mod taskbar_tests {
     fn status_button_appears_only_while_the_banner_is_shown() {
         let slot: StatusSlot = Arc::new(Mutex::new(None));
         let mut display = Display::with_palette(vec![ratatui::style::Color::Blue]);
-        display.add_layer(Box::new(StatusLayer::new("/nonexistent-status-test.sock", slot.clone())));
+        let _layer_id = display.add_layer(Box::new(StatusLayer::new("/nonexistent-status-test.sock", slot.clone())));
 
         // Idle (running, no errors, no result): no banner, taskbar shows
         // only the builtin button.
-        *slot.lock().unwrap() = Some(snap(true, None, &[]));
+        *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snap(true, None, &[]));
         assert_eq!(taskbar_buttons(&mut display), 1);
 
         // Pending errors: banner and the status button appear.
-        *slot.lock().unwrap() = Some(snap(true, None, &["boom"]));
+        *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snap(true, None, &["boom"]));
         assert_eq!(taskbar_buttons(&mut display), 2);
 
         // Dismissed: banner gone, button gone again (slot stays reserved).
@@ -494,7 +498,7 @@ mod taskbar_tests {
         assert_eq!(taskbar_buttons(&mut display), 1);
 
         // New errors: the button is back at its reserved slot.
-        *slot.lock().unwrap() = Some(snap(true, None, &["boom", "bang"]));
+        *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snap(true, None, &["boom", "bang"]));
         assert_eq!(taskbar_buttons(&mut display), 2);
     }
 }
@@ -525,7 +529,7 @@ mod gate_tests {
             protocols: crate::protocols::all_protocols(&socket),
         };
         let state2 = state.clone();
-        std::thread::spawn(move || handle.run(state2).ok());
+        let _ = std::thread::spawn(move || handle.run(state2).ok());
         for _ in 0..200 {
             if SocketConnection::server_exists(&socket) {
                 break;
@@ -535,10 +539,10 @@ mod gate_tests {
 
         let slot: StatusSlot = Arc::new(Mutex::new(None));
         let mut display = Display::with_palette(vec![ratatui::style::Color::Blue]);
-        display.add_layer(Box::new(StatusLayer::new(socket.clone(), slot.clone())));
+        let _layer_id = display.add_layer(Box::new(StatusLayer::new(socket.clone(), slot.clone())));
 
         let refresh = |slot: &StatusSlot| {
-            *slot.lock().unwrap() = query_status(&socket);
+            *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = query_status(&socket);
         };
         let frame = |display: &mut Display| {
             let mut f = builtin_frame();
@@ -548,7 +552,7 @@ mod gate_tests {
 
         // Parked: the recovery popup appears.
         state.push_error("boom".to_string());
-        state.error_gate_parked.lock().unwrap().push("z3 exploded".to_string());
+        state.error_gate_parked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push("z3 exploded".to_string());
         refresh(&slot);
         let f = frame(&mut display);
         assert!(has_banner(&f).is_some(), "gate popup shown");
@@ -558,19 +562,19 @@ mod gate_tests {
         // resume and clear itself).
         assert!(display.route_event(&enter()));
         assert!(
-            state.pending_errors.lock().unwrap().is_empty(),
+            state.pending_errors.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty(),
             "retry must run 'continue'"
         );
         assert!(!state.shutdown.load(std::sync::atomic::Ordering::Acquire));
 
         // Park again; WAIT (focus 1) does neither.
         state.push_error("again".to_string());
-        state.error_gate_parked.lock().unwrap().push("z3 exploded".to_string());
+        state.error_gate_parked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push("z3 exploded".to_string());
         refresh(&slot);
         assert!(display.route_event(&key(KeyCode::Right))); // focus -> WAIT
         assert!(display.route_event(&enter()));
         assert_eq!(
-            state.pending_errors.lock().unwrap().len(),
+            state.pending_errors.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(),
             1,
             "wait must not run 'continue'"
         );
@@ -603,14 +607,14 @@ mod multiline_tests {
         // Fixes: ..."); they must not leak control characters into the
         // banner.
         let slot: StatusSlot = Arc::new(Mutex::new(None));
-        *slot.lock().unwrap() = Some(StatusSnapshot {
+        *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(StatusSnapshot {
             running: true,
             result: None,
             pending_errors: vec![],
             parked: vec!["opencode failed (exit 1): Invalid API key.\nFixes: set --api-key".to_string()],
         });
         let mut display = Display::with_palette(vec![ratatui::style::Color::Blue]);
-        display.add_layer(Box::new(StatusLayer::new("/nonexistent", slot)));
+        let _layer_id = display.add_layer(Box::new(StatusLayer::new("/nonexistent", slot)));
 
         let mut f = frame();
         display.frame(&mut f);

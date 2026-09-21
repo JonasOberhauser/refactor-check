@@ -34,11 +34,11 @@ impl ServerState {
     }
 
     pub fn push_error(&self, error: String) {
-        self.pending_errors.lock().unwrap().push(error);
+        self.pending_errors.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(error);
     }
 
     pub fn drain_errors(&self) -> Vec<String> {
-        let mut errors = self.pending_errors.lock().unwrap();
+        let mut errors = self.pending_errors.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         std::mem::take(&mut *errors)
     }
 }
@@ -302,11 +302,19 @@ pub fn watch_protocol() -> Protocol {
         .parse(|_args: &str| Ok(StatusRequest {}))
         .client(|req: StatusRequest, _out, _input| Ok(req))
         .server_ctx(|_req: StatusRequest, ctx: &ServerState| {
-            let pending = ctx.pending_errors.lock().unwrap().clone();
-            let parked = ctx.error_gate_parked.lock().unwrap().clone();
+            let pending = ctx.pending_errors.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            let parked = ctx
+                .error_gate_parked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             Ok(StatusResponse {
                 running: !ctx.work_finished.load(Ordering::Acquire),
-                result: ctx.work_result.lock().unwrap().clone(),
+                result: ctx
+                    .work_result
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
                 pending_errors: pending,
                 parked,
             })
@@ -335,8 +343,12 @@ pub fn status_protocol() -> Protocol {
         .server_ctx(|_req: StatusRequest, ctx: &ServerState| {
             let errors = ctx.drain_errors();
             let running = !ctx.work_finished.load(Ordering::Acquire);
-            let result = ctx.work_result.lock().unwrap().clone();
-            let parked = ctx.error_gate_parked.lock().unwrap().clone();
+            let result = ctx.work_result.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            let parked = ctx
+                .error_gate_parked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             Ok(StatusResponse {
                 running,
                 result,
@@ -370,7 +382,7 @@ pub fn exit_protocol() -> Protocol {
         .client(|req: (), _out, _input| Ok(req))
         .server_ctx(|_req: (), ctx: &ServerState| {
             ctx.shutdown.store(true, Ordering::Release);
-            ctx.epoch.fetch_add(1, Ordering::Release);
+            let _ = ctx.epoch.fetch_add(1, Ordering::Release);
             Ok(())
         })
         .client(|_: (), out, _input| {
@@ -515,7 +527,7 @@ mod tests {
             socket: socket.clone(),
             protocols: all_protocols(&socket),
         };
-        std::thread::spawn(move || handle.run(state).ok());
+        let _ = std::thread::spawn(move || handle.run(state).ok());
 
         for _ in 0..100 {
             if SocketConnection::server_exists(&socket) {
@@ -537,7 +549,7 @@ mod tests {
         let mut input = NoInput;
         let mut conn = SocketConnection::connect(&socket).unwrap();
         conn.send_typed(&"status".to_string()).unwrap();
-        status_protocol().run_client("", &mut conn, &mut console, &mut input).unwrap();
+        let _ = status_protocol().run_client("", &mut conn, &mut console, &mut input).unwrap();
         assert!(
             console.lines.iter().any(|l| l.contains("boom")),
             "interactive status must still see the error: {:?}",
@@ -570,7 +582,7 @@ mod tests {
             socket: socket.clone(),
             protocols: all_protocols(&socket),
         };
-        std::thread::spawn(move || handle.run(state).ok());
+        let _ = std::thread::spawn(move || handle.run(state).ok());
 
         for _ in 0..100 {
             if SocketConnection::server_exists(&socket) {
@@ -608,7 +620,7 @@ mod resolve_tests {
             socket: socket.to_path_buf(),
             protocols,
         };
-        std::thread::spawn(move || handle.run(state).ok());
+        let _ = std::thread::spawn(move || handle.run(state).ok());
         wait_online(socket);
     }
 
@@ -689,13 +701,13 @@ mod parked_tests {
 
         let state = Arc::new(ServerState::new(Arc::new(MessageLog::new())));
         state.push_error("boom".to_string());
-        state.error_gate_parked.lock().unwrap().push("z3 exploded".to_string());
+        state.error_gate_parked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push("z3 exploded".to_string());
         let handle = servyi_servatui::ServerHandle {
             socket: socket.clone(),
             protocols: all_protocols(&socket),
         };
         let state_for_thread = state.clone();
-        std::thread::spawn(move || handle.run(state_for_thread).ok());
+        let _ = std::thread::spawn(move || handle.run(state_for_thread).ok());
         for _ in 0..200 {
             if SocketConnection::server_exists(&socket) {
                 break;
@@ -712,7 +724,7 @@ mod parked_tests {
         let mut input = NoInput;
         let mut conn = SocketConnection::connect(&socket).unwrap();
         conn.send_typed(&"status".to_string()).unwrap();
-        status_protocol().run_client("", &mut conn, &mut console, &mut input).unwrap();
+        let _ = status_protocol().run_client("", &mut conn, &mut console, &mut input).unwrap();
         assert!(
             console.lines.iter().any(|l| l.contains("z3 exploded")),
             "status must show the parked gate: {:?}",

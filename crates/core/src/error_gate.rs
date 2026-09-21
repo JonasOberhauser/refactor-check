@@ -45,7 +45,7 @@ impl ErrorGate {
     pub async fn report_and_wait(&self, error: &str) -> Result<(), ShutdownRequested> {
         let my_epoch = self.epoch.load(Ordering::Acquire);
         let _ = self.tx.send(error.to_string());
-        self.parked.lock().unwrap().push(error.to_string());
+        self.parked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(error.to_string());
         eprintln!("[error gate] verification parked: {error}");
         eprintln!("[error gate] type 'continue' in the deductive-shell to retry, or 'exit' to abort");
         loop {
@@ -65,9 +65,9 @@ impl ErrorGate {
     }
 
     fn unregister(&self, error: &str) {
-        let mut parked = self.parked.lock().unwrap();
+        let mut parked = self.parked.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(pos) = parked.iter().position(|e| e == error) {
-            parked.remove(pos);
+            let _removed = parked.remove(pos);
         }
     }
 }
@@ -102,14 +102,14 @@ mod tests {
         let g = gate.clone();
         let handle = tokio::spawn(async move { g.report_and_wait("z3 exploded").await });
 
-        eventually(|| parked.lock().unwrap().len() == 1).await;
-        assert_eq!(parked.lock().unwrap()[0], "z3 exploded");
+        eventually(|| parked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len() == 1).await;
+        assert_eq!(parked.lock().unwrap_or_else(std::sync::PoisonError::into_inner)[0], "z3 exploded");
 
         // 'continue' bumps the epoch -> the parked thread resumes and
         // unregisters itself.
         epoch.store(1, Ordering::Release);
         handle.await.unwrap().unwrap();
-        assert!(parked.lock().unwrap().is_empty(), "release must clear the parked list");
+        assert!(parked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty(), "release must clear the parked list");
     }
 
     #[tokio::test]
@@ -127,11 +127,11 @@ mod tests {
 
         let g = gate.clone();
         let handle = tokio::spawn(async move { g.report_and_wait("opencode auth failed").await });
-        eventually(|| parked.lock().unwrap().len() == 1).await;
+        eventually(|| parked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len() == 1).await;
 
         shutdown.store(true, Ordering::Release);
         let err = handle.await.unwrap().unwrap_err();
         assert!(err.to_string().contains("shutdown"));
-        assert!(parked.lock().unwrap().is_empty(), "abort must clear the parked list");
+        assert!(parked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty(), "abort must clear the parked list");
     }
 }

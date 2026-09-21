@@ -275,7 +275,9 @@ pub fn transition_need_formula(
         }
         return BranchFromNeedFormula::Insist;
     }
-    BranchFromNeedFormula::Proceed(formulas.into_iter().next().unwrap())
+    BranchFromNeedFormula::Proceed(
+        formulas.into_iter().next().expect("checked exactly one formula above"),
+    )
 }
 
 pub fn transition_solver(formula: String, result: SolverResult) -> BranchFromSolver {

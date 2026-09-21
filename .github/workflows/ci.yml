@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  clippy:
+    name: clippy (strict, no unwrap)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: >
+          cargo clippy --workspace --all-targets -- -D warnings
+          -W clippy::all
+          -W clippy::unwrap_used
+          -W clippy::undocumented_unsafe_blocks
+          -W unsafe_op_in_unsafe_fn
+          -W unused_unsafe
+          -W clippy::dbg_macro
+          -W clippy::todo
+          -W clippy::unimplemented
+
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build --workspace
+      - name: test
+        run: cargo test --workspace
+
+  docs:
+    name: rustdoc links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: doc
+        run: cargo doc --workspace --no-deps

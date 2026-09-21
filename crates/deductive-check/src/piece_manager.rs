@@ -142,7 +142,7 @@ impl DeductivePieceManager for DefaultDeductivePieceManager {
     }
 
     fn store_function_docs(&self, function_id: FunctionId, docs: String) {
-        self.function_docs.insert(function_id, docs);
+        let _previous = self.function_docs.insert(function_id, docs);
     }
 
     fn get_function_docs(&self, function_id: &FunctionId) -> String {

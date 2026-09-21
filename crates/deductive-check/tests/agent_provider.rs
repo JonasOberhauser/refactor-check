@@ -159,7 +159,7 @@ async fn live_api_key_is_reread_on_every_call() {
         let provider = provider.clone();
         let dir = dir.path().to_path_buf();
         async move {
-            provider
+            let _ = provider
                 .invoke(agent_request(&script, &dir, true))
                 .await
                 .unwrap();
@@ -170,7 +170,7 @@ async fn live_api_key_is_reread_on_every_call() {
 
     // The user fixes the key via the shell's live config; the next call
     // must pick it up WITHOUT restarting.
-    config.update(|cfg| cfg.llm.api_key = "sk-fixed".to_string());
+    let _ = config.update(|cfg| cfg.llm.api_key = "sk-fixed".to_string());
     tokio_test_probe(probe, script).await;
     assert_eq!(
         std::fs::read_to_string(&keyfile).unwrap().trim(),

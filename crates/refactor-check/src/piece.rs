@@ -23,17 +23,17 @@ impl CodePiece {
     }
 
     pub fn with_ctx<R>(&self, f: impl FnOnce(&ContextId) -> R) -> R {
-        let guard = self.context_id.lock().unwrap();
+        let guard = self.context_id.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let ctx = guard.as_ref().expect("context already taken");
         f(ctx)
     }
 
     pub fn take_context(&self) -> Box<ContextId> {
-        self.context_id.lock().unwrap().take().unwrap_or_else(|| panic!("context already taken for piece {}", self.label))
+        self.context_id.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take().unwrap_or_else(|| panic!("context already taken for piece {}", self.label))
     }
 
     pub fn restore_context(&self, ctx: Box<ContextId>) {
-        *self.context_id.lock().unwrap() = Some(ctx);
+        *self.context_id.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ctx);
     }
 
     pub fn ctx_display(&self) -> &str { &self.ctx_display }

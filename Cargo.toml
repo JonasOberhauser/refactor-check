@@ -6,3 +6,10 @@ members = [
     "crates/deductive-shell",
 ]
 resolver = "2"
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(duv_demo_local)'] }
+unused_results = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"

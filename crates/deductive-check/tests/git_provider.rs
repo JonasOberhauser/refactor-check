@@ -23,9 +23,9 @@ async fn add_all_tolerates_unmatched_globs() {
     // literal `git add '*.rs' '*.toml' '*.lock'` died on the unmatched
     // pathspec ('fatal: pathspec '*.lock' did not match any files').
     let dir = tempfile::tempdir().unwrap();
-    git(dir.path(), &["init"]);
+    let _init = git(dir.path(), &["init"]);
     std::fs::create_dir_all(dir.path().join("src/nested")).unwrap();
-    std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+    let _ = std::fs::write(dir.path().join("src/main.rs"), "fn main() {}");
     std::fs::write(dir.path().join("src/nested/lib.rs"), "pub fn f() {}").unwrap();
 
     let provider = CliGitProvider::new(dir.path().to_path_buf());
@@ -45,8 +45,8 @@ async fn add_all_tolerates_unmatched_globs() {
 #[tokio::test]
 async fn add_all_with_no_matches_is_a_noop_success() {
     let dir = tempfile::tempdir().unwrap();
-    git(dir.path(), &["init"]);
-    std::fs::write(dir.path().join("notes.md"), "hi").unwrap();
+    let _init = git(dir.path(), &["init"]);
+    let _ = std::fs::write(dir.path().join("notes.md"), "hi");
 
     let provider = CliGitProvider::new(dir.path().to_path_buf());
     let resp: GitResponse = provider
@@ -62,7 +62,7 @@ async fn repo_root_detects_enclosing_worktree_from_subdirectory() {
     // inside the work tree — the Initializer must not `git init` a new
     // nested repo there.
     let dir = tempfile::tempdir().unwrap();
-    git(dir.path(), &["init"]);
+    let _init = git(dir.path(), &["init"]);
     let sub = dir.path().join("crates").join("subcrate");
     std::fs::create_dir_all(&sub).unwrap();
 

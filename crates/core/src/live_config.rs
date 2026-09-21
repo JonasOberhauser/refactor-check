@@ -80,7 +80,7 @@ mod tests {
     fn test_version_method() {
         let lc = LiveConfig::new(String::from("hello"));
         assert_eq!(lc.version(), 0);
-        lc.update(|v| v.push_str(" world"));
+        let _ = lc.update(|v| v.push_str(" world"));
         assert_eq!(lc.version(), 1);
     }
 
@@ -88,7 +88,7 @@ mod tests {
     fn test_shared_works_across_clone() {
         let lc = LiveConfig::shared(100u64);
         let clone = Arc::clone(&lc);
-        lc.update(|v| *v = 200);
+        let _ = lc.update(|v| *v = 200);
         let (version, value) = clone.snapshot();
         assert_eq!(version, 1);
         assert_eq!(value, 200);

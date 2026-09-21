@@ -287,7 +287,7 @@ fn main() -> Result<()> {
             // Forward gate errors to server state for status/continue protocols
             {
                 let gate_state = bg_state.clone();
-                std::thread::spawn(move || {
+                let _gate_thread = std::thread::spawn(move || {
                     while let Ok(e) = gate_rx.recv() {
                         gate_state.push_error(e);
                     }
@@ -321,7 +321,7 @@ fn main() -> Result<()> {
                     }
                 };
 
-                bg_config.update(|cfg| cfg.llm.api_key = api_key.clone());
+                let _ = bg_config.update(|cfg| cfg.llm.api_key = api_key.clone());
 
                 info!("creating llm client");
                 let llm = refactor_check_core::llm::LlmClient::with_live_config(bg_config.clone())
@@ -390,11 +390,11 @@ fn main() -> Result<()> {
             bg_state.work_finished.store(true, Ordering::Release);
             match &result {
                 Ok(()) => {
-                    *bg_state.work_result.lock().unwrap() = None;
+                    *bg_state.work_result.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
-                    *bg_state.work_result.lock().unwrap() = Some(msg.clone());
+                    *bg_state.work_result.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(msg.clone());
                     bg_state.push_error(msg.clone());
                     println!("\n{}", "=".repeat(60));
                     if e.downcast_ref::<refactor_check_core::error_gate::ShutdownRequested>()
@@ -415,7 +415,7 @@ fn main() -> Result<()> {
 
     // Error forwarding thread: drains err_rx into server state
     let fwd_state = server_state.clone();
-    std::thread::spawn(move || {
+    let _fwd_thread = std::thread::spawn(move || {
         while let Ok(error) = err_rx.recv() {
             fwd_state.push_error(error);
         }
@@ -437,16 +437,16 @@ fn main() -> Result<()> {
 
     // Shutdown: signal bg thread
     server_state.shutdown.store(true, Ordering::Release);
-    server_state.epoch.fetch_add(1, Ordering::Release);
+    let _epoch = server_state.epoch.fetch_add(1, Ordering::Release);
 
     // Wait for bg thread
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    let _waiter = std::thread::spawn(move || {
         let _ = done_tx.send(bg_handle.join());
     });
     match done_rx.recv_timeout(std::time::Duration::from_secs(2)) {
         Ok(Ok(())) => {
-            if let Some(err) = server_state.work_result.lock().unwrap().take() {
+            if let Some(err) = server_state.work_result.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
                 println!("[background work error: {err}]");
             }
         }

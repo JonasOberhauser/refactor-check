@@ -1,3 +1,9 @@
+// These integration tests exercise rust-analyzer over a local duv_demo
+// checkout at /workspace/duv_demo. The fixture is machine-local, so the
+// suite is compiled out by default; run it on a machine with the fixture:
+//   RUSTFLAGS='--cfg duv_demo_local' cargo test -p deductive-check --test duv_demo_integration
+#![cfg(duv_demo_local)]
+
 use deductive_check::core_provider::IOProvider;
 use deductive_check::provider::{CliRustAnalyzerProvider, RustAnalyzerRequest, RustAnalyzerResponse};
 use std::path::PathBuf;

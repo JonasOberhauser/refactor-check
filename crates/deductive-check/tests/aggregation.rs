@@ -64,7 +64,7 @@ impl IOProvider<SolverRequest, WithContext<SolverResult>> for MockSolver {
         let outcome = self
             .outcomes
             .lock()
-            .unwrap()
+            .expect("mock solver lock")
             .pop_front()
             .unwrap_or(SolverOutcome::Unsat);
         let stdout = match &outcome {
@@ -181,7 +181,7 @@ impl IOProvider<AgentRequest, AgentResponse> for MockAgent {
         let (success, stdout) = self
             .responses
             .lock()
-            .unwrap()
+            .expect("mock agent lock")
             .pop_front()
             .unwrap_or((true, "No bug found.".to_string()));
         Ok(AgentResponse { success, stdout })

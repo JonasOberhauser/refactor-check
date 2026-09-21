@@ -21,3 +21,5 @@ dashmap = "6"
 tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "process", "io-util", "sync", "time"] }
 test-log = { version = "0.2", features = ["trace"] }
 refactor-check-test-helpers = { path = "tests/helpers" }
+[lints]
+workspace = true

@@ -23,3 +23,6 @@ ratatui = { version = "0.28", features = ["unstable-widget-ref"] }
 crossterm = "0.28"
 [dev-dependencies]
 tempfile = "3"
+
+[lints]
+workspace = true
