@@ -720,10 +720,10 @@ async fn check_formula(
 
     let smt_content = match translate_formula(formula_content, formula_source, &fctx, providers).await {
         Ok(smt) => smt,
-        Err(_) => {
-            warn!(%fctx, "Formula translation failed");
-            pm.advance_formula(&fctx, Some(FormulaPhase::Check), FormulaPhase::ClosedUnknown);
-            return Ok((formula, fctx, SolverOutcome::Unknown, String::new()));
+        Err(e) => {
+            warn!(%fctx, error = %e, "Formula translation failed; routing to fixer");
+            pm.advance_formula(&fctx, Some(FormulaPhase::Check), FormulaPhase::Fix);
+            return Ok((formula, fctx, SolverOutcome::Error(format!("python3 translation failed: {e}")), formula_content.to_string()));
         }
     };
 
@@ -814,12 +814,11 @@ async fn check_and_fix_formula(
     ).await?;
 
     let mut fix_attempts = 0;
+    let mut error_msg = match &outcome {
+        SolverOutcome::Error(e) => e.clone(),
+        _ => String::new(),
+    };
     while matches!(outcome, SolverOutcome::Error(_)) && fix_attempts < max_fix_attempts {
-        let error_msg = match &outcome {
-            SolverOutcome::Error(e) => e.clone(),
-            _ => unreachable!(),
-        };
-
         info!(%fctx, fix_attempts, "Attempting to fix formula");
 
         let (fixed_response, fctx2) = fix_formula(&current_smt, &error_msg, fctx, &piece_ctx_info.called_functions, &piece_ctx_info.docs_section, providers).await?;
@@ -836,7 +835,9 @@ async fn check_and_fix_formula(
         let translated = match translate_formula(&fixed_ef.content, &fixed_ef.source, &fctx, providers).await {
             Ok(smt) => smt,
             Err(e) => {
-                warn!(%fctx, fix_attempts, error = %e, "Failed to translate fixed formula");
+                warn!(%fctx, fix_attempts, error = %e, "Failed to translate fixed formula; feeding error back to fixer");
+                error_msg = format!("python3 translation failed: {e}");
+                current_smt = fixed_ef.content.clone();
                 fix_attempts += 1;
                 continue;
             }
@@ -861,6 +862,9 @@ async fn check_and_fix_formula(
         info!(%fctx, outcome = ?fixed_result.outcome, "IO response: solver");
 
         outcome = fixed_result.outcome.clone();
+        if let SolverOutcome::Error(e) = &outcome {
+            error_msg = e.clone();
+        }
         current_smt = translated;
         formula = crate::formula::Formula::new(
             fixed_ef.content.clone(),
