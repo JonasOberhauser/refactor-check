@@ -1,0 +1,48 @@
+name: fuzz-nightly
+
+# Nightly fuzzing of the deductive-check state machine and formula
+# extraction. Each libFuzzer target runs 10000 executions; crash inputs
+# land in fuzz/artifacts and are uploaded on failure.
+
+on:
+  schedule:
+    - cron: "17 2 * * *" # nightly, off the top of the hour
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "libFuzzer -runs per target"
+        type: string
+        default: "10000"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [state_machine, formula_extraction]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-21
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/deductive-check/fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Fuzz ${{ matrix.target }} (${{ inputs.runs || '10000' }} runs)
+        working-directory: crates/deductive-check/fuzz
+        run: >
+          cargo fuzz run ${{ matrix.target }}
+          -- -runs=${{ inputs.runs || '10000' }} -max_total_time=1800
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-${{ matrix.target }}
+          path: crates/deductive-check/fuzz/artifacts/
+          if-no-files-found: ignore

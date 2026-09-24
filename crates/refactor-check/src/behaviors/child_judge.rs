@@ -7,6 +7,10 @@ use crate::provider::{DynLlmProvider, LlmRequest, LlmRole};
 use crate::smt::SolverResult;
 use crate::states::{CodePiece, JudgeVerdict};
 
+/// # Panics
+///
+/// Panics via [`CodePiece::with_ctx`] if the piece's context was already
+/// taken and not restored.
 pub async fn execute(
     piece: &CodePiece,
     formula: &str,

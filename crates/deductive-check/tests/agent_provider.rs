@@ -1,5 +1,6 @@
 //! Real-subprocess tests for the opencode agent provider: API-key passing
 //! and fail-fast (ungated) requests for preflight.
+#![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{mpsc, Arc};

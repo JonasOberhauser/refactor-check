@@ -22,18 +22,36 @@ impl CodePiece {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics if the piece's context was already taken (via
+    /// [`Self::take_context`]) and not restored.
     pub fn with_ctx<R>(&self, f: impl FnOnce(&ContextId) -> R) -> R {
-        let guard = self.context_id.lock().unwrap();
+        // into_inner is sound here: poisoning can only originate in a
+        // panic inside `f`, which only shared-reads the context; the
+        // Option transitions under this lock are single atomic ops, so
+        // the state is never left broken.
+        let guard = self.context_id.lock().unwrap_or_else(|e| e.into_inner());
         let ctx = guard.as_ref().expect("context already taken");
         f(ctx)
     }
 
+    /// # Panics
+    ///
+    /// Panics if the context was already taken: each take must be paired
+    /// with exactly one [`Self::restore_context`].
+    #[allow(clippy::panic)] // a double-take is a caller logic bug: fail loudly
     pub fn take_context(&self) -> Box<ContextId> {
-        self.context_id.lock().unwrap().take().unwrap_or_else(|| panic!("context already taken for piece {}", self.label))
+        // See with_ctx: poisoning cannot leave the Option broken.
+        match self.context_id.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            Some(ctx) => ctx,
+            None => panic!("context already taken for piece {}", self.label),
+        }
     }
 
     pub fn restore_context(&self, ctx: Box<ContextId>) {
-        *self.context_id.lock().unwrap() = Some(ctx);
+        // See with_ctx: poisoning cannot leave the Option broken.
+        *self.context_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(ctx);
     }
 
     pub fn ctx_display(&self) -> &str { &self.ctx_display }

@@ -267,15 +267,13 @@ pub fn transition_need_formula(
     formulas: Vec<String>,
     insist_attempt: usize,
 ) -> BranchFromNeedFormula {
-    if formulas.is_empty() {
-        if insist_attempt >= MAX_INSIST_ATTEMPTS {
-            return BranchFromNeedFormula::Exhausted(format!(
-                "failed to produce formula after {MAX_INSIST_ATTEMPTS} insist attempts",
-            ));
-        }
-        return BranchFromNeedFormula::Insist;
+    match formulas.into_iter().next() {
+        Some(first) => BranchFromNeedFormula::Proceed(first),
+        None if insist_attempt >= MAX_INSIST_ATTEMPTS => BranchFromNeedFormula::Exhausted(format!(
+            "failed to produce formula after {MAX_INSIST_ATTEMPTS} insist attempts",
+        )),
+        None => BranchFromNeedFormula::Insist,
     }
-    BranchFromNeedFormula::Proceed(formulas.into_iter().next().unwrap())
 }
 
 pub fn transition_solver(formula: String, result: SolverResult) -> BranchFromSolver {

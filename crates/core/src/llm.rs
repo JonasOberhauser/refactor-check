@@ -320,11 +320,9 @@ impl<'a> StreamHandler<'a> {
                     Ok(Some(Ok(response))) => {
                         total_chunks += 1;
                         if let Some(choice) = response.choices.first() {
-                            let has_content = choice.delta.content.as_ref().is_some_and(|c| !c.is_empty());
-                            if has_content {
+                            if let Some(text) = choice.delta.content.as_ref().filter(|c| !c.is_empty()) {
                                 got_first_content = true;
-                                let text = choice.delta.content.as_ref().unwrap();
-                                tracer.on_content(self.label, text);
+                                let _n = tracer.on_content(self.label, text);
                                 content.push_str(text);
                             } else {
                                 tracer.on_empty(self.label);
@@ -465,7 +463,7 @@ impl LlmClient {
     #[instrument(skip_all, fields(model))]
     pub async fn chat_formalizer(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
         let config = self.ensure_current();
-        tracing::Span::current().record("model", &config.formalizer_model);
+        let _span = tracing::Span::current().record("model", &config.formalizer_model);
         let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).formalizer.clone();
         self.chat_inner(
             ChatCtx { label: "formalizer", client: &client, model: &config.formalizer_model, config: &config, context_id },
@@ -477,7 +475,7 @@ impl LlmClient {
     #[instrument(skip_all, fields(model))]
     pub async fn chat_fixer(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
         let config = self.ensure_current();
-        tracing::Span::current().record("model", &config.fixer_model);
+        let _span = tracing::Span::current().record("model", &config.fixer_model);
         let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).fixer.clone();
         self.chat_inner(
             ChatCtx { label: "fixer", client: &client, model: &config.fixer_model, config: &config, context_id },
@@ -489,7 +487,7 @@ impl LlmClient {
     #[instrument(skip_all, fields(model))]
     pub async fn chat_judge(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
         let config = self.ensure_current();
-        tracing::Span::current().record("model", &config.judge_model);
+        let _span = tracing::Span::current().record("model", &config.judge_model);
         let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).judge.clone();
         self.chat_inner(
             ChatCtx { label: "judge", client: &client, model: &config.judge_model, config: &config, context_id },
@@ -505,7 +503,7 @@ impl LlmClient {
     #[instrument(skip_all, fields(model))]
     pub async fn chat_splitter(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
         let config = self.ensure_current();
-        tracing::Span::current().record("model", &config.splitter_model);
+        let _span = tracing::Span::current().record("model", &config.splitter_model);
         let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).splitter.clone();
         self.chat_inner(
             ChatCtx { label: "splitter", client: &client, model: &config.splitter_model, config: &config, context_id },
@@ -517,7 +515,7 @@ impl LlmClient {
     #[instrument(skip_all, fields(model))]
     pub async fn chat_splitting_judge(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
         let config = self.ensure_current();
-        tracing::Span::current().record("model", &config.splitting_judge_model);
+        let _span = tracing::Span::current().record("model", &config.splitting_judge_model);
         let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).splitting_judge.clone();
         self.chat_inner(
             ChatCtx { label: "splitting_judge", client: &client, model: &config.splitting_judge_model, config: &config, context_id },
@@ -533,7 +531,7 @@ impl LlmClient {
     #[instrument(skip_all, fields(model))]
     pub async fn chat_analyzer(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
         let config = self.ensure_current();
-        tracing::Span::current().record("model", &config.analyzer_model);
+        let _span = tracing::Span::current().record("model", &config.analyzer_model);
         let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).analyzer.clone();
         self.chat_inner(
             ChatCtx { label: "analyzer", client: &client, model: &config.analyzer_model, config: &config, context_id },

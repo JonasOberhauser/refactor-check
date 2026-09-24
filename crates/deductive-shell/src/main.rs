@@ -41,7 +41,7 @@ fn main() {
 
     let mut display = Display::new();
     display.set_log_sink(log_sink);
-    display.add_layer(Box::new(StatusLayer::new(socket.clone(), slot)));
+    let _layer_id = display.add_layer(Box::new(StatusLayer::new(socket.clone(), slot)));
 
     let protocols = all_protocols(&socket);
     if let Err(e) = display.run(&socket, &protocols) {

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 use deductive_check::core_provider::IOProvider;
 use deductive_check::provider::{CliRustAnalyzerProvider, RustAnalyzerRequest, RustAnalyzerResponse};
 use std::path::PathBuf;

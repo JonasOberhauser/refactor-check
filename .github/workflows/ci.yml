@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-21
+      - uses: Swatinem/rust-cache@v2
+      # duv_demo integration tests skip themselves when the fixture
+      # project is absent (it lives on dev machines only).
+      - run: cargo test --workspace --all-targets
+
+  lint-policy:
+    # Shared Servyi policy (servyi/lints): clippy under the shared flag
+    # list, the unsafe_scope driver, rustdoc links — in this job's
+    # environment.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: servyi/lints/.github/actions/lint-policy@main

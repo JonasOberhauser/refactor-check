@@ -41,28 +41,32 @@ impl LogReplayLlm {
         Ok(q.remove(0))
     }
 
+// Mock state: a poisoned lock means another test thread already
+// panicked — the queues stay readable so the actual failure
+// reports itself instead of a secondary panic.
+
     pub fn splitter_push(&mut self, response: String) {
-        self.splitter.lock().unwrap().push(response);
+        self.splitter.lock().unwrap_or_else(|e| e.into_inner()).push(response);
     }
 
     pub fn splitting_judge_push(&mut self, response: String) {
-        self.splitting_judge.lock().unwrap().push(response);
+        self.splitting_judge.lock().unwrap_or_else(|e| e.into_inner()).push(response);
     }
 
     pub fn formalizer_push(&mut self, response: String) {
-        self.formalizer.lock().unwrap().push(response);
+        self.formalizer.lock().unwrap_or_else(|e| e.into_inner()).push(response);
     }
 
     pub fn fixer_push(&mut self, response: String) {
-        self.fixer.lock().unwrap().push(response);
+        self.fixer.lock().unwrap_or_else(|e| e.into_inner()).push(response);
     }
 
     pub fn judge_push(&mut self, response: String) {
-        self.judge.lock().unwrap().push(response);
+        self.judge.lock().unwrap_or_else(|e| e.into_inner()).push(response);
     }
 
     pub fn analyzer_push(&mut self, response: String) {
-        self.analyzer.lock().unwrap().push(response);
+        self.analyzer.lock().unwrap_or_else(|e| e.into_inner()).push(response);
     }
 }
 
@@ -100,7 +104,7 @@ impl LogReplaySolver {
     }
 
     pub fn push(&mut self, outcome: SolverOutcome, stdout: String, stderr: String) {
-        self.runs.lock().unwrap().push(SolverResult {
+        self.runs.lock().unwrap_or_else(|e| e.into_inner()).push(SolverResult {
             outcome,
             stdout,
             stderr,
