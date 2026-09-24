@@ -42,10 +42,18 @@ impl ErrorGate {
         Self { epoch, shutdown, tx, parked }
     }
 
+    ///
+    /// # Panics
+    ///
+    /// Panics if the parked-list lock is poisoned — only pure Vec ops run
+    /// under it, so poisoning would mean a lock discipline was broken
+    /// elsewhere.
     pub async fn report_and_wait(&self, error: &str) -> Result<(), ShutdownRequested> {
         let my_epoch = self.epoch.load(Ordering::Acquire);
         let _ = self.tx.send(error.to_string());
-        self.parked.lock().unwrap().push(error.to_string());
+        // Only pure Vec ops run under this lock, so no panic can
+        // originate here and the lock can never be poisoned.
+        self.parked.lock().expect("parked lock: pure ops only").push(error.to_string());
         eprintln!("[error gate] verification parked: {error}");
         eprintln!("[error gate] type 'continue' in the deductive-shell to retry, or 'exit' to abort");
         loop {
@@ -65,9 +73,9 @@ impl ErrorGate {
     }
 
     fn unregister(&self, error: &str) {
-        let mut parked = self.parked.lock().unwrap();
+        let mut parked = self.parked.lock().expect("parked lock: pure ops only");
         if let Some(pos) = parked.iter().position(|e| e == error) {
-            parked.remove(pos);
+            let _removed = parked.remove(pos);
         }
     }
 }

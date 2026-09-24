@@ -51,16 +51,20 @@ impl SequenceLlm {
         }
     }
 
+// Mock state: a poisoned lock means another test thread already
+// panicked — the queues stay readable so the actual failure
+// reports itself instead of a secondary panic.
+
     pub fn formalizer_remaining(&self) -> usize {
-        self.formalizer.lock().expect("lock poisoned").len()
+        self.formalizer.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     pub fn fixer_remaining(&self) -> usize {
-        self.fixer.lock().expect("lock poisoned").len()
+        self.fixer.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     pub fn judge_remaining(&self) -> usize {
-        self.judge.lock().expect("lock poisoned").len()
+        self.judge.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 

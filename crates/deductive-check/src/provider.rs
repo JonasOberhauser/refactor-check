@@ -640,8 +640,8 @@ impl CliRustAnalyzerProvider {
         for (file_id, vfs_path) in vfs.iter() {
             if let Some(abs_path) = vfs_path.as_path() {
                 let path_buf: PathBuf = abs_path.to_path_buf().into();
-                path_to_file_id.insert(path_buf.clone(), file_id);
-                file_id_to_path.insert(file_id, path_buf);
+                let _prev = path_to_file_id.insert(path_buf.clone(), file_id);
+                let _prev = file_id_to_path.insert(file_id, path_buf);
             }
         }
 
@@ -1331,7 +1331,7 @@ impl CliAgentProvider {
         self
     }
 
-    /// Like [`with_api_key`], but the key is read from the live config on
+    /// Like [`Self::with_api_key`], but the key is read from the live config on
     /// EVERY call — updating it (shell: `set --api-key ...`) and pressing
     /// RETRY uses the new key without a restart.
     #[must_use]
@@ -1400,11 +1400,12 @@ impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
             }
 
             let mut cmd = tokio::process::Command::new(&self.binary);
-            cmd.args(&args)
+            let _cmd = cmd
+                .args(&args)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
             for (name, value) in &self.call_env() {
-                cmd.env(name, value);
+                let _cmd = cmd.env(name, value);
             }
 
             let output = match cmd.output().await {

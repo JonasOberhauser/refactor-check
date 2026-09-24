@@ -1,9 +1,27 @@
+#![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 use deductive_check::core_provider::IOProvider;
 use deductive_check::provider::{CliRustAnalyzerProvider, RustAnalyzerRequest, RustAnalyzerResponse};
 use std::path::PathBuf;
 
 fn duv_demo_path() -> PathBuf {
     PathBuf::from("/workspace/duv_demo")
+}
+
+/// The tests need the duv_demo fixture project, which lives on the
+/// development machine; CI (and any other checkout) skips instead of
+/// failing (the fuse_e2e pattern: skip yourself when the environment
+/// is not there).
+fn duv_demo_available() -> bool {
+    duv_demo_path().join("Cargo.toml").exists()
+}
+
+macro_rules! require_duv_demo {
+    () => {
+        if !duv_demo_available() {
+            eprintln!("skipped: duv_demo fixture not present at /workspace/duv_demo");
+            return;
+        }
+    };
 }
 
 fn duv_demo_src_path(file: &str) -> PathBuf {
@@ -33,6 +51,7 @@ async fn list_functions(provider: &CliRustAnalyzerProvider, file: &str) -> Vec<d
 
 #[tokio::test]
 async fn test_duv_demo_lists_invariant_impl_methods() {
+    require_duv_demo!();
     let provider = create_provider().await;
     let functions = list_functions(&provider, "counter.rs").await;
 
@@ -50,6 +69,7 @@ async fn test_duv_demo_lists_invariant_impl_methods() {
 
 #[tokio::test]
 async fn test_duv_demo_nested_loops_calls_precondition_fn() {
+    require_duv_demo!();
     let provider = create_provider().await;
     let functions = list_functions(&provider, "counter.rs").await;
 
@@ -62,6 +82,7 @@ async fn test_duv_demo_nested_loops_calls_precondition_fn() {
 
 #[tokio::test]
 async fn test_duv_demo_runner_functions() {
+    require_duv_demo!();
     let provider = create_provider().await;
     let functions = list_functions(&provider, "runner.rs").await;
 
@@ -78,6 +99,7 @@ async fn test_duv_demo_runner_functions() {
 
 #[tokio::test]
 async fn test_duv_demo_get_function_code() {
+    require_duv_demo!();
     let provider = create_provider().await;
     let functions = list_functions(&provider, "counter.rs").await;
 
@@ -100,6 +122,7 @@ async fn test_duv_demo_get_function_code() {
 
 #[tokio::test]
 async fn test_duv_demo_called_functions() {
+    require_duv_demo!();
     let provider = create_provider().await;
     let functions = list_functions(&provider, "counter.rs").await;
 
@@ -127,6 +150,7 @@ async fn test_duv_demo_called_functions() {
 
 #[tokio::test]
 async fn test_duv_demo_called_function_code() {
+    require_duv_demo!();
     let provider = create_provider().await;
     let functions = list_functions(&provider, "counter.rs").await;
 
@@ -173,6 +197,7 @@ async fn test_duv_demo_called_function_code() {
 
 #[tokio::test]
 async fn test_duv_demo_function_docs_api() {
+    require_duv_demo!();
     let provider = create_provider().await;
     let functions = list_functions(&provider, "counter.rs").await;
 
@@ -193,6 +218,7 @@ async fn test_duv_demo_function_docs_api() {
 
 #[tokio::test]
 async fn test_duv_demo_no_test_functions() {
+    require_duv_demo!();
     let provider = create_provider().await;
     let functions = list_functions(&provider, "counter.rs").await;
 
@@ -207,6 +233,7 @@ async fn test_duv_demo_no_test_functions() {
 
 #[tokio::test]
 async fn test_duv_demo_impl_for_set_for_methods() {
+    require_duv_demo!();
     let provider = create_provider().await;
     let functions = list_functions(&provider, "counter.rs").await;
 

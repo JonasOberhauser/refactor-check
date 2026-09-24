@@ -33,12 +33,24 @@ impl ServerState {
         }
     }
 
+    /// Queue an error for the interactive `status` protocol to drain.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the state lock is poisoned — only pure ops run under it,
+    /// so poisoning would mean a lock discipline was broken elsewhere.
     pub fn push_error(&self, error: String) {
-        self.pending_errors.lock().unwrap().push(error);
+        self.pending_errors.lock().expect("server state lock: pure ops only").push(error);
     }
 
+    /// Take all queued errors (used by `status`, not `watch`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the state lock is poisoned — only pure ops run under it,
+    /// so poisoning would mean a lock discipline was broken elsewhere.
     pub fn drain_errors(&self) -> Vec<String> {
-        let mut errors = self.pending_errors.lock().unwrap();
+        let mut errors = self.pending_errors.lock().expect("server state lock: pure ops only");
         std::mem::take(&mut *errors)
     }
 }
@@ -297,16 +309,21 @@ pub fn show_protocol(socket: impl AsRef<Path>) -> Protocol {
 /// `watch` — read-only status for pollers: identical to `status` except it
 /// never drains the pending errors, so background watchers cannot steal
 /// them from the interactive `status`/`continue` commands.
+///
+/// # Panics
+///
+/// Panics if a server-state lock is poisoned — only pure ops run under
+/// them, so poisoning would mean a lock discipline was broken elsewhere.
 pub fn watch_protocol() -> Protocol {
     Plugin::new("watch", "Read-only status (does not drain pending errors)")
         .parse(|_args: &str| Ok(StatusRequest {}))
         .client(|req: StatusRequest, _out, _input| Ok(req))
         .server_ctx(|_req: StatusRequest, ctx: &ServerState| {
-            let pending = ctx.pending_errors.lock().unwrap().clone();
-            let parked = ctx.error_gate_parked.lock().unwrap().clone();
+            let pending = ctx.pending_errors.lock().expect("server state lock: pure ops only").clone();
+            let parked = ctx.error_gate_parked.lock().expect("server state lock: pure ops only").clone();
             Ok(StatusResponse {
                 running: !ctx.work_finished.load(Ordering::Acquire),
-                result: ctx.work_result.lock().unwrap().clone(),
+                result: ctx.work_result.lock().expect("server state lock: pure ops only").clone(),
                 pending_errors: pending,
                 parked,
             })
@@ -328,6 +345,12 @@ pub fn watch_protocol() -> Protocol {
         .finalize(|| Ok(ShellAction::Continue))
 }
 
+/// `status` — show work status and drain the pending errors.
+///
+/// # Panics
+///
+/// Panics if a server-state lock is poisoned — only pure ops run under
+/// them, so poisoning would mean a lock discipline was broken elsewhere.
 pub fn status_protocol() -> Protocol {
     Plugin::new("status", "Show work status and pending errors")
         .parse(|_args: &str| Ok(StatusRequest {}))
@@ -335,8 +358,8 @@ pub fn status_protocol() -> Protocol {
         .server_ctx(|_req: StatusRequest, ctx: &ServerState| {
             let errors = ctx.drain_errors();
             let running = !ctx.work_finished.load(Ordering::Acquire);
-            let result = ctx.work_result.lock().unwrap().clone();
-            let parked = ctx.error_gate_parked.lock().unwrap().clone();
+            let result = ctx.work_result.lock().expect("server state lock: pure ops only").clone();
+            let parked = ctx.error_gate_parked.lock().expect("server state lock: pure ops only").clone();
             Ok(StatusResponse {
                 running,
                 result,
@@ -370,7 +393,7 @@ pub fn exit_protocol() -> Protocol {
         .client(|req: (), _out, _input| Ok(req))
         .server_ctx(|_req: (), ctx: &ServerState| {
             ctx.shutdown.store(true, Ordering::Release);
-            ctx.epoch.fetch_add(1, Ordering::Release);
+            let _prev_epoch = ctx.epoch.fetch_add(1, Ordering::Release);
             Ok(())
         })
         .client(|_: (), out, _input| {
@@ -689,7 +712,7 @@ mod parked_tests {
 
         let state = Arc::new(ServerState::new(Arc::new(MessageLog::new())));
         state.push_error("boom".to_string());
-        state.error_gate_parked.lock().unwrap().push("z3 exploded".to_string());
+        state.error_gate_parked.lock().expect("server state lock: pure ops only").push("z3 exploded".to_string());
         let handle = servyi_servatui::ServerHandle {
             socket: socket.clone(),
             protocols: all_protocols(&socket),

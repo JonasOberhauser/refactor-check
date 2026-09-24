@@ -10,6 +10,7 @@
 //!            FullFormalizer returns Result directly (bug_reports: Vec::new()).
 //!
 //! The f0 bug report from cycle 1 must survive into the final result.
+#![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 use std::collections::VecDeque;
 use std::path::PathBuf;

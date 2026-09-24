@@ -16,6 +16,10 @@ pub fn role_for_iteration(iteration: usize) -> LlmRole {
     }
 }
 
+/// # Panics
+///
+/// Panics via [`CodePiece::with_ctx`] if the piece's context was already
+/// taken and not restored.
 pub async fn execute(
     state: &WaitForGeneration,
     llm: &DynLlmProvider,

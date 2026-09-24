@@ -87,7 +87,7 @@ impl PreflightGit {
 impl AlgorithmState for PreflightGit {
     async fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking git");
-        providers.git.invoke(GitRequest::CurrentCommitHash).await?;
+        let _resp = providers.git.invoke(GitRequest::CurrentCommitHash).await?;
         info!("preflight: git OK");
         Ok(Step::State(Box::new(PreflightSolver { project_path: self.project_path })))
     }
@@ -117,7 +117,7 @@ pub struct PreflightPython {
 impl AlgorithmState for PreflightPython {
     async fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking python3");
-        providers.python.invoke(PythonRequest {
+        let _resp = providers.python.invoke(PythonRequest {
             script: r#"print("(check-sat)")"#.to_string(),
         }).await?;
         info!("preflight: python3 OK");
@@ -316,7 +316,7 @@ impl AlgorithmState for FunctionLister {
         let mut function_docs: HashMap<FunctionId, String> = HashMap::new();
         for fi in &guaranteed {
             if !fi.docs.is_empty() {
-                function_docs.insert(fi.id.clone(), fi.docs.clone());
+                let _prev = function_docs.insert(fi.id.clone(), fi.docs.clone());
             }
         }
 
@@ -339,7 +339,7 @@ fn filter_connected_functions(
 
     for fi in &functions {
         if target_files.contains(&fi.id.file) {
-            keep.insert((fi.id.file.clone(), fi.id.name.clone(), fi.id.line));
+            let _new = keep.insert((fi.id.file.clone(), fi.id.name.clone(), fi.id.line));
         }
     }
 
@@ -350,7 +350,7 @@ fn filter_connected_functions(
                 Some(imp) => format!("{}::{}", imp, fi.id.name),
                 None => fi.id.name.clone(),
             };
-            map.entry(key).or_insert_with(HashSet::new).insert(fi.id.file.clone());
+            let _new = map.entry(key).or_insert_with(HashSet::new).insert(fi.id.file.clone());
         }
         map
     };
@@ -376,7 +376,7 @@ fn filter_connected_functions(
             };
 
             if in_target || called_by_target {
-                keep.insert(key);
+                let _new = keep.insert(key);
                 changed = true;
             }
         }
@@ -600,7 +600,7 @@ impl FullFormalizer {
     fn functions_count(&self) -> usize {
         let mut seen = HashSet::new();
         for (piece, _) in &self.pieces {
-            seen.insert(piece.function_id().name.clone());
+            let _new = seen.insert(piece.function_id().name.clone());
         }
         seen.len()
     }

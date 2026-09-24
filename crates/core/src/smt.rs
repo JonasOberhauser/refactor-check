@@ -57,14 +57,13 @@ pub fn extract_all_formulas(response: &str) -> Vec<String> {
 }
 
 pub fn extract_single_formula(response: &str) -> String {
-    let blocks = find_fenced_smt_blocks(response);
-    if blocks.len() == 1 {
-        blocks.into_iter().next().unwrap()
-    } else if blocks.is_empty() {
-        response.trim().to_string()
-    } else {
-        warn!(count = blocks.len(), "LLM returned multiple SMT formulas where one was expected");
-        String::new()
+    match find_fenced_smt_blocks(response).as_slice() {
+        [single] => single.clone(),
+        [] => response.trim().to_string(),
+        many => {
+            warn!(count = many.len(), "LLM returned multiple SMT formulas where one was expected");
+            String::new()
+        }
     }
 }
 
@@ -196,12 +195,12 @@ pub async fn run_solver(
 
     let read_stdout = tokio::task::spawn(async move {
         let mut buf = Vec::new();
-        stdout_pipe.read_to_end(&mut buf).await?;
+        let _n = stdout_pipe.read_to_end(&mut buf).await?;
         Ok::<_, std::io::Error>(buf)
     });
     let read_stderr = tokio::task::spawn(async move {
         let mut buf = Vec::new();
-        stderr_pipe.read_to_end(&mut buf).await?;
+        let _n = stderr_pipe.read_to_end(&mut buf).await?;
         Ok::<_, std::io::Error>(buf)
     });
 

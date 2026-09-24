@@ -33,8 +33,15 @@ pub type LogSink = Arc<Mutex<Vec<String>>>;
 /// are immediately queued into `log_sink` so they land in the log box
 /// without waiting for the user to run anything. Best-effort: unreachable
 /// server leaves the last snapshot in place. Runs until process exit.
+///
+/// # Panics
+///
+/// Panics if the status slot or log sink lock is poisoned — only pure
+/// ops run under them, so poisoning would mean a lock discipline was
+/// broken elsewhere.
 pub fn spawn_status_poller(socket: PathBuf, slot: StatusSlot, log_sink: LogSink) {
-    std::thread::spawn(move || {
+    // Detached by design: runs until process exit.
+    let _poller = std::thread::spawn(move || {
         let mut seen_errors: Vec<String> = Vec::new();
         loop {
             std::thread::sleep(Duration::from_secs(2));
@@ -47,13 +54,16 @@ pub fn spawn_status_poller(socket: PathBuf, slot: StatusSlot, log_sink: LogSink)
                         // One log line per physical line — embedded
                         // newlines would render as a single broken entry.
                         for line in err.lines() {
-                            log_sink.lock().unwrap().push(format!("error: {line}"));
+                            log_sink
+                                .lock()
+                                .expect("log sink lock: pure ops only")
+                                .push(format!("error: {line}"));
                         }
                     }
                 }
                 seen_errors = snap.pending_errors.clone();
             }
-            *slot.lock().unwrap() = Some(snap);
+            *slot.lock().expect("status slot lock: pure ops only") = Some(snap);
         }
     });
 }
@@ -158,7 +168,7 @@ impl StatusLayer {
     /// The banner to show this frame, after applying dismissal/re-open
     /// logic against the latest snapshot. Idempotent between frames.
     fn current_banner(&mut self) -> Banner {
-        let Some(snap) = self.slot.lock().unwrap().clone() else {
+        let Some(snap) = self.slot.lock().expect("status slot lock: pure ops only").clone() else {
             return Banner::None;
         };
         // Content-based: a retry that drains errors and a re-park with a
@@ -219,7 +229,7 @@ impl DisplayLayer for StatusLayer {
         true
     }
 
-    fn on_overlay(&mut self, ctx: &mut LayerCtx, widgets: &mut Vec<WidgetEntry>) -> StackIntent {
+    fn on_overlay(&mut self, ctx: &mut LayerCtx<'_>, widgets: &mut Vec<WidgetEntry>) -> StackIntent {
         match self.current_banner() {
             Banner::None => {}
             Banner::Plain(lines) => {
@@ -243,7 +253,7 @@ impl DisplayLayer for StatusLayer {
             Banner::Gate(lines) => {
                 let n_lines = lines.len() + 1; // + button row
                 let area = self.gate_banner_area(ctx.terminal_area, n_lines);
-                let mut text: Vec<Line> =
+                let mut text: Vec<Line<'_>> =
                     lines.into_iter().map(Line::from).collect();
                 text.push(Line::from(
                     GATE_BUTTONS
@@ -274,7 +284,7 @@ impl DisplayLayer for StatusLayer {
         StackIntent::Keep
     }
 
-    fn on_event(&mut self, ev: &Event, ctx: &LayerCtx) -> EventResult {
+    fn on_event(&mut self, ev: &Event, ctx: &LayerCtx<'_>) -> EventResult {
         match self.current_banner() {
             Banner::None => EventResult::Pass,
             Banner::Plain(_) => match ev {
@@ -464,7 +474,7 @@ mod taskbar_tests {
     use super::*;
     use servatui_display::Display;
 
-    fn taskbar_buttons(display: &mut Display) -> usize {
+    fn taskbar_buttons(display: &mut Display<'_>) -> usize {
         let mut f = frame();
         display.frame(&mut f);
         f.iter().filter(|w| w.name == "display.taskbar").count()
@@ -540,7 +550,7 @@ mod gate_tests {
         let refresh = |slot: &StatusSlot| {
             *slot.lock().unwrap() = query_status(&socket);
         };
-        let frame = |display: &mut Display| {
+        let frame = |display: &mut Display<'_>| {
             let mut f = builtin_frame();
             display.frame(&mut f);
             f

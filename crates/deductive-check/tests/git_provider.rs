@@ -1,5 +1,6 @@
 //! Real-git tests for the git provider's repo detection and the
 //! init/add flow the Initializer relies on.
+#![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 use deductive_check::provider::{CliGitProvider, GitRequest, GitResponse};
 use servyi_ioprovider::IOProvider;
