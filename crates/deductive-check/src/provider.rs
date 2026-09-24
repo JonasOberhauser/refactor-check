@@ -1331,7 +1331,7 @@ impl CliAgentProvider {
         self
     }
 
-    /// Like [`with_api_key`], but the key is read from the live config on
+    /// Like [`Self::with_api_key`], but the key is read from the live config on
     /// EVERY call — updating it (shell: `set --api-key ...`) and pressing
     /// RETRY uses the new key without a restart.
     #[must_use]
