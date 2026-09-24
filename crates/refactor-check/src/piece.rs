@@ -36,17 +36,16 @@ impl CodePiece {
         f(ctx)
     }
 
-    /// # Panics
-    ///
-    /// Panics if the context was already taken: each take must be paired
-    /// with exactly one [`Self::restore_context`].
-    #[allow(clippy::panic)] // a double-take is a caller logic bug: fail loudly
-    pub fn take_context(&self) -> Box<ContextId> {
+    /// A double-take (take without a paired [`Self::restore_context`]) is
+    /// a caller logic bug: it is reported as an `Err` carrying the piece
+    /// label instead of panicking.
+    pub fn take_context(&self) -> Result<Box<ContextId>, String> {
         // See with_ctx: poisoning cannot leave the Option broken.
-        match self.context_id.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            Some(ctx) => ctx,
-            None => panic!("context already taken for piece {}", self.label),
-        }
+        self.context_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .ok_or_else(|| format!("context already taken for piece {}", self.label))
     }
 
     pub fn restore_context(&self, ctx: Box<ContextId>) {

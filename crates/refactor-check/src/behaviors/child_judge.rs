@@ -99,7 +99,7 @@ pub async fn execute(
             llm::user_message(&prompt),
         ];
 
-        let ctx = piece.take_context();
+        let ctx = piece.take_context().map_err(anyhow::Error::msg)?;
         let resp = llm.invoke(LlmRequest { role: LlmRole::Judge, messages, context_id: ctx }).await?;
         piece.restore_context(resp.context_id);
         let response = resp.value;
