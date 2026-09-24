@@ -44,7 +44,7 @@ async fn run_branch(
             BranchPhase::WaitForSolver { formula } => {
                 piece.with_ctx(|ctx| pm.expect_any_and_set(ctx, &[PiecePhase::Forming, PiecePhase::Fixing], PiecePhase::Solving));
                 debug!(ctx = %piece.ctx_display(), label = %piece.label(), "running solver");
-                let ctx = piece.take_context();
+                let ctx = piece.take_context().map_err(anyhow::Error::msg)?;
                 let resp = solver.invoke(SolverRequest { formula: formula.clone(), context_id: ctx }).await?;
                 piece.restore_context(resp.context_id);
                 let result = resp.value;
@@ -143,7 +143,7 @@ async fn run_branch(
                 let fb = feedback.as_deref().unwrap_or("");
                 let role = LlmRole::Fixer;
 
-                let ctx = piece.take_context();
+                let ctx = piece.take_context().map_err(anyhow::Error::msg)?;
                 let resp = if insist_pending {
                     let prev = last_response.as_deref().unwrap_or("");
                     debug!(ctx = %piece.ctx_display(), label = %piece.label(), "insist fixer retry for piece");

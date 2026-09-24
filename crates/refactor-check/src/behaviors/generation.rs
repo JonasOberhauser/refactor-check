@@ -62,7 +62,7 @@ async fn generate_one_formula(
     role: LlmRole,
 ) -> Result<String> {
     let messages = build_single_piece_messages(piece, input_content, verified);
-    let ctx = piece.take_context();
+    let ctx = piece.take_context().map_err(anyhow::Error::msg)?;
     let resp = llm.invoke(LlmRequest { role, messages, context_id: ctx }).await?;
     piece.restore_context(resp.context_id);
     let response = resp.value;
@@ -111,7 +111,7 @@ async fn generate_insist(
         )),
     ];
 
-    let ctx = state.pieces[0].take_context();
+    let ctx = state.pieces[0].take_context().map_err(anyhow::Error::msg)?;
     let resp = llm.invoke(LlmRequest { role, messages, context_id: ctx }).await?;
     state.pieces[0].restore_context(resp.context_id);
     let response = resp.value;
