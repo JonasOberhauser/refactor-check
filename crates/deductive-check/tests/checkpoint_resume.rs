@@ -9,7 +9,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use deductive_check::checkpoint::{restore_snapshot, run_checkpointed};
-use deductive_check::piece_manager::DefaultDeductivePieceManager;
+use deductive_check::piece_manager::{DefaultDeductivePieceManager, MachineCheckpointable};
 use deductive_check::provider::{
     AgentRequest, AgentResponse, CalledFunctionCode, FileSystemRequest, FileSystemResponse,
     FunctionInfo, GitRequest, GitResponse, Providers, PythonRequest, PythonResponse,
@@ -226,7 +226,7 @@ fn checkpointed_run_snapshots_and_resume_skips_recorded_pieces() {
         agent: &MockAgent { responses: Mutex::new(VecDeque::new()) },
     };
     let mut pm2 = DefaultDeductivePieceManager::default();
-    pm2.restore(&snap);
+    pm2.restore(&snap).expect("restore");
     let resumed = run_checkpointed(
         project.to_str().expect("utf8"),
         &mocks2,

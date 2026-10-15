@@ -59,14 +59,56 @@ pub trait DeductivePieceManager: Send + Sync {
         None
     }
 
-    /// Downcast hook for the checkpoint runner.
-    fn as_any(&self) -> &dyn std::any::Any;
-
     /// Whether outcome reuse is armed (post-restore). Default false —
-    /// only DefaultDeductivePieceManager supports restore.
+    /// only a restored manager reports true.
     fn is_resumed(&self) -> bool {
         false
     }
+}
+
+/// Explicit opt-in to checkpoint save/restore. Implementations that do
+/// not participate are a compile-time error at the checkpointed runner,
+/// not a silently empty snapshot.
+pub trait MachineCheckpointable: DeductivePieceManager {
+    /// The checkpoint shape: everything a resumed run needs — piece/formula
+    /// phases, the completed outcomes, and the final result. Function docs
+    /// are a cache and are deliberately NOT part of the shape.
+    #[must_use]
+    fn snapshot(
+        &self,
+        result: Option<&crate::result::VerificationResult>,
+    ) -> crate::checkpoint::MachineSnapshot;
+
+    /// Rebuild from a snapshot: outcomes restored and the resume skip
+    /// armed — ONLY a restored run reuses outcomes; in-process restart
+    /// cycles keep re-verifying every piece. Errors on a malformed
+    /// snapshot rather than dropping phases silently.
+    fn restore(&mut self, snap: &crate::checkpoint::MachineSnapshot) -> anyhow::Result<()>;
+
+    /// Piece phases for the snapshot shape, sorted by hash.
+    fn piece_phases(&self) -> Vec<(u64, CodePiecePhase)>;
+    /// Formula phases for the snapshot shape, sorted by hash.
+    fn formula_phases(&self) -> Vec<(u64, FormulaPhase)>;
+    /// Recorded outcomes for the snapshot shape.
+    fn outcome_list(
+        &self,
+    ) -> Vec<(
+        FunctionId,
+        Option<crate::result::ClosedPiece>,
+        Option<crate::result::UnverifiedPiece>,
+    )>;
+    /// Rebuild the piece tracker from snapshot phases. Errors on
+    /// malformed data instead of dropping phases silently.
+    fn set_piece_phases(&mut self, phases: &[(u64, CodePiecePhase)]) -> anyhow::Result<()>;
+    /// Rebuild the formula tracker from snapshot phases.
+    fn set_formula_phases(&mut self, phases: &[(u64, FormulaPhase)]) -> anyhow::Result<()>;
+    /// Re-insert one restored outcome.
+    fn restore_outcome(
+        &self,
+        function_id: FunctionId,
+        closed: Option<crate::result::ClosedPiece>,
+        unverified: Option<crate::result::UnverifiedPiece>,
+    );
 }
 
 pub struct DefaultDeductivePieceManager {
@@ -103,39 +145,21 @@ impl Default for DefaultDeductivePieceManager {
     }
 }
 
-impl DefaultDeductivePieceManager {
-    /// Downcast hook for the checkpoint runner (the protocol only knows
-    /// the trait).
-    pub fn as_default(pm: &dyn DeductivePieceManager) -> Option<&Self> {
-        pm.as_any().downcast_ref::<Self>()
-    }
-
-    /// The checkpoint shape: everything a resumed run needs — piece/formula
-    /// phases, the completed outcomes, and the final result. Function docs
-    /// are a cache and are deliberately NOT part of the shape.
-    #[must_use]
-    pub fn snapshot(
+impl MachineCheckpointable for DefaultDeductivePieceManager {
+    fn snapshot(
         &self,
         result: Option<&crate::result::VerificationResult>,
     ) -> crate::checkpoint::MachineSnapshot {
         crate::checkpoint::MachineSnapshot::from_pm(self, result)
     }
 
-    /// Rebuild from a snapshot: outcomes restored and the resume skip
-    /// armed — ONLY a restored run reuses outcomes; in-process restart
-    /// cycles keep re-verifying every piece.
-    pub fn restore(&mut self, snap: &crate::checkpoint::MachineSnapshot) {
-        snap.apply_to(self);
+    fn restore(&mut self, snap: &crate::checkpoint::MachineSnapshot) -> anyhow::Result<()> {
+        snap.apply_to(self)?;
         let _prev = self.resumed.swap(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
-    /// Whether outcome reuse is armed (post-restore).
-    pub fn is_resumed(&self) -> bool {
-        self.resumed.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-
-    pub(crate) fn piece_phases(&self) -> Vec<(u64, CodePiecePhase)> {
+    fn piece_phases(&self) -> Vec<(u64, CodePiecePhase)> {
         let mut v: Vec<(u64, CodePiecePhase)> =
             serde_json::from_str(&serde_json::to_string(&self.piece_tracker).unwrap_or_default())
                 .unwrap_or_default();
@@ -143,7 +167,7 @@ impl DefaultDeductivePieceManager {
         v
     }
 
-    pub(crate) fn formula_phases(&self) -> Vec<(u64, FormulaPhase)> {
+    fn formula_phases(&self) -> Vec<(u64, FormulaPhase)> {
         let mut v: Vec<(u64, FormulaPhase)> =
             serde_json::from_str(&serde_json::to_string(&self.formula_tracker).unwrap_or_default())
                 .unwrap_or_default();
@@ -151,7 +175,7 @@ impl DefaultDeductivePieceManager {
         v
     }
 
-    pub(crate) fn outcome_list(
+    fn outcome_list(
         &self,
     ) -> Vec<(FunctionId, Option<crate::result::ClosedPiece>, Option<crate::result::UnverifiedPiece>)> {
         self.outcomes
@@ -164,21 +188,27 @@ impl DefaultDeductivePieceManager {
     }
 
 
-    pub(crate) fn set_piece_phases(&mut self, phases: &[(u64, CodePiecePhase)]) {
+    fn set_piece_phases(
+        &mut self,
+        phases: &[(u64, CodePiecePhase)],
+    ) -> anyhow::Result<()> {
         let entries: Vec<(u64, CodePiecePhase)> = phases.to_vec();
-        if let Ok(tracker) = serde_json::from_str(&serde_json::to_string(&entries).unwrap_or_default()) {
-            self.piece_tracker = tracker;
-        }
+        let json = serde_json::to_string(&entries).map_err(anyhow::Error::from)?;
+        self.piece_tracker = serde_json::from_str(&json).map_err(anyhow::Error::from)?;
+        Ok(())
     }
 
-    pub(crate) fn set_formula_phases(&mut self, phases: &[(u64, FormulaPhase)]) {
+    fn set_formula_phases(
+        &mut self,
+        phases: &[(u64, FormulaPhase)],
+    ) -> anyhow::Result<()> {
         let entries: Vec<(u64, FormulaPhase)> = phases.to_vec();
-        if let Ok(tracker) = serde_json::from_str(&serde_json::to_string(&entries).unwrap_or_default()) {
-            self.formula_tracker = tracker;
-        }
+        let json = serde_json::to_string(&entries).map_err(anyhow::Error::from)?;
+        self.formula_tracker = serde_json::from_str(&json).map_err(anyhow::Error::from)?;
+        Ok(())
     }
 
-    pub(crate) fn restore_outcome(
+    fn restore_outcome(
         &self,
         function_id: FunctionId,
         closed: Option<crate::result::ClosedPiece>,
@@ -287,12 +317,9 @@ impl DeductivePieceManager for DefaultDeductivePieceManager {
         self.function_docs.get(function_id).map(|g| g.value().clone()).unwrap_or_default()
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn is_resumed(&self) -> bool {
-        Self::is_resumed(self)
+        self.resumed.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 

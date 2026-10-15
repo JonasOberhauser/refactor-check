@@ -15,7 +15,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::piece_manager::{DefaultDeductivePieceManager, DeductivePieceManager};
+use crate::piece_manager::MachineCheckpointable;
 use crate::provider::Providers;
 use crate::result::VerificationResult;
 use crate::states::{AlgorithmState, PreflightGit, Step};
@@ -36,7 +36,10 @@ pub struct MachineSnapshot {
 }
 
 impl MachineSnapshot {
-    pub(crate) fn from_pm(pm: &DefaultDeductivePieceManager, result: Option<&VerificationResult>) -> Self {
+    pub(crate) fn from_pm(
+        pm: &dyn MachineCheckpointable,
+        result: Option<&VerificationResult>,
+    ) -> Self {
         Self {
             piece_phases: pm.piece_phases(),
             formula_phases: pm.formula_phases(),
@@ -45,12 +48,13 @@ impl MachineSnapshot {
         }
     }
 
-    pub(crate) fn apply_to(&self, pm: &mut DefaultDeductivePieceManager) {
-        pm.set_piece_phases(&self.piece_phases);
-        pm.set_formula_phases(&self.formula_phases);
+    pub(crate) fn apply_to(&self, pm: &mut dyn MachineCheckpointable) -> anyhow::Result<()> {
+        pm.set_piece_phases(&self.piece_phases)?;
+        pm.set_formula_phases(&self.formula_phases)?;
         for (function_id, closed, unverified) in &self.outcomes {
             pm.restore_outcome(function_id.clone(), closed.clone(), unverified.clone());
         }
+        Ok(())
     }
 }
 
@@ -58,13 +62,13 @@ impl MachineSnapshot {
 /// atomic shape saves every `every` (from a snapshotter thread), the node
 /// is refreshed after every state transition, and the final shape (with
 /// the result) is saved on completion. Callers restore with
-/// [`restore_snapshot`] + [`DefaultDeductivePieceManager::restore`] before
+/// [`restore_snapshot`] + [`MachineCheckpointable::restore`] before
 /// calling again to resume with zero re-invocation of completed pieces.
 #[allow(clippy::missing_panics_doc)] // panics only if embedded runtime setup fails
 pub fn run_checkpointed(
     project_path: &str,
     providers: &Providers<'_>,
-    pm: &dyn DeductivePieceManager,
+    pm: &dyn MachineCheckpointable,
     snapshot_path: impl Into<std::path::PathBuf>,
     every: Duration,
 ) -> Result<VerificationResult> {
@@ -104,7 +108,7 @@ pub fn run_checkpointed(
                     };
                     // Refresh the pair's node so the next snapshotter
                     // round saves the post-transition state.
-                    *h = downcast(pm).map(|d| d.snapshot(None)).unwrap_or_default();
+                    *h = pm.snapshot(None);
                 }
             });
             let result = result?;
@@ -117,18 +121,11 @@ pub fn run_checkpointed(
         })?;
 
         // Final save WITH the result — restore replays from this.
-        *h = match downcast(pm) {
-            Some(d) => d.snapshot(Some(&result)),
-            None => MachineSnapshot { result: Some(result.clone()), ..Default::default() },
-        };
+        *h = pm.snapshot(Some(&result));
         servyi_states_snapshot::save_handle(&h, &snapshot_path)?;
         info!("final checkpoint saved");
         Ok::<VerificationResult, anyhow::Error>(result)
     })
-}
-
-pub(crate) fn downcast(pm: &dyn DeductivePieceManager) -> Option<&DefaultDeductivePieceManager> {
-    DefaultDeductivePieceManager::as_default(pm)
 }
 
 /// Deserialize a snapshot artifact written by [`run_checkpointed`].

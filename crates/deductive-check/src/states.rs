@@ -1173,18 +1173,25 @@ impl AlgorithmState for FullFormalizer {
                 async move {
                 // Outcome reuse is a RESTORED run's skip; in-process
                 // restart cycles keep re-verifying every piece.
-                if pm.is_resumed() {
+                let outcome = if pm.is_resumed() {
                     match pm.outcome_of(piece.function_id()) {
-                        Some((closed, unverified)) => {
-                            Ok::<PieceOutcome, anyhow::Error>(PieceOutcome { closed, unverified })
-                        }
+                        Some((closed, unverified)) => PieceOutcome { closed, unverified },
                         None => {
-                            process_piece(piece, ctx, providers, pm, &verification_dir).await
+                            process_piece(piece, ctx, providers, pm, &verification_dir).await?
                         }
                     }
                 } else {
-                    process_piece(piece, ctx, providers, pm, &verification_dir).await
-                }
+                    process_piece(piece, ctx, providers, pm, &verification_dir).await?
+                };
+                // Record per-piece, as this piece completes (not after the
+                // whole batch): any snapshot landing after this moment
+                // includes this piece's outcome.
+                pm.record_outcome(
+                    piece.function_id(),
+                    outcome.closed.clone(),
+                    outcome.unverified.clone(),
+                );
+                Ok::<PieceOutcome, anyhow::Error>(outcome)
                 }
             })
             .collect();
@@ -1198,9 +1205,8 @@ impl AlgorithmState for FullFormalizer {
             match result {
                 Ok(outcome) => {
                     let (closed, unverified) = (outcome.closed, outcome.unverified);
-                    // Record per-piece outcomes so a snapshot taken from
-                    // this pm lets a resumed run skip this piece.
-                    pm.record_outcome(pieces_only[i].function_id(), closed.clone(), unverified.clone());
+                    // Outcomes were recorded per-piece as they completed;
+                    // this loop only assembles the batch result.
                     if let Some(cp) = closed {
                         closed_pieces.push(cp);
                     }
