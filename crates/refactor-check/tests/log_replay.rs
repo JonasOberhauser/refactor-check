@@ -16,8 +16,8 @@ fn smt_formula_response() -> String {
 }
 
 /// Simple log replay: one piece, formalizer → solver UNSAT → judge REASONABLE.
-#[test_log::test(tokio::test)]
-async fn test_replay_simple_happy() {
+#[test_log::test]
+fn test_replay_simple_happy() {
     let mut llm = LogReplayLlm::new();
     llm.splitter_push(
         "Piece: whole\n---- BEFORE ----\na\n---- AFTER ----\na\n".to_string(),
@@ -31,7 +31,7 @@ async fn test_replay_simple_happy() {
 
     let pm = test_pm();
     let result = machine::run("test", &llm, &solver, &pm)
-        .await
+        
         .expect("agent should succeed");
 
     assert_eq!(result.formulas.len(), 1);
@@ -43,8 +43,8 @@ async fn test_replay_simple_happy() {
 /// iteration=1 → resplit → fresh pieces created at non-zero iteration.
 /// Regression: absent pieces used to panic with "expected phase Open but was absent"
 /// before `enter_generation` was introduced.
-#[test_log::test(tokio::test)]
-async fn test_replay_resplit_at_iteration_one() {
+#[test_log::test]
+fn test_replay_resplit_at_iteration_one() {
     let mut llm = LogReplayLlm::new();
 
     // Initial split: 1 piece
@@ -96,7 +96,7 @@ sub2 after"
 
     let pm = test_pm();
     let result = machine::run("test", &llm, &solver, &pm)
-        .await
+        
         .expect("agent should succeed");
 
     assert_eq!(result.formulas.len(), 2);
@@ -106,8 +106,8 @@ sub2 after"
 
 /// Splitting judge rejects splits until depth exhausted → pieces become open
 /// and are re-processed without phase mismatch panic.
-#[test_log::test(tokio::test)]
-async fn test_replay_split_depth_exhausted_via_judge() {
+#[test_log::test]
+fn test_replay_split_depth_exhausted_via_judge() {
     let mut llm = LogReplayLlm::new();
 
     // Split 1 (depth 0): accepted
@@ -146,7 +146,7 @@ async fn test_replay_split_depth_exhausted_via_judge() {
 
     let pm = test_pm();
     let result = machine::run("test", &llm, &solver, &pm)
-        .await
+        
         .expect("agent should succeed despite split depth exhaustion");
 
     assert_eq!(result.reasonable_unsat, 1);

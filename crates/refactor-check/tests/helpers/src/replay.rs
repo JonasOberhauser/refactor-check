@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
-use async_trait::async_trait;
 use refactor_check::provider::{IOProvider, LlmRequest, LlmRole, SolverRequest, WithContext};
 use refactor_check::smt::{SolverOutcome, SolverResult};
 
@@ -70,9 +69,8 @@ impl LogReplayLlm {
     }
 }
 
-#[async_trait]
 impl IOProvider<LlmRequest, WithContext<String>> for LogReplayLlm {
-    async fn invoke(&self, input: LlmRequest) -> Result<WithContext<String>> {
+    fn invoke(&self, input: LlmRequest) -> Result<WithContext<String>> {
         let LlmRequest { role, context_id, .. } = input;
         let value = match role {
             LlmRole::Splitter => Self::take_first(&self.splitter, "Splitter")?,
@@ -112,9 +110,8 @@ impl LogReplaySolver {
     }
 }
 
-#[async_trait]
 impl IOProvider<SolverRequest, WithContext<SolverResult>> for LogReplaySolver {
-    async fn invoke(&self, input: SolverRequest) -> Result<WithContext<SolverResult>> {
+    fn invoke(&self, input: SolverRequest) -> Result<WithContext<SolverResult>> {
         let SolverRequest { context_id, .. } = input;
         let mut q = self.runs.lock().expect("lock poisoned");
         if q.is_empty() {

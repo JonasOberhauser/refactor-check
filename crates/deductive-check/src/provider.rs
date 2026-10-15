@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -932,9 +931,8 @@ impl CliRustAnalyzerProvider {
     }
 }
 
-#[async_trait]
 impl IOProvider<RustAnalyzerRequest, RustAnalyzerResponse> for CliRustAnalyzerProvider {
-    async fn invoke(&self, input: RustAnalyzerRequest) -> Result<RustAnalyzerResponse> {
+    fn invoke(&self, input: RustAnalyzerRequest) -> Result<RustAnalyzerResponse> {
         match input {
             RustAnalyzerRequest::ListFunctions { files, cfg_verification: _ } => {
                 let mut all_functions = Vec::new();
@@ -983,25 +981,24 @@ impl CliGitProvider {
     }
 }
 
-#[async_trait]
 impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
-    async fn invoke(&self, input: GitRequest) -> Result<GitResponse> {
+    fn invoke(&self, input: GitRequest) -> Result<GitResponse> {
         let dir = &self.project_path;
         match input {
             GitRequest::CreateBranch { name } => {
-                let output = tokio::process::Command::new("git")
+                let output = std::process::Command::new("git")
                     .args(["checkout", "-b", &name])
                     .current_dir(dir)
                     .output()
-                    .await?;
+                    ?;
                 Ok(git_response(output))
             }
             GitRequest::Commit { message } => {
-                let output = tokio::process::Command::new("git")
+                let output = std::process::Command::new("git")
                     .args(["commit", "-m", &message])
                     .current_dir(dir)
                     .output()
-                    .await?;
+                    ?;
                 Ok(git_response(output))
             }
             GitRequest::AddFiles { paths } => {
@@ -1009,27 +1006,27 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
                 for p in &paths {
                     args.push(p.to_string_lossy().to_string());
                 }
-                let output = tokio::process::Command::new("git")
+                let output = std::process::Command::new("git")
                     .args(&args)
                     .current_dir(dir)
                     .output()
-                    .await?;
+                    ?;
                 Ok(git_response(output))
             }
             GitRequest::FindChangedRustFiles { base_commit } => {
-                let output = tokio::process::Command::new("git")
+                let output = std::process::Command::new("git")
                     .args(["diff", "--name-only", &base_commit])
                     .current_dir(dir)
                     .output()
-                    .await?;
+                    ?;
                 Ok(git_response(output))
             }
             GitRequest::CurrentCommitHash => {
-                let output = tokio::process::Command::new("git")
+                let output = std::process::Command::new("git")
                     .args(["rev-parse", "HEAD"])
                     .current_dir(dir)
                     .output()
-                    .await?;
+                    ?;
                 Ok(git_response(output))
             }
             GitRequest::CreateDirectory { path } => {
@@ -1048,11 +1045,11 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
                 })
             }
             GitRequest::Init { path: _ } => {
-                let output = tokio::process::Command::new("git")
+                let output = std::process::Command::new("git")
                     .args(["init"])
                     .current_dir(dir)
                     .output()
-                    .await?;
+                    ?;
                 Ok(git_response(output))
             }
             GitRequest::AddAll { path: _ } => {
@@ -1080,11 +1077,11 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
                 for chunk in matches.chunks(200) {
                     let mut args = vec!["add".to_string(), "--".to_string()];
                     args.extend(chunk.iter().cloned());
-                    let output = tokio::process::Command::new("git")
+                    let output = std::process::Command::new("git")
                         .args(&args)
                         .current_dir(dir)
                         .output()
-                        .await?;
+                        ?;
                     let resp = git_response(output);
                     if !resp.success {
                         return Ok(resp);
@@ -1093,11 +1090,11 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
                 Ok(GitResponse { success: true, output: String::new() })
             }
             GitRequest::RepoRoot => {
-                let output = tokio::process::Command::new("git")
+                let output = std::process::Command::new("git")
                     .args(["rev-parse", "--show-toplevel"])
                     .current_dir(dir)
                     .output()
-                    .await?;
+                    ?;
                 Ok(git_response(output))
             }
         }
@@ -1216,9 +1213,8 @@ impl LocalFileSystemProvider {
     }
 }
 
-#[async_trait]
 impl IOProvider<FileSystemRequest, FileSystemResponse> for LocalFileSystemProvider {
-    async fn invoke(&self, input: FileSystemRequest) -> Result<FileSystemResponse> {
+    fn invoke(&self, input: FileSystemRequest) -> Result<FileSystemResponse> {
         std::fs::create_dir_all(&input.dir)?;
         let path = input.dir.join(&input.filename);
         std::fs::write(&path, &input.content)?;
@@ -1261,15 +1257,13 @@ impl Default for ProcessPythonProvider {
     }
 }
 
-#[async_trait]
 impl IOProvider<PythonRequest, PythonResponse> for ProcessPythonProvider {
-    async fn invoke(&self, input: PythonRequest) -> Result<PythonResponse> {
+    fn invoke(&self, input: PythonRequest) -> Result<PythonResponse> {
         loop {
-            let output = match tokio::process::Command::new("python3")
+            let output = match std::process::Command::new("python3")
                 .arg("-c")
                 .arg(&input.script)
                 .output()
-                .await
             {
                 Ok(output) => output,
                 Err(e) => {
@@ -1277,7 +1271,7 @@ impl IOProvider<PythonRequest, PythonResponse> for ProcessPythonProvider {
                         "cannot start python3: {e} — install python3 and press RETRY NOW (or type continue)"
                     );
                     if let Some(gate) = &self.error_gate {
-                        gate.report_and_wait(&message).await?;
+                        gate.report_and_wait(&message)?;
                         continue;
                     }
                     anyhow::bail!("{message}");
@@ -1384,9 +1378,8 @@ fn extract_text_from_json_events(stdout: &str) -> String {
     texts.join("")
 }
 
-#[async_trait]
 impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
-    async fn invoke(&self, input: AgentRequest) -> Result<AgentResponse> {
+    fn invoke(&self, input: AgentRequest) -> Result<AgentResponse> {
         loop {
             let mut args = self.base_args.clone();
             args.push(input.prompt.clone());
@@ -1399,7 +1392,7 @@ impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
                 args.push(file.to_string_lossy().to_string());
             }
 
-            let mut cmd = tokio::process::Command::new(&self.binary);
+            let mut cmd = std::process::Command::new(&self.binary);
             let _cmd = cmd
                 .args(&args)
                 .stdout(std::process::Stdio::piped())
@@ -1408,7 +1401,7 @@ impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
                 let _cmd = cmd.env(name, value);
             }
 
-            let output = match cmd.output().await {
+            let output = match cmd.output() {
                 Ok(output) => output,
                 Err(e) => {
                     if input.recoverable {
@@ -1419,7 +1412,7 @@ impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
                                  - Install the binary and ensure it is in PATH\n\
                                  - Restart with --agent-binary /correct/path/to/binary",
                                 self.binary,
-                            )).await?;
+                            ))?;
                             continue;
                         }
                     }
@@ -1455,7 +1448,7 @@ impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
                 );
                 if input.recoverable {
                     if let Some(gate) = &self.error_gate {
-                        gate.report_and_wait(&message).await?;
+                        gate.report_and_wait(&message)?;
                         continue;
                     }
                 }

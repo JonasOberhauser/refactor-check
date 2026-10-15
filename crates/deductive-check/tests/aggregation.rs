@@ -17,7 +17,6 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use anyhow::Result;
-use async_trait::async_trait;
 
 use deductive_check::code_piece::FunctionId;
 use deductive_check::machine;
@@ -40,9 +39,8 @@ struct MockLlm {
     formalizer_out: String,
 }
 
-#[async_trait]
 impl IOProvider<LlmRequest, WithContext<String>> for MockLlm {
-    async fn invoke(&self, input: LlmRequest) -> Result<WithContext<String>> {
+    fn invoke(&self, input: LlmRequest) -> Result<WithContext<String>> {
         let resp = match input.role {
             LlmRole::Splitter => SPLITTER_OUT.to_string(),
             LlmRole::Formalizer | LlmRole::Fixer => self.formalizer_out.clone(),
@@ -59,9 +57,8 @@ struct MockSolver {
     outcomes: Mutex<VecDeque<SolverOutcome>>,
 }
 
-#[async_trait]
 impl IOProvider<SolverRequest, WithContext<SolverResult>> for MockSolver {
-    async fn invoke(&self, input: SolverRequest) -> Result<WithContext<SolverResult>> {
+    fn invoke(&self, input: SolverRequest) -> Result<WithContext<SolverResult>> {
         let outcome = self
             .outcomes
             .lock()
@@ -85,9 +82,8 @@ impl IOProvider<SolverRequest, WithContext<SolverResult>> for MockSolver {
 
 struct MockRa;
 
-#[async_trait]
 impl IOProvider<RustAnalyzerRequest, RustAnalyzerResponse> for MockRa {
-    async fn invoke(&self, input: RustAnalyzerRequest) -> Result<RustAnalyzerResponse> {
+    fn invoke(&self, input: RustAnalyzerRequest) -> Result<RustAnalyzerResponse> {
         Ok(match input {
             RustAnalyzerRequest::ListFunctions { files, .. } => {
                 let file = files.first().cloned().unwrap_or_else(|| PathBuf::from("src/lib.rs"));
@@ -133,9 +129,8 @@ fn function_info(file: PathBuf, name: &str) -> FunctionInfo {
 // ── Git / FS / Python: fixed happy-path responses ──────────────────────────
 
 struct MockGit;
-#[async_trait]
 impl IOProvider<GitRequest, GitResponse> for MockGit {
-    async fn invoke(&self, input: GitRequest) -> Result<GitResponse> {
+    fn invoke(&self, input: GitRequest) -> Result<GitResponse> {
         Ok(match input {
             GitRequest::WalkRustFiles { .. } => {
                 GitResponse { success: true, output: "src/lib.rs\n".to_string() }
@@ -150,17 +145,15 @@ impl IOProvider<GitRequest, GitResponse> for MockGit {
 }
 
 struct MockFs;
-#[async_trait]
 impl IOProvider<FileSystemRequest, FileSystemResponse> for MockFs {
-    async fn invoke(&self, input: FileSystemRequest) -> Result<FileSystemResponse> {
+    fn invoke(&self, input: FileSystemRequest) -> Result<FileSystemResponse> {
         Ok(FileSystemResponse { path: input.dir.join(&input.filename) })
     }
 }
 
 struct MockPython;
-#[async_trait]
 impl IOProvider<PythonRequest, PythonResponse> for MockPython {
-    async fn invoke(&self, input: PythonRequest) -> Result<PythonResponse> {
+    fn invoke(&self, input: PythonRequest) -> Result<PythonResponse> {
         let smtlib = if input.script.trim().is_empty() {
             "(check-sat)".to_string()
         } else {
@@ -176,9 +169,8 @@ struct MockAgent {
     responses: Mutex<VecDeque<(bool, String)>>,
 }
 
-#[async_trait]
 impl IOProvider<AgentRequest, AgentResponse> for MockAgent {
-    async fn invoke(&self, _input: AgentRequest) -> Result<AgentResponse> {
+    fn invoke(&self, _input: AgentRequest) -> Result<AgentResponse> {
         let (success, stdout) = self
             .responses
             .lock()
@@ -215,8 +207,8 @@ impl Mocks {
     }
 }
 
-#[tokio::test]
-async fn bug_report_survives_restart_cycle() {
+#[test]
+fn bug_report_survives_restart_cycle() {
     let project = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(project.path().join(".git")).expect("create .git marker");
 
@@ -250,7 +242,7 @@ async fn bug_report_survives_restart_cycle() {
         &mocks.providers(),
         &pm,
     )
-    .await
+    
     .expect("machine ran");
 
     assert_eq!(
@@ -269,8 +261,8 @@ async fn bug_report_survives_restart_cycle() {
     );
 }
 
-#[tokio::test]
-async fn totals_reported_when_terminating_via_problem_analyzer() {
+#[test]
+fn totals_reported_when_terminating_via_problem_analyzer() {
     // When the machine terminates through ProblemAnalyzer's own Result path
     // (unverified pieces all reported as bugs, none RETRY), the final
     // VerificationResult must report the real totals. Previously
@@ -306,7 +298,7 @@ async fn totals_reported_when_terminating_via_problem_analyzer() {
         &mocks.providers(),
         &pm,
     )
-    .await
+    
     .expect("machine ran");
 
     assert_eq!(
@@ -320,8 +312,8 @@ async fn totals_reported_when_terminating_via_problem_analyzer() {
     assert_eq!(result.bug_reports.len(), 2, "both pieces should be bug reports");
 }
 
-#[tokio::test]
-async fn no_formula_on_last_judge_attempt_does_not_panic() {
+#[test]
+fn no_formula_on_last_judge_attempt_does_not_panic() {
     // When the formalizer yields 0 parseable formulas, process_piece's judge
     // loop exhausts all attempts via the "no formulas extracted" branch,
     // leaving the piece in GetContext. The post-loop transition must not
@@ -356,7 +348,7 @@ async fn no_formula_on_last_judge_attempt_does_not_panic() {
         &mocks.providers(),
         &pm,
     )
-    .await
+    
     .expect("machine must not panic; piece should surface as bug/unverified");
 
     assert!(

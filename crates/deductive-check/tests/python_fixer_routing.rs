@@ -16,7 +16,6 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use anyhow::{Result, anyhow};
-use async_trait::async_trait;
 
 use deductive_check::code_piece::FunctionId;
 use deductive_check::machine;
@@ -42,9 +41,8 @@ struct MockLlm {
     fixer_prompts: Mutex<Vec<String>>,
 }
 
-#[async_trait]
 impl IOProvider<LlmRequest, WithContext<String>> for MockLlm {
-    async fn invoke(&self, input: LlmRequest) -> Result<WithContext<String>> {
+    fn invoke(&self, input: LlmRequest) -> Result<WithContext<String>> {
         let resp = match input.role {
             LlmRole::Splitter => SPLITTER_OUT.to_string(),
             LlmRole::Formalizer => BROKEN_PYZ3_OUT.to_string(),
@@ -70,9 +68,8 @@ impl IOProvider<LlmRequest, WithContext<String>> for MockLlm {
 
 struct FailThenEchoPython;
 
-#[async_trait]
 impl IOProvider<PythonRequest, PythonResponse> for FailThenEchoPython {
-    async fn invoke(&self, input: PythonRequest) -> Result<PythonResponse> {
+    fn invoke(&self, input: PythonRequest) -> Result<PythonResponse> {
         // The preflight probe (`print("(check-sat)")`) must succeed; the
         // formalizer's broken pyz3 script fails exactly like a nonzero
         // python3 exit (the branch's bail; main parks the gate instead).
@@ -88,9 +85,8 @@ impl IOProvider<PythonRequest, PythonResponse> for FailThenEchoPython {
 // ── Solver / RA / Git / FS / Agent: happy-path ─────────────────────────────
 
 struct MockSolver;
-#[async_trait]
 impl IOProvider<SolverRequest, WithContext<SolverResult>> for MockSolver {
-    async fn invoke(&self, input: SolverRequest) -> Result<WithContext<SolverResult>> {
+    fn invoke(&self, input: SolverRequest) -> Result<WithContext<SolverResult>> {
         let _ = input;
         Ok(WithContext {
             value: SolverResult {
@@ -104,9 +100,8 @@ impl IOProvider<SolverRequest, WithContext<SolverResult>> for MockSolver {
 }
 
 struct MockRa;
-#[async_trait]
 impl IOProvider<RustAnalyzerRequest, RustAnalyzerResponse> for MockRa {
-    async fn invoke(&self, input: RustAnalyzerRequest) -> Result<RustAnalyzerResponse> {
+    fn invoke(&self, input: RustAnalyzerRequest) -> Result<RustAnalyzerResponse> {
         Ok(match input {
             RustAnalyzerRequest::ListFunctions { files, .. } => {
                 let file = files.first().cloned().unwrap_or_else(|| PathBuf::from("src/lib.rs"));
@@ -143,9 +138,8 @@ impl IOProvider<RustAnalyzerRequest, RustAnalyzerResponse> for MockRa {
 }
 
 struct MockGit;
-#[async_trait]
 impl IOProvider<GitRequest, GitResponse> for MockGit {
-    async fn invoke(&self, input: GitRequest) -> Result<GitResponse> {
+    fn invoke(&self, input: GitRequest) -> Result<GitResponse> {
         Ok(match input {
             GitRequest::WalkRustFiles { .. } => {
                 GitResponse { success: true, output: "src/lib.rs\n".to_string() }
@@ -159,17 +153,15 @@ impl IOProvider<GitRequest, GitResponse> for MockGit {
 }
 
 struct MockFs;
-#[async_trait]
 impl IOProvider<FileSystemRequest, FileSystemResponse> for MockFs {
-    async fn invoke(&self, input: FileSystemRequest) -> Result<FileSystemResponse> {
+    fn invoke(&self, input: FileSystemRequest) -> Result<FileSystemResponse> {
         Ok(FileSystemResponse { path: input.dir.join(&input.filename) })
     }
 }
 
 struct MockAgent;
-#[async_trait]
 impl IOProvider<AgentRequest, AgentResponse> for MockAgent {
-    async fn invoke(&self, input: AgentRequest) -> Result<AgentResponse> {
+    fn invoke(&self, input: AgentRequest) -> Result<AgentResponse> {
         let _ = input;
         Ok(AgentResponse { success: true, stdout: "No bug found.".to_string() })
     }
@@ -177,8 +169,8 @@ impl IOProvider<AgentRequest, AgentResponse> for MockAgent {
 
 // ── The test ────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn python_script_failure_goes_to_the_fixer_not_the_unknown_bucket() {
+#[test]
+fn python_script_failure_goes_to_the_fixer_not_the_unknown_bucket() {
     let project = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(project.path().join(".git")).expect("create .git marker");
 
@@ -199,7 +191,7 @@ async fn python_script_failure_goes_to_the_fixer_not_the_unknown_bucket() {
         &mocks,
         &pm,
     )
-    .await
+    
     .expect("machine ran");
 
     let fixer_prompts = llm.fixer_prompts.lock().expect("fixer log lock");

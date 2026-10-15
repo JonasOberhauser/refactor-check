@@ -6,7 +6,7 @@ use crate::result::AgentResult;
 use crate::provider::{DynLlmProvider, DynSolverProvider};
 use crate::states::*;
 
-pub async fn run(
+pub fn run(
     input_content: &str,
     llm: &DynLlmProvider,
     solver: &DynSolverProvider,
@@ -24,7 +24,7 @@ pub async fn run(
     });
 
     loop {
-        state = match state.execute(llm, solver, pm).await? {
+        state = match state.execute(llm, solver, pm)? {
             Step::State(next) => next,
             Step::Result(result) => return Ok(result),
         };

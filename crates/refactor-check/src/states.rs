@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
 
 pub use crate::piece::CodePiece;
 use crate::piece_manager::PieceManager;
@@ -13,9 +12,8 @@ pub enum Step {
     Result(AgentResult),
 }
 
-#[async_trait]
 pub trait AlgorithmState: Send + Sync {
-    async fn execute(
+    fn execute(
         self: Box<Self>,
         llm: &DynLlmProvider,
         solver: &DynSolverProvider,

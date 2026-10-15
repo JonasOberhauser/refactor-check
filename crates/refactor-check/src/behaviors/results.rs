@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use futures::future;
 use tracing::debug;
 
 use crate::phase::PiecePhase;
@@ -14,20 +13,20 @@ use crate::transitions;
 use super::child_judge;
 use super::generation;
 
-pub async fn execute_all(
+pub fn execute_all(
     branches: Vec<FormulaBranch>,
     llm: &DynLlmProvider,
     solver: &DynSolverProvider,
     pm: &dyn PieceManager,
 ) -> Result<Vec<ChildDone>> {
-    let futures = branches
-        .into_iter()
-        .map(|branch| run_branch(branch, llm, solver, pm));
-    let results: Vec<Vec<ChildDone>> = future::try_join_all(futures).await?;
-    Ok(results.into_iter().flatten().collect())
+    let mut results = Vec::new();
+    for branch in branches {
+        results.extend(run_branch(branch, llm, solver, pm)?);
+    }
+    Ok(results)
 }
 
-async fn run_branch(
+fn run_branch(
     branch: FormulaBranch,
     llm: &DynLlmProvider,
     solver: &DynSolverProvider,
@@ -45,7 +44,7 @@ async fn run_branch(
                 piece.with_ctx(|ctx| pm.expect_any_and_set(ctx, &[PiecePhase::Forming, PiecePhase::Fixing], PiecePhase::Solving));
                 debug!(ctx = %piece.ctx_display(), label = %piece.label(), "running solver");
                 let ctx = piece.take_context().map_err(anyhow::Error::msg)?;
-                let resp = solver.invoke(SolverRequest { formula: formula.clone(), context_id: ctx }).await?;
+                let resp = solver.invoke(SolverRequest { formula: formula.clone(), context_id: ctx })?;
                 piece.restore_context(resp.context_id);
                 let result = resp.value;
                 debug!(ctx = %piece.ctx_display(), label = %piece.label(), outcome = ?result.outcome, "solver done");
@@ -85,7 +84,7 @@ async fn run_branch(
             } => {
                 let verdict = child_judge::execute(
                     &piece, &formula, &solver_result, llm, &input_content,
-                ).await?;
+                )?;
                 current_formula = formula.clone();
                 match transitions::transition_judge(
                     formula,
@@ -153,7 +152,7 @@ async fn run_branch(
                             &piece, fb, prev, &input_content,
                         ),
                         context_id: ctx,
-                    }).await?
+                    })?
                 } else {
                     debug!(ctx = %piece.ctx_display(), label = %piece.label(), "fixer retry for piece");
                     llm.invoke(LlmRequest {
@@ -163,7 +162,7 @@ async fn run_branch(
                             solver_stdout, solver_stderr, &input_content,
                         ),
                         context_id: ctx,
-                    }).await?
+                    })?
                 };
                 piece.restore_context(resp.context_id);
                 let response = resp.value;
