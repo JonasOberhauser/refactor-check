@@ -10,7 +10,7 @@ use crate::smt::SolverOutcome;
 
 pub use crate::smt::DEFAULT_SOLVER_TIMEOUT_SECS;
 
-pub async fn run(
+pub fn run(
     input_file: &str,
     config: Arc<LiveConfig<AppConfig>>,
     error_gate: Option<Arc<ErrorGate>>,
@@ -26,7 +26,7 @@ pub async fn run(
     }
     let pm = DefaultPieceManager::new();
 
-    let result = crate::machine::run(&input_content, &llm, &solver, &pm).await?;
+    let result = crate::machine::run(&input_content, &llm, &solver, &pm)?;
     println!(
         "=== Overall Equivalent ===\n{}\n",
         result.overall_equivalent

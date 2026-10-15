@@ -6,7 +6,7 @@ use crate::provider::Providers;
 use crate::result::VerificationResult;
 use crate::states::{AlgorithmState, PreflightGit, Step};
 
-pub async fn run(
+pub fn run(
     project_path: &str,
     providers: &Providers<'_>,
     pm: &dyn DeductivePieceManager,
@@ -15,7 +15,7 @@ pub async fn run(
     let mut state: Box<dyn AlgorithmState> = Box::new(PreflightGit::new(project_path));
 
     loop {
-        state = match state.execute(providers, pm).await? {
+        state = match state.execute(providers, pm)? {
             Step::State(next) => {
                 info!("State transition complete");
                 next

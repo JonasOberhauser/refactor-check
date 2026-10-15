@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
-use async_trait::async_trait;
 use refactor_check_core::context_id::ContextId;
 use tracing::{debug, info, warn};
 
@@ -52,9 +51,8 @@ pub enum Step {
     Result(VerificationResult),
 }
 
-#[async_trait]
 pub trait AlgorithmState: Send + Sync + 'static {
-    async fn execute(
+    fn execute(
         self: Box<Self>,
         providers: &Providers<'_>,
         pm: &dyn crate::piece_manager::DeductivePieceManager,
@@ -83,11 +81,10 @@ impl PreflightGit {
         Self { project_path }
     }
 }
-#[async_trait]
 impl AlgorithmState for PreflightGit {
-    async fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
+    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking git");
-        let _resp = providers.git.invoke(GitRequest::CurrentCommitHash).await?;
+        let _resp = providers.git.invoke(GitRequest::CurrentCommitHash)?;
         info!("preflight: git OK");
         Ok(Step::State(Box::new(PreflightSolver { project_path: self.project_path })))
     }
@@ -96,15 +93,14 @@ impl AlgorithmState for PreflightGit {
 pub struct PreflightSolver {
     project_path: PathBuf,
 }
-#[async_trait]
 impl AlgorithmState for PreflightSolver {
-    async fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
+    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking z3 solver");
         let root = ContextId::root();
         let resp = providers.solver.invoke(SolverRequest {
             formula: "(check-sat)".to_string(),
             context_id: Box::new(root.new_child()),
-        }).await?;
+        })?;
         info!(ctx = %resp.context_id, "preflight: solver OK");
         Ok(Step::State(Box::new(PreflightPython { project_path: self.project_path })))
     }
@@ -113,13 +109,12 @@ impl AlgorithmState for PreflightSolver {
 pub struct PreflightPython {
     project_path: PathBuf,
 }
-#[async_trait]
 impl AlgorithmState for PreflightPython {
-    async fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
+    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking python3");
         let _resp = providers.python.invoke(PythonRequest {
             script: r#"print("(check-sat)")"#.to_string(),
-        }).await?;
+        })?;
         info!("preflight: python3 OK");
         Ok(Step::State(Box::new(PreflightAgent { project_path: self.project_path })))
     }
@@ -128,9 +123,8 @@ impl AlgorithmState for PreflightPython {
 pub struct PreflightAgent {
     project_path: PathBuf,
 }
-#[async_trait]
 impl AlgorithmState for PreflightAgent {
-    async fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
+    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking opencode agent");
         let resp = providers.agent.invoke(AgentRequest {
             prompt: "Say OK".to_string(),
@@ -140,7 +134,7 @@ impl AlgorithmState for PreflightAgent {
             // gate, the user fixes it and hits RETRY (the agent re-reads
             // the live key on every call).
             recoverable: true,
-        }).await?;
+        })?;
         if !resp.success {
             anyhow::bail!("opencode agent check failed: {}", resp.stdout);
         }
@@ -152,13 +146,12 @@ impl AlgorithmState for PreflightAgent {
 pub struct PreflightProject {
     project_path: PathBuf,
 }
-#[async_trait]
 impl AlgorithmState for PreflightProject {
-    async fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
+    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking project files");
         let resp = providers.git.invoke(GitRequest::WalkRustFiles {
             path: self.project_path.clone(),
-        }).await?;
+        })?;
         let count = resp.output.lines().filter(|l| !l.is_empty()).count();
         if count == 0 {
             anyhow::bail!("no .rs files found in project");
@@ -169,9 +162,8 @@ impl AlgorithmState for PreflightProject {
     }
 }
 
-#[async_trait]
 impl AlgorithmState for Initializer {
-    async fn execute(
+    fn execute(
         self: Box<Self>,
         providers: &Providers<'_>,
         _pm: &dyn crate::piece_manager::DeductivePieceManager,
@@ -183,28 +175,25 @@ impl AlgorithmState for Initializer {
         // subcrate of a bigger repo has no .git of its own, and git-init'ing
         // a nested repo there would be wrong; we branch in the enclosing
         // repo instead.
-        let repo_root = providers.git.invoke(GitRequest::RepoRoot).await?;
+        let repo_root = providers.git.invoke(GitRequest::RepoRoot)?;
         if !repo_root.success {
             info!(project = %self.project_path.display(), "not inside a git work tree, initializing git repo");
             let resp = providers
                 .git
-                .invoke(GitRequest::Init { path: self.project_path.clone() })
-                .await?;
+                .invoke(GitRequest::Init { path: self.project_path.clone() })?;
             if !resp.success {
                 anyhow::bail!("Failed to init git repo: {}", resp.output);
             }
             info!("adding rust files to git");
             let resp = providers
                 .git
-                .invoke(GitRequest::AddAll { path: self.project_path.clone() })
-                .await?;
+                .invoke(GitRequest::AddAll { path: self.project_path.clone() })?;
             if !resp.success {
                 anyhow::bail!("Failed to add files: {}", resp.output);
             }
             let resp = providers
                 .git
-                .invoke(GitRequest::Commit { message: "Initial commit".to_string() })
-                .await?;
+                .invoke(GitRequest::Commit { message: "Initial commit".to_string() })?;
             if !resp.success {
                 anyhow::bail!("Failed to create initial commit: {}", resp.output);
             }
@@ -218,8 +207,7 @@ impl AlgorithmState for Initializer {
             .git
             .invoke(GitRequest::CreateBranch {
                 name: branch_name.clone(),
-            })
-            .await?;
+            })?;
         info!("IO response: git CreateBranch");
         if !resp.success {
             anyhow::bail!("Failed to create verification branch: {}", resp.output);
@@ -231,8 +219,7 @@ impl AlgorithmState for Initializer {
             .git
             .invoke(GitRequest::CreateDirectory {
                 path: verification_dir.clone(),
-            })
-            .await?;
+            })?;
         info!("IO response: git CreateDirectory");
         if !resp.success {
             anyhow::bail!("Failed to create verification directory: {}", resp.output);
@@ -243,8 +230,7 @@ impl AlgorithmState for Initializer {
             .git
             .invoke(GitRequest::WalkRustFiles {
                 path: self.project_path.clone(),
-            })
-            .await?;
+            })?;
         let mut all_rust_files: Vec<PathBuf> = resp
             .output
             .lines()
@@ -273,9 +259,8 @@ pub struct FunctionLister {
     accumulated_bugs: Vec<BugReport>,
 }
 
-#[async_trait]
 impl AlgorithmState for FunctionLister {
-    async fn execute(
+    fn execute(
         self: Box<Self>,
         providers: &Providers<'_>,
         _pm: &dyn crate::piece_manager::DeductivePieceManager,
@@ -286,8 +271,7 @@ impl AlgorithmState for FunctionLister {
             .invoke(RustAnalyzerRequest::ListFunctions {
                 files: self.files.clone(),
                 cfg_verification: true,
-            })
-            .await?;
+            })?;
         info!("IO response: rust-analyzer ListFunctions");
 
         let functions = match resp {
@@ -397,42 +381,31 @@ pub struct FunctionAnalyzer {
     accumulated_bugs: Vec<BugReport>,
 }
 
-#[async_trait]
 impl AlgorithmState for FunctionAnalyzer {
-    async fn execute(
+    fn execute(
         self: Box<Self>,
         providers: &Providers<'_>,
         _pm: &dyn crate::piece_manager::DeductivePieceManager,
     ) -> Result<Step> {
-        let mut futs = Vec::new();
+        let mut function_bodies = Vec::new();
         for (file, function_ids) in &self.functions {
             for fid in function_ids {
-                let file = file.clone();
-                let fid = fid.clone();
-                let fut = async {
-                    debug!("IO: rust-analyzer GetFunctionCode");
-                    let resp = providers
-                        .rust_analyzer
-                        .invoke(RustAnalyzerRequest::GetFunctionCode {
-                            function_id: fid.clone(),
-                        })
-                        .await?;
-                    debug!("IO response: rust-analyzer GetFunctionCode");
-                    let body = match resp {
-                        RustAnalyzerResponse::FunctionCode(code) => code,
-                        _ => anyhow::bail!("Expected FunctionCode from rust-analyzer"),
-                    };
-                    Ok::<_, anyhow::Error>((file, fid, body))
+                debug!("IO: rust-analyzer GetFunctionCode");
+                let resp = providers
+                    .rust_analyzer
+                    .invoke(RustAnalyzerRequest::GetFunctionCode {
+                        function_id: fid.clone(),
+                    })?;
+                debug!("IO response: rust-analyzer GetFunctionCode");
+                let body = match resp {
+                    RustAnalyzerResponse::FunctionCode(code) => code,
+                    _ => anyhow::bail!("Expected FunctionCode from rust-analyzer"),
                 };
-                futs.push(fut);
+                if !body.trim().is_empty() {
+                    function_bodies.push((file.clone(), fid.clone(), body));
+                }
             }
         }
-
-        let function_bodies: Vec<(PathBuf, FunctionId, String)> = futures::future::try_join_all(futs)
-            .await?
-            .into_iter()
-            .filter(|(_, _, body)| !body.trim().is_empty())
-            .collect();
 
         Ok(Step::State(Box::new(Splitter {
             project_path: self.project_path,
@@ -454,19 +427,16 @@ pub struct Splitter {
     accumulated_bugs: Vec<BugReport>,
 }
 
-#[async_trait]
 impl AlgorithmState for Splitter {
-    async fn execute(
+    fn execute(
         self: Box<Self>,
         providers: &Providers<'_>,
         pm: &dyn crate::piece_manager::DeductivePieceManager,
     ) -> Result<Step> {
         let root_ctx = ContextId::root();
-        let futs: Vec<_> = self.function_bodies.iter().map(|(file, fid, body)| {
+        let results: Vec<_> = self.function_bodies.iter().map(|(file, fid, body)| {
             split_function(providers, pm, root_ctx, file, fid, body)
-        }).collect();
-
-        let results = futures::future::try_join_all(futs).await?;
+        }).collect::<Result<Vec<_>>>()?;
 
         for (_file, fid, _body) in &self.function_bodies {
             if let Some(docs) = self.function_docs.get(fid) {
@@ -487,7 +457,7 @@ impl AlgorithmState for Splitter {
     }
 }
 
-async fn split_function(
+fn split_function(
     providers: &Providers<'_>,
     pm: &dyn crate::piece_manager::DeductivePieceManager,
     root_ctx: &ContextId,
@@ -521,8 +491,7 @@ async fn split_function(
                 role: LlmRole::Splitter,
                 messages,
                 context_id: Box::new(func_ctx),
-            })
-            .await?;
+            })?;
         func_ctx = *resp.context_id;
         info!(%func_ctx, "IO response: splitter");
         let response = resp.value;
@@ -611,7 +580,7 @@ struct PieceOutcome {
     unverified: Option<UnverifiedPiece>,
 }
 
-async fn gather_context(
+fn gather_context(
     piece: &ArcCodePiece,
     ctx: &ContextId,
     providers: &Providers<'_>,
@@ -622,8 +591,7 @@ async fn gather_context(
         .rust_analyzer
         .invoke(RustAnalyzerRequest::GetCalledFunctions {
             function_id: piece.function_id().clone(),
-        })
-        .await?;
+        })?;
 
     let called_functions = match resp {
         RustAnalyzerResponse::CalledFunctionList(fns) => fns,
@@ -631,38 +599,28 @@ async fn gather_context(
     };
     info!(%ctx, "IO response: {} called functions", called_functions.len());
 
-    let futs: Vec<_> = called_functions.into_iter().map(|cf| {
-        async move {
-            let name = cf.name.clone();
-            info!(%ctx, "IO: rust-analyzer GetCalledFunctionCode");
-            let resp = providers
-                .rust_analyzer
-                .invoke(RustAnalyzerRequest::GetCalledFunctionCode {
-                    called: cf,
-                })
-                .await?;
-            info!(%ctx, "IO response: rust-analyzer GetCalledFunctionCode");
-            let result = match resp {
-                RustAnalyzerResponse::CalledFunctionCode(r) => r,
-                _ => return Ok::<_, anyhow::Error>(None),
-            };
-            if result.code.starts_with("// Could not find") {
-                return Ok(None);
-            }
-            let docs_section = if result.docs.is_empty() {
-                String::new()
-            } else {
-                format!("\nDocumentation:\n{}", result.docs)
-            };
-            Ok(Some(format!("--- {} ---\n{}{}", name, result.code, docs_section)))
+    let mut context_parts = Vec::new();
+    for cf in called_functions {
+        let name = cf.name.clone();
+        info!(%ctx, "IO: rust-analyzer GetCalledFunctionCode");
+        let resp = providers
+            .rust_analyzer
+            .invoke(RustAnalyzerRequest::GetCalledFunctionCode { called: cf })?;
+        info!(%ctx, "IO response: rust-analyzer GetCalledFunctionCode");
+        let result = match resp {
+            RustAnalyzerResponse::CalledFunctionCode(r) => r,
+            _ => continue,
+        };
+        if result.code.starts_with("// Could not find") {
+            continue;
         }
-    }).collect();
-
-    let context_parts: Vec<String> = futures::future::try_join_all(futs)
-        .await?
-        .into_iter()
-        .flatten()
-        .collect();
+        let docs_section = if result.docs.is_empty() {
+            String::new()
+        } else {
+            format!("\nDocumentation:\n{}", result.docs)
+        };
+        context_parts.push(format!("--- {} ---\n{}{}", name, result.code, docs_section));
+    }
 
     if context_parts.is_empty() {
         Ok("(no called functions found)".to_string())
@@ -671,7 +629,7 @@ async fn gather_context(
     }
 }
 
-async fn formalize_piece(
+fn formalize_piece(
     piece: &ArcCodePiece,
     ctx: ContextId,
     context: &str,
@@ -698,15 +656,14 @@ async fn formalize_piece(
                 role: LlmRole::Formalizer,
                 messages,
                 context_id: Box::new(ctx),
-            })
-            .await?;
+            })?;
     let ctx = *resp.context_id;
     info!(%ctx, "IO response: formalizer");
 
     Ok((resp.value, ctx))
 }
 
-async fn check_formula(
+fn check_formula(
     formula_content: &str,
     formula_source: &FormulaSource,
     piece_ctx: &ContextId,
@@ -718,7 +675,7 @@ async fn check_formula(
 
     pm.advance_formula(&fctx, Some(FormulaPhase::Open), FormulaPhase::Check);
 
-    let smt_content = match translate_formula(formula_content, formula_source, &fctx, providers).await {
+    let smt_content = match translate_formula(formula_content, formula_source, &fctx, providers) {
         Ok(smt) => smt,
         Err(e) => {
             warn!(%fctx, error = %e, "Formula translation failed; routing to fixer");
@@ -733,8 +690,7 @@ async fn check_formula(
             .invoke(SolverRequest {
                 formula: smt_content.clone(),
                 context_id: Box::new(fctx),
-            })
-            .await?;
+            })?;
     let fctx = *resp.context_id;
     let result = resp.value;
     info!(%fctx, outcome = ?result.outcome, "IO response: solver");
@@ -746,7 +702,7 @@ async fn check_formula(
     Ok((formula, fctx, outcome, smt_content))
 }
 
-async fn fix_formula(
+fn fix_formula(
     formula_content: &str,
     error: &str,
     fctx: ContextId,
@@ -766,15 +722,14 @@ async fn fix_formula(
                 role: LlmRole::Fixer,
                 messages,
                 context_id: Box::new(fctx),
-            })
-            .await?;
+            })?;
     let fctx = *resp.context_id;
     info!(%fctx, "IO response: fixer");
 
     Ok((resp.value, fctx))
 }
 
-async fn translate_formula(
+fn translate_formula(
     content: &str,
     source: &FormulaSource,
     formula_ctx: &ContextId,
@@ -788,8 +743,7 @@ async fn translate_formula(
                 .python
                 .invoke(PythonRequest {
                     script: content.to_string(),
-                })
-                .await?;
+                })?;
             info!(%formula_ctx, "IO response: python translated");
 
             if resp.smtlib.is_empty() {
@@ -800,7 +754,7 @@ async fn translate_formula(
     }
 }
 
-async fn check_and_fix_formula(
+fn check_and_fix_formula(
     ef: &crate::formula::ExtractedFormula,
     piece_ctx: &ContextId,
     providers: &Providers<'_>,
@@ -811,7 +765,7 @@ async fn check_and_fix_formula(
 ) -> Result<(crate::formula::Formula, SolverOutcome, ContextId)> {
     let (mut formula, mut fctx, mut outcome, mut current_smt) = check_formula(
         &ef.content, &ef.source, piece_ctx, providers, pm, iteration,
-    ).await?;
+    )?;
 
     let mut fix_attempts = 0;
     let mut error_msg = match &outcome {
@@ -821,7 +775,7 @@ async fn check_and_fix_formula(
     while matches!(outcome, SolverOutcome::Error(_)) && fix_attempts < max_fix_attempts {
         info!(%fctx, fix_attempts, "Attempting to fix formula");
 
-        let (fixed_response, fctx2) = fix_formula(&current_smt, &error_msg, fctx, &piece_ctx_info.called_functions, &piece_ctx_info.docs_section, providers).await?;
+        let (fixed_response, fctx2) = fix_formula(&current_smt, &error_msg, fctx, &piece_ctx_info.called_functions, &piece_ctx_info.docs_section, providers)?;
         fctx = fctx2;
         let fixed_extracted = crate::formula::extract_formulas_from_response(&fixed_response);
 
@@ -832,7 +786,7 @@ async fn check_and_fix_formula(
 
         let fixed_ef = &fixed_extracted[0];
 
-        let translated = match translate_formula(&fixed_ef.content, &fixed_ef.source, &fctx, providers).await {
+        let translated = match translate_formula(&fixed_ef.content, &fixed_ef.source, &fctx, providers) {
             Ok(smt) => smt,
             Err(e) => {
                 warn!(%fctx, fix_attempts, error = %e, "Failed to translate fixed formula; feeding error back to fixer");
@@ -855,8 +809,7 @@ async fn check_and_fix_formula(
             .invoke(SolverRequest {
                 formula: translated.clone(),
                 context_id: Box::new(fctx),
-            })
-            .await?;
+            })?;
         fctx = *resp.context_id;
         let fixed_result = resp.value;
         info!(%fctx, outcome = ?fixed_result.outcome, "IO response: solver");
@@ -882,7 +835,7 @@ async fn check_and_fix_formula(
     Ok((formula, outcome, fctx))
 }
 
-async fn judge_piece(
+fn judge_piece(
     piece: &ArcCodePiece,
     ctx: ContextId,
     formulas_summary: &str,
@@ -902,8 +855,7 @@ async fn judge_piece(
                 role: LlmRole::Judge,
                 messages: messages.clone(),
                 context_id: Box::new(ctx),
-            })
-            .await?;
+            })?;
 
     let mut response = resp.value;
     let mut ctx = *resp.context_id;
@@ -930,8 +882,7 @@ async fn judge_piece(
                 role: LlmRole::Judge,
                 messages: messages.clone(),
                 context_id: Box::new(ctx),
-            })
-            .await?;
+            })?;
 
         response = resp.value;
         ctx = *resp.context_id;
@@ -941,7 +892,7 @@ async fn judge_piece(
     Ok((response, ctx))
 }
 
-async fn process_piece(
+fn process_piece(
     piece: &ArcCodePiece,
     mut ctx: ContextId,
     providers: &Providers<'_>,
@@ -952,7 +903,7 @@ async fn process_piece(
 
     pm.expect_piece_phase_and_set(&ctx, &[CodePiecePhase::Open], CodePiecePhase::GetContext);
 
-    let context = gather_context(piece, &ctx, providers).await?;
+    let context = gather_context(piece, &ctx, providers)?;
     info!(%ctx, "Gathered context for piece");
 
     let own_docs = pm.get_function_docs(piece.function_id());
@@ -968,7 +919,7 @@ async fn process_piece(
     for judge_attempt in 0..max_judge_attempts {
         pm.advance_piece(&ctx, Some(CodePiecePhase::GetContext), CodePiecePhase::Formalizer);
 
-        let (formalizer_response, ctx2) = formalize_piece(piece, ctx, &context, &elaboration, &own_docs_section, providers).await?;
+        let (formalizer_response, ctx2) = formalize_piece(piece, ctx, &context, &elaboration, &own_docs_section, providers)?;
         ctx = ctx2;
         info!(%ctx, judge_attempt, "formalizer step done");
 
@@ -990,15 +941,13 @@ async fn process_piece(
             docs_section: own_docs_section.clone(),
         };
 
-        let formula_futs: Vec<_> = extracted.iter().map(|ef| {
+        let formula_results: Vec<_> = extracted.iter().map(|ef| {
             check_and_fix_formula(
                 ef, &ctx, providers, pm,
                 iteration, max_fix_attempts,
                 &piece_ctx_info,
             )
         }).collect();
-
-        let formula_results = futures::future::join_all(formula_futs).await;
 
         let mut unsat_count = 0usize;
         let mut sat_models = Vec::new();
@@ -1044,7 +993,7 @@ async fn process_piece(
                     filename,
                     content: ef.content.clone(),
                 })
-                .await;
+                ;
             info!(%ctx, "IO response: formula written");
         }
 
@@ -1054,7 +1003,7 @@ async fn process_piece(
             .invoke(GitRequest::AddFiles {
                 paths: vec![verification_dir.to_path_buf()],
             })
-            .await;
+            ;
         info!(%ctx, "IO response: files added");
         info!(%ctx, "IO: git Commit");
         let _ = providers
@@ -1062,13 +1011,13 @@ async fn process_piece(
             .invoke(GitRequest::Commit {
                 message: format!("Add formulas for ctx {} (iteration {})", ctx, judge_attempt),
             })
-            .await;
+            ;
         info!(%ctx, "IO response: committed");
 
         pm.advance_piece(&ctx, Some(CodePiecePhase::Check), CodePiecePhase::Judge);
 
         let formulas_summary = formula_summaries.join("\n");
-        let (judge_response, ctx2) = judge_piece(piece, ctx, &formulas_summary, &piece_ctx_info, providers).await?;
+        let (judge_response, ctx2) = judge_piece(piece, ctx, &formulas_summary, &piece_ctx_info, providers)?;
         ctx = ctx2;
         info!(%ctx, judge_attempt, "judge step done");
 
@@ -1140,9 +1089,8 @@ async fn process_piece(
     })
 }
 
-#[async_trait]
 impl AlgorithmState for FullFormalizer {
-    async fn execute(
+    fn execute(
         self: Box<Self>,
         providers: &Providers<'_>,
         pm: &dyn crate::piece_manager::DeductivePieceManager,
@@ -1162,11 +1110,9 @@ impl AlgorithmState for FullFormalizer {
 
         let ctx_labels: Vec<String> = ctxs_only.iter().map(|c| c.to_string()).collect();
 
-        let futs: Vec<_> = pieces_only.iter().zip(ctxs_only).map(|(piece, ctx)| {
+        let results: Vec<_> = pieces_only.iter().zip(ctxs_only).map(|(piece, ctx)| {
             process_piece(piece, ctx, providers, pm, &verification_dir)
         }).collect();
-
-        let results = futures::future::join_all(futs).await;
 
         let mut closed_pieces = Vec::new();
         let mut unverified_pieces = Vec::new();
@@ -1232,9 +1178,8 @@ pub struct ProblemAnalyzer {
     total_functions: usize,
 }
 
-#[async_trait]
 impl AlgorithmState for ProblemAnalyzer {
-    async fn execute(
+    fn execute(
         self: Box<Self>,
         providers: &Providers<'_>,
         _pm: &dyn crate::piece_manager::DeductivePieceManager,
@@ -1251,7 +1196,7 @@ impl AlgorithmState for ProblemAnalyzer {
 
         let base_commit = if self.base_commit.is_empty() {
             info!("IO: git CurrentCommitHash");
-            let resp = providers.git.invoke(GitRequest::CurrentCommitHash).await?;
+            let resp = providers.git.invoke(GitRequest::CurrentCommitHash)?;
             resp.output.trim().to_string()
         } else {
             self.base_commit.clone()
@@ -1272,7 +1217,7 @@ impl AlgorithmState for ProblemAnalyzer {
                 .invoke(RustAnalyzerRequest::GetFileContent {
                     path: piece.file.clone(),
                 })
-                .await
+                
             {
                 Ok(RustAnalyzerResponse::FileContent(s)) if !s.is_empty() => s,
                 Ok(_) => {
@@ -1366,8 +1311,7 @@ If you respond RETRY, make sure to commit your changes first."#,
                     working_directory: self.project_path.clone(),
                     files_to_read: vec![piece.file.clone()],
                     recoverable: true,
-                })
-                .await?;
+                })?;
             info!("IO response: agent responded");
 
             let response = agent_resp.stdout.trim().to_string();
@@ -1380,7 +1324,7 @@ If you respond RETRY, make sure to commit your changes first."#,
                     .invoke(GitRequest::AddFiles {
                         paths: vec![piece.file.clone()],
                     })
-                    .await;
+                    ;
                 info!("IO response: files added");
                 info!("IO: git Commit");
                 let _ = providers
@@ -1388,7 +1332,7 @@ If you respond RETRY, make sure to commit your changes first."#,
                     .invoke(GitRequest::Commit {
                         message: format!("Agent fix for {} at {}:{}", piece.function_id.display_name(), piece.file.display(), piece.start_line),
                     })
-                    .await;
+                    ;
                 info!("IO response: committed");
 
                 remaining_unverified.push(piece.clone());
@@ -1442,9 +1386,8 @@ pub struct Restarter {
     accumulated_bugs: Vec<BugReport>,
 }
 
-#[async_trait]
 impl AlgorithmState for Restarter {
-    async fn execute(
+    fn execute(
         self: Box<Self>,
         providers: &Providers<'_>,
         _pm: &dyn crate::piece_manager::DeductivePieceManager,
@@ -1454,8 +1397,7 @@ impl AlgorithmState for Restarter {
             .git
             .invoke(GitRequest::FindChangedRustFiles {
                 base_commit: self.base_commit.clone(),
-            })
-            .await?;
+            })?;
 
         let changed_files: Vec<PathBuf> = if resp.success {
             resp.output

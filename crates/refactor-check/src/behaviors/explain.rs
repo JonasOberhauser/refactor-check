@@ -1,5 +1,4 @@
 use anyhow::Result;
-use futures::future;
 use refactor_check_core::context_id::ContextId;
 use tracing::{info, warn};
 
@@ -8,7 +7,7 @@ use crate::provider::{DynLlmProvider, LlmRequest, LlmRole};
 use crate::smt::SolverOutcome;
 use crate::states::WaitForExplanation;
 
-pub async fn execute(
+pub fn execute(
     state: &WaitForExplanation,
     llm: &DynLlmProvider,
     parent_ctx: &ContextId,
@@ -28,16 +27,15 @@ pub async fn execute(
 
     info!(count = needs_explanation.len(), "generating bug explanations");
 
-    let futures = needs_explanation.iter().map(|(i, formula, outcome)| {
-        let messages = build_explanation_messages(&state.input_content, formula, outcome);
-        let ctx = parent_ctx.new_child();
-        async move {
-            let resp = llm.invoke(LlmRequest { role: LlmRole::Fixer, messages, context_id: Box::new(ctx) }).await;
+    let results: Vec<(usize, Result<String>)> = needs_explanation
+        .iter()
+        .map(|(i, formula, outcome)| {
+            let messages = build_explanation_messages(&state.input_content, formula, outcome);
+            let ctx = parent_ctx.new_child();
+            let resp = llm.invoke(LlmRequest { role: LlmRole::Fixer, messages, context_id: Box::new(ctx) });
             (*i, resp.map(|r| r.value))
-        }
-    });
-
-    let results = future::join_all(futures).await;
+        })
+        .collect();
 
     let total = state.result.formulas.len();
     let mut explanations = vec![None; total];

@@ -6,7 +6,7 @@ use crate::piece_manager::PieceManager;
 use crate::provider::{DynLlmProvider, LlmRequest, LlmRole};
 use crate::states::{CodePiece, WaitForSplit};
 
-pub async fn execute(
+pub fn execute(
     state: &WaitForSplit,
     llm: &DynLlmProvider,
     pm: &dyn PieceManager,
@@ -15,7 +15,7 @@ pub async fn execute(
     let mut split_ctx = parent_ctx.new_child();
     for attempt in 0..3 {
         let messages = build_split_messages(state);
-        let resp = llm.invoke(LlmRequest { role: LlmRole::Splitter, messages, context_id: Box::new(split_ctx) }).await?;
+        let resp = llm.invoke(LlmRequest { role: LlmRole::Splitter, messages, context_id: Box::new(split_ctx) })?;
         split_ctx = *resp.context_id;
         let response = resp.value;
         let pieces = extract_split_pieces(&response, pm, &split_ctx);

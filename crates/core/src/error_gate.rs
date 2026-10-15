@@ -48,7 +48,7 @@ impl ErrorGate {
     /// Panics if the parked-list lock is poisoned — only pure Vec ops run
     /// under it, so poisoning would mean a lock discipline was broken
     /// elsewhere.
-    pub async fn report_and_wait(&self, error: &str) -> Result<(), ShutdownRequested> {
+    pub fn report_and_wait(&self, error: &str) -> Result<(), ShutdownRequested> {
         let my_epoch = self.epoch.load(Ordering::Acquire);
         let _ = self.tx.send(error.to_string());
         // Only pure Vec ops run under this lock, so no panic can
@@ -65,7 +65,7 @@ impl ErrorGate {
             if self.epoch.load(Ordering::Acquire) != my_epoch {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            std::thread::sleep(Duration::from_millis(200));
         }
         self.unregister(error);
         eprintln!("[error gate] resuming (continue received)");
@@ -84,18 +84,18 @@ impl ErrorGate {
 mod tests {
     use super::*;
 
-    async fn eventually(what: impl Fn() -> bool) {
+    fn eventually(what: impl Fn() -> bool) {
         for _ in 0..200 {
             if what() {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            std::thread::sleep(Duration::from_millis(10));
         }
         panic!("condition never became true");
     }
 
-    #[tokio::test]
-    async fn parking_registers_and_continue_clears() {
+    #[test]
+    fn parking_registers_and_continue_clears() {
         let epoch = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (tx, _rx) = mpsc::channel();
@@ -108,20 +108,20 @@ mod tests {
         ));
 
         let g = gate.clone();
-        let handle = tokio::spawn(async move { g.report_and_wait("z3 exploded").await });
+        let handle = std::thread::spawn(move || g.report_and_wait("z3 exploded"));
 
-        eventually(|| parked.lock().unwrap().len() == 1).await;
+        eventually(|| parked.lock().unwrap().len() == 1);
         assert_eq!(parked.lock().unwrap()[0], "z3 exploded");
 
         // 'continue' bumps the epoch -> the parked thread resumes and
         // unregisters itself.
         epoch.store(1, Ordering::Release);
-        handle.await.unwrap().unwrap();
+        handle.join().unwrap().unwrap();
         assert!(parked.lock().unwrap().is_empty(), "release must clear the parked list");
     }
 
-    #[tokio::test]
-    async fn shutdown_releases_and_clears() {
+    #[test]
+    fn shutdown_releases_and_clears() {
         let epoch = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (tx, _rx) = mpsc::channel();
@@ -134,11 +134,11 @@ mod tests {
         ));
 
         let g = gate.clone();
-        let handle = tokio::spawn(async move { g.report_and_wait("opencode auth failed").await });
-        eventually(|| parked.lock().unwrap().len() == 1).await;
+        let handle = std::thread::spawn(move || g.report_and_wait("opencode auth failed"));
+        eventually(|| parked.lock().unwrap().len() == 1);
 
         shutdown.store(true, Ordering::Release);
-        let err = handle.await.unwrap().unwrap_err();
+        let err = handle.join().unwrap().unwrap_err();
         assert!(err.to_string().contains("shutdown"));
         assert!(parked.lock().unwrap().is_empty(), "abort must clear the parked list");
     }

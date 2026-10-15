@@ -104,9 +104,6 @@ fn main() -> Result<()> {
     let config_live = Arc::new(LiveConfig::new(AppConfig::from(&cli)));
     let input = cli.input.clone();
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(run(&input, config_live, None))?;
+    run(&input, config_live, None)?;
     Ok(())
 }

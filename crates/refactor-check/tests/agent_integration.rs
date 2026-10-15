@@ -1,7 +1,6 @@
 use std::sync::{Arc, Mutex};
 
 
-use async_trait::async_trait;
 use refactor_check::consts::JUDGE_REASONABLE;
 use refactor_check::machine;
 use refactor_check::provider::{IOProvider, SolverRequest, WithContext};
@@ -78,8 +77,8 @@ fn d() { 4 }"
 }
 
 /// No-split: splitter says one piece, happy path.
-#[test_log::test(tokio::test)]
-async fn test_split_no_split_happy_path() {
+#[test_log::test]
+fn test_split_no_split_happy_path() {
     let llm = SequenceLlm::with_accepting_judge(
         vec![formula_response_single()],
         vec![],
@@ -92,7 +91,7 @@ async fn test_split_no_split_happy_path() {
 
     let pm = test_pm();
     let result = machine::run("refactoring desc", &llm, &solver, &pm)
-        .await
+        
         .expect("agent should succeed");
 
     assert_eq!(result.formulas.len(), 1);
@@ -102,8 +101,8 @@ async fn test_split_no_split_happy_path() {
 }
 
 /// Splitter gives 2 pieces, each generates one formula.
-#[test_log::test(tokio::test)]
-async fn test_split_two_pieces() {
+#[test_log::test]
+fn test_split_two_pieces() {
     let llm = SequenceLlm::with_accepting_judge(
         vec![formula_response_single(), formula_response_single()],
         vec![],
@@ -119,7 +118,7 @@ async fn test_split_two_pieces() {
 
     let pm = test_pm();
     let result = machine::run("refactoring desc", &llm, &solver, &pm)
-        .await
+        
         .expect("agent should succeed");
 
     assert_eq!(result.formulas.len(), 2);
@@ -128,8 +127,8 @@ async fn test_split_two_pieces() {
 }
 
 /// Splitter gives 4 pieces, all verified.
-#[test_log::test(tokio::test)]
-async fn test_split_four_pieces() {
+#[test_log::test]
+fn test_split_four_pieces() {
     let llm = SequenceLlm::with_accepting_judge(
         vec![
             "\
@@ -160,7 +159,7 @@ Piece 4:\n```smt2\n(set-logic QF_LIA)\n(declare-fun e () Int)\n(declare-fun f ()
 
     let pm = test_pm();
     let result = machine::run("refactoring desc", &llm, &solver, &pm)
-        .await
+        
         .expect("agent should succeed");
 
     assert_eq!(result.formulas.len(), 4);
@@ -169,14 +168,13 @@ Piece 4:\n```smt2\n(set-logic QF_LIA)\n(declare-fun e () Int)\n(declare-fun f ()
 }
 
 /// One piece times out → splitter asked to resplit → children verified with UNSAT.
-#[test_log::test(tokio::test)]
-async fn test_split_timeout_resplit() {
+#[test_log::test]
+fn test_split_timeout_resplit() {
     struct ToggleSolver {
         call_count: Arc<Mutex<usize>>,
     }
-    #[async_trait]
-    impl IOProvider<SolverRequest, WithContext<SolverResult>> for ToggleSolver {
-        async fn invoke(&self, input: SolverRequest) -> anyhow::Result<WithContext<SolverResult>> {
+        impl IOProvider<SolverRequest, WithContext<SolverResult>> for ToggleSolver {
+        fn invoke(&self, input: SolverRequest) -> anyhow::Result<WithContext<SolverResult>> {
             let SolverRequest { context_id, .. } = input;
             let mut count = self.call_count.lock().expect("lock poisoned");
             *count += 1;
@@ -225,7 +223,7 @@ large code"
 
     let pm = test_pm();
     let result = machine::run("refactoring desc", &llm, &solver, &pm)
-        .await
+        
         .expect("agent should succeed");
 
     assert_eq!(result.formulas.len(), 2);
@@ -234,8 +232,8 @@ large code"
 }
 
 /// SAT result should be detected and not-equivalent reported.
-#[test_log::test(tokio::test)]
-async fn test_split_sat_result() {
+#[test_log::test]
+fn test_split_sat_result() {
     let llm = SequenceLlm::with_accepting_judge(
         vec![formula_response_single()],
         vec![],
@@ -248,7 +246,7 @@ async fn test_split_sat_result() {
 
     let pm = test_pm();
     let result = machine::run("refactoring desc", &llm, &solver, &pm)
-        .await
+        
         .expect("agent should succeed");
 
     assert_eq!(result.formulas.len(), 1);
@@ -257,8 +255,8 @@ async fn test_split_sat_result() {
 }
 
 /// Per-piece generator retries on empty response.
-#[test_log::test(tokio::test)]
-async fn test_split_generator_insist_then_ok() {
+#[test_log::test]
+fn test_split_generator_insist_then_ok() {
     let llm = SequenceLlm::with_accepting_judge(
         vec!["no formula here".to_string(), formula_response_single()],
         vec![],
@@ -271,7 +269,7 @@ async fn test_split_generator_insist_then_ok() {
 
     let pm = test_pm();
     let result = machine::run("refactoring desc", &llm, &solver, &pm)
-        .await
+        
         .expect("agent should succeed");
 
     assert_eq!(result.formulas.len(), 1);
@@ -279,8 +277,8 @@ async fn test_split_generator_insist_then_ok() {
 }
 
 /// Simple 1-piece verification with UNSAT.
-#[test_log::test(tokio::test)]
-async fn test_split_one_piece_unsat() {
+#[test_log::test]
+fn test_split_one_piece_unsat() {
     let llm = SequenceLlm::with_accepting_judge(
         vec![formula_response_single()],
         vec![],
@@ -293,7 +291,7 @@ async fn test_split_one_piece_unsat() {
 
     let pm = test_pm();
     let result = machine::run("refactoring desc", &llm, &solver, &pm)
-        .await
+        
         .expect("agent should succeed");
 
     assert_eq!(result.formulas.len(), 1);
@@ -301,8 +299,8 @@ async fn test_split_one_piece_unsat() {
 }
 
 /// Judge says retry for one piece of a split → generator fixes → verified.
-#[test_log::test(tokio::test)]
-async fn test_split_one_piece_judge_retry_then_verified() {
+#[test_log::test]
+fn test_split_one_piece_judge_retry_then_verified() {
     let llm = SequenceLlm::with_accepting_judge(
         vec![formula_response_single(), formula_response_single()],
         vec![formula_response_single()],
@@ -319,7 +317,7 @@ async fn test_split_one_piece_judge_retry_then_verified() {
 
     let pm = test_pm();
     let result = machine::run("refactoring desc", &llm, &solver, &pm)
-        .await
+        
         .expect("agent should succeed");
 
     assert_eq!(result.formulas.len(), 2);
@@ -328,8 +326,8 @@ async fn test_split_one_piece_judge_retry_then_verified() {
 }
 
 /// SAT piece with judge verifying it's a spurious SAT → overall not-equivalent.
-#[test_log::test(tokio::test)]
-async fn test_split_sat_piece_detected() {
+#[test_log::test]
+fn test_split_sat_piece_detected() {
     let llm = SequenceLlm::with_accepting_judge(
         vec![formula_response_single()],
         vec![],
@@ -342,7 +340,7 @@ async fn test_split_sat_piece_detected() {
 
     let pm = test_pm();
     let result = machine::run("refactoring desc", &llm, &solver, &pm)
-        .await
+        
         .expect("agent should succeed");
 
     assert_eq!(result.formulas.len(), 1);

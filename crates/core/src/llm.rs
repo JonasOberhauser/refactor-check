@@ -1,18 +1,166 @@
-use async_openai::types::chat::{
-    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
-    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestUserMessage,
-    ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest, FinishReason,
-};
-
-pub use async_openai::types::chat::ServiceTier;
 use anyhow::{Context, Result, bail};
-use async_trait::async_trait;
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::io::{BufRead, BufReader};
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::Duration;
 use tracing::{debug, info, instrument, trace, warn};
+
+/// Service tier for chat-completion requests (OpenAI-compatible).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceTier {
+    Auto,
+    Default,
+    Flex,
+    Scale,
+    Priority,
+}
+
+/// Why the model stopped generating (streamed `finish_reason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FinishReason {
+    Stop,
+    Length,
+    ToolCalls,
+    ContentFilter,
+    FunctionCall,
+}
+
+/// Socket wake-up interval for the SSE reader thread: the reader loops
+/// through read timeouts so a dropped [`SseStream`] shuts its thread down
+/// promptly instead of parking on a quiet socket forever.
+const SSE_SOCKET_WAKEUP: Duration = Duration::from_secs(1);
+/// Connection timeout for the initial HTTP POST.
+const SSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Sync OpenAI-compatible chat client: POSTs to `{api_base}/chat/completions`
+/// with `stream: true` and returns the raw SSE body reader.
+#[derive(Clone)]
+struct SyncChatClient {
+    agent: ureq::Agent,
+    api_key: String,
+    api_base: String,
+}
+
+impl SyncChatClient {
+    fn new(api_key: &str, api_base: &str) -> Self {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(SSE_CONNECT_TIMEOUT)
+            .timeout_read(SSE_SOCKET_WAKEUP)
+            .build();
+        Self { agent, api_key: api_key.to_string(), api_base: api_base.to_string() }
+    }
+
+    fn open_stream(&self, body: &serde_json::Value) -> Result<SseStream, String> {
+        let url = format!("{}/chat/completions", self.api_base.trim_end_matches('/'));
+        match self
+            .agent
+            .post(&url)
+            .set("Authorization", &format!("Bearer {}", self.api_key))
+            .set("Accept", "text/event-stream")
+            .send_json(body.clone())
+        {
+            Ok(response) => Ok(SseStream::new(response)),
+            Err(ureq::Error::Status(code, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                Err(format!("http status {code}: {body}"))
+            }
+            Err(e) => Err(format!("{e}")),
+        }
+    }
+}
+
+/// One parsed SSE event off the wire.
+enum SseEvent {
+    /// A `data: ...` payload.
+    Data(String),
+    /// End of stream (`data: [DONE]` or clean EOF).
+    Eof,
+    /// Transport error other than the periodic socket wake-up.
+    Error(String),
+}
+
+/// SSE body reader driven by its own thread; the consumer picks each event
+/// with a per-event timeout (the sync equivalent of
+/// `tokio::time::timeout(stream.next())`).
+///
+/// Dropping the receiver unblocks the reader thread: its next send fails,
+/// it drops the body, and the connection closes. Read timeouts on the
+/// socket are wake-ups, not errors — they keep the abandon path prompt
+/// without disturbing long idle gaps between tokens.
+struct SseStream {
+    rx: mpsc::Receiver<SseEvent>,
+}
+
+impl SseStream {
+    fn new(response: ureq::Response) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let _reader_thread = std::thread::spawn(move || {
+            let reader = response.into_reader();
+            let mut lines = BufReader::new(reader).lines();
+            loop {
+                match lines.next() {
+                    Some(Ok(line)) => {
+                        let line = line.trim_start();
+                        if let Some(payload) = line.strip_prefix("data:") {
+                            let payload = payload.trim();
+                            if payload == "[DONE]" {
+                                break;
+                            }
+                            if !payload.is_empty() && tx.send(SseEvent::Data(payload.to_string())).is_err() {
+                                break;
+                            }
+                        }
+                        // Non-data lines (heartbeats, event/id fields) are skipped.
+                    }
+                    Some(Err(e)) => match e.kind() {
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                            if tx.send(SseEvent::Data(String::new())).is_err() {
+                                break;
+                            }
+                        }
+                        _ => {
+                            let _ = tx.send(SseEvent::Error(format!("{e}")));
+                            break;
+                        }
+                    },
+                    None => break,
+                }
+            }
+            let _ = tx.send(SseEvent::Eof);
+        });
+        Self { rx }
+    }
+
+    /// Next event, or `None` on consumer-side timeout.
+    fn next_event(&self, timeout: Duration) -> Option<SseEvent> {
+        self.rx.recv_timeout(timeout).ok()
+    }
+}
+
+/// One streamed chunk: `choices[0].delta.content` / `finish_reason`.
+#[derive(Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    #[serde(rename = "type", default)]
+    _event_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    delta: StreamDelta,
+    finish_reason: Option<FinishReason>,
+}
+
+#[derive(Deserialize)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+}
 
 use crate::config_update::AppConfig;
 use crate::context_id::ContextId;
@@ -126,16 +274,14 @@ impl fmt::Debug for LlmConfig {
     }
 }
 
-type OaiClient = async_openai::Client<async_openai::config::OpenAIConfig>;
-
 struct ClientSet {
     version: u64,
-    formalizer: OaiClient,
-    fixer: OaiClient,
-    judge: OaiClient,
-    splitting_judge: OaiClient,
-    splitter: OaiClient,
-    analyzer: OaiClient,
+    formalizer: SyncChatClient,
+    fixer: SyncChatClient,
+    judge: SyncChatClient,
+    splitting_judge: SyncChatClient,
+    splitter: SyncChatClient,
+    analyzer: SyncChatClient,
 }
 
 impl ClientSet {
@@ -149,36 +295,12 @@ impl ClientSet {
 
         Self {
             version,
-            formalizer: OaiClient::with_config(
-                async_openai::config::OpenAIConfig::new()
-                    .with_api_key(formalizer_key)
-                    .with_api_base(&config.api_base),
-            ),
-            fixer: OaiClient::with_config(
-                async_openai::config::OpenAIConfig::new()
-                    .with_api_key(fixer_key)
-                    .with_api_base(&config.api_base),
-            ),
-            judge: OaiClient::with_config(
-                async_openai::config::OpenAIConfig::new()
-                    .with_api_key(judge_key)
-                    .with_api_base(&config.api_base),
-            ),
-            splitting_judge: OaiClient::with_config(
-                async_openai::config::OpenAIConfig::new()
-                    .with_api_key(splitting_judge_key)
-                    .with_api_base(&config.api_base),
-            ),
-            splitter: OaiClient::with_config(
-                async_openai::config::OpenAIConfig::new()
-                    .with_api_key(splitter_key)
-                    .with_api_base(&config.api_base),
-            ),
-            analyzer: OaiClient::with_config(
-                async_openai::config::OpenAIConfig::new()
-                    .with_api_key(analyzer_key)
-                    .with_api_base(&config.api_base),
-            ),
+            formalizer: SyncChatClient::new(formalizer_key, &config.api_base),
+            fixer: SyncChatClient::new(fixer_key, &config.api_base),
+            judge: SyncChatClient::new(judge_key, &config.api_base),
+            splitting_judge: SyncChatClient::new(splitting_judge_key, &config.api_base),
+            splitter: SyncChatClient::new(splitter_key, &config.api_base),
+            analyzer: SyncChatClient::new(analyzer_key, &config.api_base),
         }
     }
 }
@@ -233,7 +355,7 @@ fn rand_random() -> u128 {
 }
 
 struct StreamHandler<'a> {
-    client: &'a async_openai::Client<async_openai::config::OpenAIConfig>,
+    client: &'a SyncChatClient,
     label: &'a str,
     timeout: Duration,
     max_retries: u32,
@@ -248,7 +370,7 @@ enum FailureAction {
 
 impl<'a> StreamHandler<'a> {
     fn new(
-        client: &'a async_openai::Client<async_openai::config::OpenAIConfig>,
+        client: &'a SyncChatClient,
         label: &'a str,
         timeout: Duration,
         max_retries: u32,
@@ -258,41 +380,39 @@ impl<'a> StreamHandler<'a> {
         Self { client, label, timeout, max_retries, service_tier, context_id }
     }
 
-    async fn run(
+    fn run(
         &self,
         model: &str,
-        request_messages: Vec<ChatCompletionRequestMessage>,
+        request_messages: &[serde_json::Value],
         is_valid: &impl Fn(&str) -> bool,
     ) -> Result<String> {
         let mut attempt: u32 = 0;
         let mut transient_backoff_secs: u64 = 5;
         loop {
             if attempt > 0 {
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                std::thread::sleep(Duration::from_secs(2));
             }
 
-            let request = CreateChatCompletionRequest {
-                model: model.to_string(),
-                messages: request_messages.clone(),
-                stream: Some(true),
-                service_tier: Some(self.service_tier.clone()),
-                ..Default::default()
-            };
+            let request = serde_json::json!({
+                "model": model,
+                "messages": request_messages,
+                "stream": true,
+                "service_tier": self.service_tier,
+            });
 
             debug!(%self.label, %self.context_id, attempt, "sending LLM streaming request");
 
-            let mut stream = loop {
-                match self.client.chat().create_stream(request.clone()).await {
+            let stream = loop {
+                match self.client.open_stream(&request) {
                     Ok(s) => {
                         transient_backoff_secs = 5;
                         break s;
                     }
-                    Err(e) => {
-                        let reason = format!("{e}");
+                    Err(reason) => {
                         if is_rate_limit(&reason) {
                             let jitter = (rand_random() % 3) as u64;
                             warn!(%self.label, %self.context_id, bytes = 0usize, backoff_secs = transient_backoff_secs + jitter, reason, "LLM transient error, retrying without incrementing attempt");
-                            tokio::time::sleep(Duration::from_secs(transient_backoff_secs + jitter)).await;
+                            std::thread::sleep(Duration::from_secs(transient_backoff_secs + jitter));
                             transient_backoff_secs = (transient_backoff_secs * 2).min(120);
                             continue;
                         }
@@ -301,7 +421,8 @@ impl<'a> StreamHandler<'a> {
                             attempt += 1;
                             continue;
                         }
-                        return Err(e).context("LLM streaming request failed after all retries");
+                        return Err(anyhow::anyhow!(reason))
+                            .context("LLM streaming request failed after all retries");
                     }
                 }
             };
@@ -316,10 +437,25 @@ impl<'a> StreamHandler<'a> {
 
             loop {
                 let current_timeout = if got_first_content { self.timeout } else { self.timeout * 4 };
-                match tokio::time::timeout(current_timeout, stream.next()).await {
-                    Ok(Some(Ok(response))) => {
+                match stream.next_event(current_timeout) {
+                    Some(SseEvent::Data(payload)) => {
+                        if payload.is_empty() {
+                            // Socket wake-up with nothing on the wire.
+                            tracer.on_empty(self.label);
+                            continue;
+                        }
+                        let chunk: StreamChunk = match serde_json::from_str(&payload) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let reason = format!("malformed SSE chunk: {e}");
+                                match self.handle_failure(&content, attempt, is_valid, &reason)? {
+                                    FailureAction::UseContent(c) => return Ok(c),
+                                    FailureAction::Retry => break,
+                                }
+                            }
+                        };
                         total_chunks += 1;
-                        if let Some(choice) = response.choices.first() {
+                        if let Some(choice) = chunk.choices.first() {
                             if let Some(text) = choice.delta.content.as_ref().filter(|c| !c.is_empty()) {
                                 got_first_content = true;
                                 let _n = tracer.on_content(self.label, text);
@@ -332,12 +468,11 @@ impl<'a> StreamHandler<'a> {
                             }
                         }
                     }
-                    Ok(Some(Err(e))) => {
-                        let reason = format!("{e}");
+                    Some(SseEvent::Error(reason)) => {
                         if is_rate_limit(&reason) && content.is_empty() {
                             let jitter = (rand_random() % 3) as u64;
                             warn!(%self.label, %self.context_id, bytes = 0usize, backoff_secs = transient_backoff_secs + jitter, reason, "LLM transient error, retrying without incrementing attempt");
-                            tokio::time::sleep(Duration::from_secs(transient_backoff_secs + jitter)).await;
+                            std::thread::sleep(Duration::from_secs(transient_backoff_secs + jitter));
                             transient_backoff_secs = (transient_backoff_secs * 2).min(120);
                             transient_retry = true;
                             break;
@@ -347,10 +482,10 @@ impl<'a> StreamHandler<'a> {
                             FailureAction::Retry => break,
                         }
                     }
-                    Ok(None) => {
+                    Some(SseEvent::Eof) => {
                         return self.finish(content, &tracer, finish_reason);
                     }
-                    Err(_) => {
+                    None => {
                         let reason = format!(
                             "timeout after {}ms ({} bytes, {} chunks received)",
                             current_timeout.as_millis(),
@@ -418,7 +553,7 @@ impl<'a> StreamHandler<'a> {
 
 struct ChatCtx<'a> {
     label: &'a str,
-    client: &'a OaiClient,
+    client: &'a SyncChatClient,
     model: &'a str,
     config: &'a LlmConfig,
     context_id: &'a ContextId,
@@ -461,7 +596,7 @@ impl LlmClient {
     }
 
     #[instrument(skip_all, fields(model))]
-    pub async fn chat_formalizer(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
+    pub fn chat_formalizer(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
         let config = self.ensure_current();
         let _span = tracing::Span::current().record("model", &config.formalizer_model);
         let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).formalizer.clone();
@@ -469,11 +604,11 @@ impl LlmClient {
             ChatCtx { label: "formalizer", client: &client, model: &config.formalizer_model, config: &config, context_id },
             messages,
             |content| !content.trim().is_empty(),
-        ).await
+        )
     }
 
     #[instrument(skip_all, fields(model))]
-    pub async fn chat_fixer(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
+    pub fn chat_fixer(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
         let config = self.ensure_current();
         let _span = tracing::Span::current().record("model", &config.fixer_model);
         let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).fixer.clone();
@@ -481,11 +616,11 @@ impl LlmClient {
             ChatCtx { label: "fixer", client: &client, model: &config.fixer_model, config: &config, context_id },
             messages,
             |content| !content.trim().is_empty(),
-        ).await
+        )
     }
 
     #[instrument(skip_all, fields(model))]
-    pub async fn chat_judge(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
+    pub fn chat_judge(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
         let config = self.ensure_current();
         let _span = tracing::Span::current().record("model", &config.judge_model);
         let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).judge.clone();
@@ -497,11 +632,11 @@ impl LlmClient {
                 let trimmed = upper.trim_start_matches(|c: char| !c.is_alphabetic());
                 trimmed.starts_with("REASONABLE") || trimmed.starts_with("RETRY")
             },
-        ).await
+        )
     }
 
     #[instrument(skip_all, fields(model))]
-    pub async fn chat_splitter(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
+    pub fn chat_splitter(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
         let config = self.ensure_current();
         let _span = tracing::Span::current().record("model", &config.splitter_model);
         let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).splitter.clone();
@@ -509,11 +644,11 @@ impl LlmClient {
             ChatCtx { label: "splitter", client: &client, model: &config.splitter_model, config: &config, context_id },
             messages,
             |content| !content.trim().is_empty(),
-        ).await
+        )
     }
 
     #[instrument(skip_all, fields(model))]
-    pub async fn chat_splitting_judge(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
+    pub fn chat_splitting_judge(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
         let config = self.ensure_current();
         let _span = tracing::Span::current().record("model", &config.splitting_judge_model);
         let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).splitting_judge.clone();
@@ -525,11 +660,11 @@ impl LlmClient {
                 let trimmed = upper.trim_start_matches(|c: char| !c.is_alphabetic());
                 trimmed.starts_with("REASONABLE") || trimmed.starts_with("RETRY")
             },
-        ).await
+        )
     }
 
     #[instrument(skip_all, fields(model))]
-    pub async fn chat_analyzer(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
+    pub fn chat_analyzer(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
         let config = self.ensure_current();
         let _span = tracing::Span::current().record("model", &config.analyzer_model);
         let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).analyzer.clone();
@@ -537,10 +672,10 @@ impl LlmClient {
             ChatCtx { label: "analyzer", client: &client, model: &config.analyzer_model, config: &config, context_id },
             messages,
             |content| !content.trim().is_empty(),
-        ).await
+        )
     }
 
-    async fn chat_inner(
+    fn chat_inner(
         &self,
         ctx: ChatCtx<'_>,
         messages: Vec<Message>,
@@ -554,34 +689,18 @@ impl LlmClient {
             }
         }
 
-        let request_messages: Vec<ChatCompletionRequestMessage> = messages
+        let role_str = |role: Role| match role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        };
+        let request_messages: Vec<serde_json::Value> = messages
             .into_iter()
-            .map(|msg| match msg.role {
-                Role::System => {
-                    ChatCompletionRequestMessage::System(
-                        ChatCompletionRequestSystemMessage {
-                            content: ChatCompletionRequestSystemMessageContent::Text(msg.content),
-                            name: None,
-                        },
-                    )
-                }
-                Role::User => {
-                    ChatCompletionRequestMessage::User(
-                        ChatCompletionRequestUserMessage {
-                            content: ChatCompletionRequestUserMessageContent::Text(msg.content),
-                            name: None,
-                        },
-                    )
-                }
-                Role::Assistant => {
-                    ChatCompletionRequestMessage::Assistant(
-                        async_openai::types::chat::ChatCompletionRequestAssistantMessage {
-                            content: Some(async_openai::types::chat::ChatCompletionRequestAssistantMessageContent::Text(msg.content)),
-                            name: None,
-                            ..Default::default()
-                        },
-                    )
-                }
+            .map(|msg| {
+                serde_json::json!({
+                    "role": role_str(msg.role),
+                    "content": msg.content,
+                })
             })
             .collect();
 
@@ -590,11 +709,11 @@ impl LlmClient {
             label,
             Duration::from_millis(config.stream_timeout_ms),
             config.max_stream_retries,
-            config.service_tier.clone(),
+            config.service_tier,
             context_id,
         );
 
-        handler.run(model, request_messages, &is_partial_valid).await
+        handler.run(model, &request_messages, &is_partial_valid)
     }
 }
 
@@ -622,26 +741,25 @@ pub fn assistant_message(content: &str) -> Message {
     }
 }
 
-#[async_trait]
 impl IOProvider<LlmRequest, WithContext<String>> for LlmClient {
-    async fn invoke(&self, input: LlmRequest) -> Result<WithContext<String>> {
+    fn invoke(&self, input: LlmRequest) -> Result<WithContext<String>> {
         let LlmRequest { role, messages, context_id } = input;
 
         loop {
             let result = match role {
-                LlmRole::Splitter => self.chat_splitter(messages.clone(), &context_id).await,
-                LlmRole::SplittingJudge => self.chat_splitting_judge(messages.clone(), &context_id).await,
-                LlmRole::Formalizer => self.chat_formalizer(messages.clone(), &context_id).await,
-                LlmRole::Fixer => self.chat_fixer(messages.clone(), &context_id).await,
-                LlmRole::Judge => self.chat_judge(messages.clone(), &context_id).await,
-                LlmRole::Analyzer => self.chat_analyzer(messages.clone(), &context_id).await,
+                LlmRole::Splitter => self.chat_splitter(messages.clone(), &context_id),
+                LlmRole::SplittingJudge => self.chat_splitting_judge(messages.clone(), &context_id),
+                LlmRole::Formalizer => self.chat_formalizer(messages.clone(), &context_id),
+                LlmRole::Fixer => self.chat_fixer(messages.clone(), &context_id),
+                LlmRole::Judge => self.chat_judge(messages.clone(), &context_id),
+                LlmRole::Analyzer => self.chat_analyzer(messages.clone(), &context_id),
             };
 
             match result {
                 Ok(content) => return Ok(WithContext { value: content, context_id }),
                 Err(e) => {
                     if let Some(gate) = &self.error_gate {
-                        gate.report_and_wait(&format!("{e:#}")).await?;
+                        gate.report_and_wait(&format!("{e:#}"))?;
                         continue;
                     }
                     return Err(e);

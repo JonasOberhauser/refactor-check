@@ -15,8 +15,8 @@ fn listed_function_names(functions: &[deductive_check::provider::FunctionInfo]) 
     names
 }
 
-#[tokio::test]
-async fn test_excludes_test_functions() {
+#[test]
+fn test_excludes_test_functions() {
     let path = test_dummy_path();
     let provider = CliRustAnalyzerProvider::new(path.to_string_lossy().to_string())
         .expect("Failed to create provider for test_dummy");
@@ -27,7 +27,7 @@ async fn test_excludes_test_functions() {
             files: vec![lib_path],
             cfg_verification: true,
         })
-        .await
+        
         .expect("ListFunctions failed");
 
     let functions = match resp {
@@ -44,12 +44,12 @@ async fn test_excludes_test_functions() {
     );
     assert!(
         !names.contains(&"test_tokio".to_string()),
-        "#[tokio::test] function should be excluded, got: {:?}",
+        "#[test] function should be excluded, got: {:?}",
         names
     );
     assert!(
         !names.contains(&"test_log_tokio".to_string()),
-        "#[test_log::test(tokio::test)] function should be excluded, got: {:?}",
+        "#[test_log::test] function should be excluded, got: {:?}",
         names
     );
     assert!(
@@ -59,7 +59,7 @@ async fn test_excludes_test_functions() {
     );
     assert!(
         !names.contains(&"tokio_in_cfg_test_mod".to_string()),
-        "#[tokio::test] in #[cfg(test)] should be excluded, got: {:?}",
+        "#[test] in #[cfg(test)] should be excluded, got: {:?}",
         names
     );
 
@@ -100,8 +100,8 @@ async fn test_excludes_test_functions() {
     );
 }
 
-#[tokio::test]
-async fn test_verification_feature_functions() {
+#[test]
+fn test_verification_feature_functions() {
     let path = test_dummy_path();
     let provider = CliRustAnalyzerProvider::new(path.to_string_lossy().to_string())
         .expect("Failed to create provider for test_dummy");
@@ -112,7 +112,7 @@ async fn test_verification_feature_functions() {
             files: vec![lib_path],
             cfg_verification: true,
         })
-        .await
+        
         .expect("ListFunctions failed");
 
     let functions = match resp {
@@ -129,8 +129,8 @@ async fn test_verification_feature_functions() {
     );
 }
 
-#[tokio::test]
-async fn test_has_guarantees_detection() {
+#[test]
+fn test_has_guarantees_detection() {
     let path = test_dummy_path();
     let provider = CliRustAnalyzerProvider::new(path.to_string_lossy().to_string())
         .expect("Failed to create provider for test_dummy");
@@ -141,7 +141,7 @@ async fn test_has_guarantees_detection() {
             files: vec![lib_path],
             cfg_verification: true,
         })
-        .await
+        
         .expect("ListFunctions failed");
 
     let functions = match resp {
@@ -189,8 +189,8 @@ async fn test_has_guarantees_detection() {
     );
 }
 
-#[tokio::test]
-async fn test_impl_for_detection() {
+#[test]
+fn test_impl_for_detection() {
     let path = test_dummy_path();
     let provider = CliRustAnalyzerProvider::new(path.to_string_lossy().to_string())
         .expect("Failed to create provider for test_dummy");
@@ -201,7 +201,7 @@ async fn test_impl_for_detection() {
             files: vec![lib_path],
             cfg_verification: true,
         })
-        .await
+        
         .expect("ListFunctions failed");
 
     let functions = match resp {
@@ -241,8 +241,8 @@ async fn test_impl_for_detection() {
     }
 }
 
-#[tokio::test]
-async fn test_fetch_docs_returns_doc_comments() {
+#[test]
+fn test_fetch_docs_returns_doc_comments() {
     let path = test_dummy_path();
     let provider = CliRustAnalyzerProvider::new(path.to_string_lossy().to_string())
         .expect("Failed to create provider for test_dummy");
@@ -253,7 +253,7 @@ async fn test_fetch_docs_returns_doc_comments() {
             files: vec![lib_path],
             cfg_verification: true,
         })
-        .await
+        
         .expect("ListFunctions failed");
 
     let functions = match resp {
@@ -276,8 +276,8 @@ async fn test_fetch_docs_returns_doc_comments() {
     );
 }
 
-#[tokio::test]
-async fn test_fetch_docs_includes_doc_attrs() {
+#[test]
+fn test_fetch_docs_includes_doc_attrs() {
     let path = test_dummy_path();
     let provider = CliRustAnalyzerProvider::new(path.to_string_lossy().to_string())
         .expect("Failed to create provider for test_dummy");
@@ -288,7 +288,7 @@ async fn test_fetch_docs_includes_doc_attrs() {
             files: vec![lib_path],
             cfg_verification: true,
         })
-        .await
+        
         .expect("ListFunctions failed");
 
     let functions = match resp {
@@ -304,8 +304,8 @@ async fn test_fetch_docs_includes_doc_attrs() {
     );
 }
 
-#[tokio::test]
-async fn test_has_guarantees_via_outgoing_calls() {
+#[test]
+fn test_has_guarantees_via_outgoing_calls() {
     let path = test_dummy_path();
     let provider = CliRustAnalyzerProvider::new(path.to_string_lossy().to_string())
         .expect("Failed to create provider for test_dummy");
@@ -316,7 +316,7 @@ async fn test_has_guarantees_via_outgoing_calls() {
             files: vec![lib_path],
             cfg_verification: true,
         })
-        .await
+        
         .expect("ListFunctions failed");
 
     let functions = match resp {
@@ -342,8 +342,8 @@ async fn test_has_guarantees_via_outgoing_calls() {
     );
 }
 
-#[tokio::test]
-async fn test_preconditions_detected_in_docs() {
+#[test]
+fn test_preconditions_detected_in_docs() {
     let path = test_dummy_path();
     let provider = CliRustAnalyzerProvider::new(path.to_string_lossy().to_string())
         .expect("Failed to create provider for test_dummy");
@@ -354,7 +354,7 @@ async fn test_preconditions_detected_in_docs() {
             files: vec![lib_path],
             cfg_verification: true,
         })
-        .await
+        
         .expect("ListFunctions failed");
 
     let functions = match resp {

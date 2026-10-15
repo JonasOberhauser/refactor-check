@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use arbitrary::Unstructured;
-use async_trait::async_trait;
 use tracing::info;
 
 use deductive_check::consts;
@@ -65,14 +64,13 @@ impl<F> ContextFuzzProvider<F> {
     }
 }
 
-#[async_trait]
 impl<F, I, T> IOProvider<I, WithContext<T>> for ContextFuzzProvider<F>
 where
     F: Fuzz<I, T>,
     I: ExtractContext + Send + Sync + 'static,
     T: Send + Sync + 'static,
 {
-    async fn invoke(&self, input: I) -> Result<WithContext<T>> {
+    fn invoke(&self, input: I) -> Result<WithContext<T>> {
         let value = {
             let mut guard = self.stream.lock().expect("fuzz stream poisoned");
             // Occasionally inject a synthetic provider error, modelling the
@@ -447,10 +445,7 @@ pub fn run_state_machine(data: &[u8]) {
     let project = setup_temp_project();
     let providers = FuzzProviders::new(data.to_vec());
     let pm = DefaultDeductivePieceManager::default();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("failed to build tokio runtime");
-    let _ = rt.block_on(machine::run(
+    let _ = (machine::run(
         project.path().to_str().expect("non-utf8 temp path"),
         &providers.providers(),
         &pm,

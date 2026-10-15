@@ -263,17 +263,6 @@ fn main() -> Result<()> {
     let bg_handle = std::thread::Builder::new()
         .name("verification".to_string())
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    let _ = err_tx.send(format!("Failed to create runtime: {e}"));
-                    return;
-                }
-            };
-
             // Create error gate for recoverable errors in LLM/SMT/Agent
             let (gate_tx, gate_rx) = std::sync::mpsc::channel();
             let gate = std::sync::Arc::new(
@@ -294,7 +283,7 @@ fn main() -> Result<()> {
                 });
             }
 
-            let result: anyhow::Result<()> = rt.block_on(async move {
+            let result: anyhow::Result<()> = (|| {
                 info!("starting verification worker");
 
                 let api_key = loop {
@@ -315,7 +304,7 @@ fn main() -> Result<()> {
                                 if bg_epoch.load(Ordering::Acquire) != my_epoch {
                                     break;
                                 }
-                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                std::thread::sleep(std::time::Duration::from_millis(200));
                             }
                         }
                     }
@@ -364,7 +353,7 @@ fn main() -> Result<()> {
 
                 let pm = deductive_check::piece_manager::DefaultDeductivePieceManager::new(bg_log.clone());
 
-                let result = deductive_check::machine::run(&bg_project, &providers, &pm).await?;
+                let result = deductive_check::machine::run(&bg_project, &providers, &pm)?;
 
                 let result_path = std::path::PathBuf::from(&result_file);
                 if let Some(parent) = result_path.parent() {
@@ -385,7 +374,7 @@ fn main() -> Result<()> {
                 println!("{}", "=".repeat(60));
 
                 Ok(())
-            });
+            })();
 
             bg_state.work_finished.store(true, Ordering::Release);
             match &result {

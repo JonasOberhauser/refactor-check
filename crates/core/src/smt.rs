@@ -1,11 +1,9 @@
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::io::Write as _;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, trace, warn};
 
 use crate::config_update::AppConfig;
@@ -165,8 +163,12 @@ impl Default for SolverConfig {
     }
 }
 
+/// # Panics
+///
+/// Panics if a pipe-reader thread panicked (structural: the pipe is owned
+/// exclusively by that thread, so a panic there means the runtime is broken).
 #[instrument(skip_all, fields(solver_path, %context_id))]
-pub async fn run_solver(
+pub fn run_solver(
     solver_path: &str,
     solver_args: &[String],
     timeout: Duration,
@@ -176,7 +178,7 @@ pub async fn run_solver(
     info!(formula_bytes = formula.len(), ?timeout, %context_id, "running SMT solver");
     let start = std::time::Instant::now();
 
-    let mut child = tokio::process::Command::new(solver_path)
+    let mut child = std::process::Command::new(solver_path)
         .args(solver_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -186,45 +188,48 @@ pub async fn run_solver(
 
     {
         let mut stdin = child.stdin.take().context("Failed to open stdin")?;
-        stdin.write_all(formula.as_bytes()).await
+        stdin
+            .write_all(formula.as_bytes())
             .context("Failed to write formula to solver stdin")?;
+        // stdin dropped here: closes the pipe, signaling EOF to the solver.
     }
 
     let mut stdout_pipe = child.stdout.take().context("Failed to open stdout")?;
     let mut stderr_pipe = child.stderr.take().context("Failed to open stderr")?;
 
-    let read_stdout = tokio::task::spawn(async move {
+    // Reader threads own the pipes for the whole child lifetime — a pipe
+    // buffer filling up can never deadlock the solver.
+    let read_stdout = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _n = stdout_pipe.read_to_end(&mut buf).await?;
-        Ok::<_, std::io::Error>(buf)
+        let _n = std::io::Read::read_to_end(&mut stdout_pipe, &mut buf);
+        buf
     });
-    let read_stderr = tokio::task::spawn(async move {
+    let read_stderr = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _n = stderr_pipe.read_to_end(&mut buf).await?;
-        Ok::<_, std::io::Error>(buf)
+        let _n = std::io::Read::read_to_end(&mut stderr_pipe, &mut buf);
+        buf
     });
 
-    let child = Arc::new(Mutex::new(child));
-    let child_for_wait = child.clone();
-
-let status = tokio::select! {
-        status = async move { child_for_wait.lock().await.wait().await } => Some(status),
-        () = tokio::time::sleep(timeout) => {
-            warn!(elapsed_ms = start.elapsed().as_millis(), %context_id, "solver timed out, killing process");
-            {
-                let mut guard = child.lock().await;
-                let _ = guard.kill().await;
-                let _ = guard.wait().await;
-            }
-            None
+    // Deadline watchdog: try_wait poll, kill on expiry.
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("Failed to wait for solver process")? {
+            break Some(status);
         }
+        if std::time::Instant::now() >= deadline {
+            warn!(elapsed_ms = start.elapsed().as_millis(), %context_id, "solver timed out, killing process");
+            let _killed = child.kill();
+            let _reaped = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     };
 
     let elapsed = start.elapsed();
 
     let Some(status) = status else {
-        let _ = read_stdout.await;
-        let _ = read_stderr.await;
+        let _stdout = read_stdout.join();
+        let _stderr = read_stderr.join();
         let timeout_msg = format!("solver timed out after {}s", timeout.as_secs());
         return Ok(SolverResult {
             outcome: SolverOutcome::Unknown,
@@ -233,13 +238,8 @@ let status = tokio::select! {
         });
     };
 
-    let status = status.context("Failed to wait for solver process")?;
-    let stdout = read_stdout.await
-        .context("stdout reader task panicked")?
-        .context("Failed to read solver stdout")?;
-    let stderr = read_stderr.await
-        .context("stderr reader task panicked")?
-        .context("Failed to read solver stderr")?;
+    let stdout = read_stdout.join().expect("stdout reader thread panicked");
+    let stderr = read_stderr.join().expect("stderr reader thread panicked");
 
     let stdout = bytes_to_string(stdout);
     let stderr = bytes_to_string(stderr);
@@ -279,9 +279,8 @@ impl Z3Solver {
     }
 }
 
-#[async_trait]
 impl IOProvider<SolverRequest, WithContext<SolverResult>> for Z3Solver {
-    async fn invoke(&self, input: SolverRequest) -> Result<WithContext<SolverResult>> {
+    fn invoke(&self, input: SolverRequest) -> Result<WithContext<SolverResult>> {
         let SolverRequest { formula, context_id } = input;
         loop {
             let cfg = self.config.snapshot().1.solver;
@@ -292,13 +291,13 @@ impl IOProvider<SolverRequest, WithContext<SolverResult>> for Z3Solver {
                 &formula,
                 &context_id,
             )
-            .await;
+;
 
             match result {
                 Ok(result) => return Ok(WithContext { value: result, context_id }),
                 Err(e) => {
                     if let Some(gate) = &self.error_gate {
-                        gate.report_and_wait(&format!("{e:#}")).await?;
+                        gate.report_and_wait(&format!("{e:#}"))?;
                         continue;
                     }
                     return Err(e);

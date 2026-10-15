@@ -12,7 +12,7 @@ pub enum SplittingJudgeVerdict {
     Retry(String),
 }
 
-pub async fn execute(
+pub fn execute(
     state: &WaitForSplittingJudge,
     llm: &DynLlmProvider,
     mut parent_ctx: ContextId,
@@ -92,7 +92,7 @@ pub async fn execute(
             llm::user_message(&prompt),
         ];
 
-        let resp = llm.invoke(LlmRequest { role: LlmRole::SplittingJudge, messages, context_id: Box::new(parent_ctx) }).await?;
+        let resp = llm.invoke(LlmRequest { role: LlmRole::SplittingJudge, messages, context_id: Box::new(parent_ctx) })?;
         parent_ctx = *resp.context_id;
         let response = resp.value;
         let trimmed = response.trim().to_string();

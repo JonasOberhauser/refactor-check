@@ -11,7 +11,7 @@ use crate::states::{CodePiece, JudgeVerdict};
 ///
 /// Panics via [`CodePiece::with_ctx`] if the piece's context was already
 /// taken and not restored.
-pub async fn execute(
+pub fn execute(
     piece: &CodePiece,
     formula: &str,
     solver_result: &SolverResult,
@@ -100,7 +100,7 @@ pub async fn execute(
         ];
 
         let ctx = piece.take_context().map_err(anyhow::Error::msg)?;
-        let resp = llm.invoke(LlmRequest { role: LlmRole::Judge, messages, context_id: ctx }).await?;
+        let resp = llm.invoke(LlmRequest { role: LlmRole::Judge, messages, context_id: ctx })?;
         piece.restore_context(resp.context_id);
         let response = resp.value;
         let trimmed = response.trim().to_string();

@@ -76,8 +76,8 @@ Piece: max_of_three
      (max_entry (max_entry a b) c))))"
         .to_string()
 }
-#[test_log::test(tokio::test)]
-async fn test_sat_judge_overrules() {
+#[test_log::test]
+fn test_sat_judge_overrules() {
     let llm = SequenceLlm::with_accepting_judge(
         vec![struct_max_formula_response()],
         vec![],
@@ -90,7 +90,7 @@ async fn test_sat_judge_overrules() {
 
     let pm = test_pm();
     let result = machine::run("max_of_three struct refactoring", &llm, &solver, &pm)
-        .await
+        
         .expect("agent should succeed (bug: judge overruled)");
 
     assert_eq!(result.formulas.len(), 1);

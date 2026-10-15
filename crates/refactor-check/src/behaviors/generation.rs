@@ -1,5 +1,4 @@
 use anyhow::Result;
-use futures::future::try_join_all;
 use tracing::{debug, warn};
 
 use crate::phase::PiecePhase;
@@ -20,7 +19,7 @@ pub fn role_for_iteration(iteration: usize) -> LlmRole {
 ///
 /// Panics via [`CodePiece::with_ctx`] if the piece's context was already
 /// taken and not restored.
-pub async fn execute(
+pub fn execute(
     state: &WaitForGeneration,
     llm: &DynLlmProvider,
     pm: &dyn PieceManager,
@@ -32,20 +31,19 @@ pub async fn execute(
     }
 
     if let InsistState::Insisting { ref last_response, .. } = &state.insist {
-        return generate_insist(state, llm, role, last_response).await;
+        return generate_insist(state, llm, role, last_response);
     }
 
     assert!(!state.pieces.is_empty(), "must have pieces");
 
-    let futures: Vec<_> = state
+    let formulas: Vec<String> = state
         .pieces
         .iter()
         .map(|piece| {
             debug!(ctx = %piece.ctx_display(), label = %piece.label(), "dispatching generation for piece");
             generate_one_formula(piece, &state.input_content, &state.verified, llm, role)
         })
-        .collect();
-    let formulas: Vec<String> = try_join_all(futures).await?;
+        .collect::<Result<Vec<_>>>()?;
     if formulas.iter().any(|f| f.is_empty()) {
         warn!("one or more pieces produced no valid formula, entering insist loop");
         return Ok(Vec::new());
@@ -54,7 +52,7 @@ pub async fn execute(
     Ok(formulas)
 }
 
-async fn generate_one_formula(
+fn generate_one_formula(
     piece: &CodePiece,
     input_content: &str,
     verified: &[VerifiedPiece],
@@ -63,7 +61,7 @@ async fn generate_one_formula(
 ) -> Result<String> {
     let messages = build_single_piece_messages(piece, input_content, verified);
     let ctx = piece.take_context().map_err(anyhow::Error::msg)?;
-    let resp = llm.invoke(LlmRequest { role, messages, context_id: ctx }).await?;
+    let resp = llm.invoke(LlmRequest { role, messages, context_id: ctx })?;
     piece.restore_context(resp.context_id);
     let response = resp.value;
     let formula = extract_single_formula(&response);
@@ -71,7 +69,7 @@ async fn generate_one_formula(
     Ok(formula)
 }
 
-async fn generate_insist(
+fn generate_insist(
     state: &WaitForGeneration,
     llm: &DynLlmProvider,
     role: LlmRole,
@@ -112,7 +110,7 @@ async fn generate_insist(
     ];
 
     let ctx = state.pieces[0].take_context().map_err(anyhow::Error::msg)?;
-    let resp = llm.invoke(LlmRequest { role, messages, context_id: ctx }).await?;
+    let resp = llm.invoke(LlmRequest { role, messages, context_id: ctx })?;
     state.pieces[0].restore_context(resp.context_id);
     let response = resp.value;
     let mut formulas = extract_all_formulas(&response);

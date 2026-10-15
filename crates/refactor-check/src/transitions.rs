@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use refactor_check_core::context_id::ContextId;
 use tracing::debug;
 use tracing::warn;
@@ -15,15 +14,14 @@ use crate::states::*;
 
 // ===== State machine =====
 
-#[async_trait]
 impl AlgorithmState for WaitForSplit {
-    async fn execute(
+    fn execute(
         self: Box<Self>,
         llm: &DynLlmProvider,
         _solver: &DynSolverProvider,
         pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
-        let raw_pieces = behaviors::splitter::execute(&self, llm, pm, ContextId::root()).await?;
+        let raw_pieces = behaviors::splitter::execute(&self, llm, pm, ContextId::root())?;
         let pieces: Vec<Arc<CodePiece>> = raw_pieces.into_iter().map(Arc::new).collect();
         Ok(Step::State(Box::new(WaitForSplittingJudge {
             input_content: self.input_content,
@@ -37,15 +35,14 @@ impl AlgorithmState for WaitForSplit {
     }
 }
 
-#[async_trait]
 impl AlgorithmState for WaitForSplittingJudge {
-    async fn execute(
+    fn execute(
         self: Box<Self>,
         llm: &DynLlmProvider,
         _solver: &DynSolverProvider,
         _pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
-        let (verdict, _) = behaviors::splitting_judge::execute(&self, llm, ContextId::root().new_child()).await?;
+        let (verdict, _) = behaviors::splitting_judge::execute(&self, llm, ContextId::root().new_child())?;
         match verdict {
             behaviors::splitting_judge::SplittingJudgeVerdict::Accept => {
                 debug!("splitting judge accepted the decomposition");
@@ -116,9 +113,8 @@ impl AlgorithmState for WaitForSplittingJudge {
     }
 }
 
-#[async_trait]
 impl AlgorithmState for WaitForGeneration {
-    async fn execute(
+    fn execute(
         self: Box<Self>,
         llm: &DynLlmProvider,
         _solver: &DynSolverProvider,
@@ -129,7 +125,7 @@ impl AlgorithmState for WaitForGeneration {
                 anyhow::bail!("failed to extract any SMT formula after {MAX_INSIST_ATTEMPTS} insist attempts");
             }
         }
-        let formulas = generation::execute(&self, llm, pm).await?;
+        let formulas = generation::execute(&self, llm, pm)?;
         if formulas.is_empty() {
             return Ok(Step::State(Box::new(WaitForGeneration {
                 input_content: self.input_content,
@@ -171,16 +167,15 @@ impl AlgorithmState for WaitForGeneration {
     }
 }
 
-#[async_trait]
 impl AlgorithmState for WaitForResults {
-    async fn execute(
+    fn execute(
         self: Box<Self>,
         llm: &DynLlmProvider,
         solver: &DynSolverProvider,
         pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
         let WaitForResults { input_content, verified, open, iteration, branches } = *self;
-        let done = behaviors::results::execute_all(branches, llm, solver, pm).await?;
+        let done = behaviors::results::execute_all(branches, llm, solver, pm)?;
 
         let mut verified = verified;
         let mut open = open;
@@ -244,15 +239,14 @@ impl AlgorithmState for WaitForResults {
     }
 }
 
-#[async_trait]
 impl AlgorithmState for WaitForExplanation {
-    async fn execute(
+    fn execute(
         self: Box<Self>,
         llm: &DynLlmProvider,
         _solver: &DynSolverProvider,
         _pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
-        let explanations = behaviors::explain::execute(&self, llm, ContextId::root()).await?;
+        let explanations = behaviors::explain::execute(&self, llm, ContextId::root())?;
         let mut result = self.result;
         for (f, explanation) in result.formulas.iter_mut().zip(explanations) {
             f.explanation = explanation;

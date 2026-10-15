@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
-use async_trait::async_trait;
 use refactor_check::provider::{IOProvider, LlmRequest, LlmRole, SolverRequest, WithContext};
 use refactor_check::smt::{SolverOutcome, SolverResult};
 
@@ -68,9 +67,8 @@ impl SequenceLlm {
     }
 }
 
-#[async_trait]
 impl IOProvider<LlmRequest, WithContext<String>> for SequenceLlm {
-    async fn invoke(&self, input: LlmRequest) -> Result<WithContext<String>> {
+    fn invoke(&self, input: LlmRequest) -> Result<WithContext<String>> {
         let LlmRequest { role, context_id, .. } = input;
         let queue = match role {
             LlmRole::Splitter => &self.splitter,
@@ -92,9 +90,8 @@ pub struct FakeSolver {
     pub outcome: SolverOutcome,
 }
 
-#[async_trait]
 impl IOProvider<SolverRequest, WithContext<SolverResult>> for FakeSolver {
-    async fn invoke(&self, input: SolverRequest) -> Result<WithContext<SolverResult>> {
+    fn invoke(&self, input: SolverRequest) -> Result<WithContext<SolverResult>> {
         let SolverRequest { context_id, .. } = input;
         Ok(WithContext {
             value: SolverResult {
