@@ -4,6 +4,7 @@ pub use refactor_check_core::{
     smt, state,
 };
 
+pub mod checkpoint;
 pub mod code_piece;
 pub mod formula;
 pub mod machine;

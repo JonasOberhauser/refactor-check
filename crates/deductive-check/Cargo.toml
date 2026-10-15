@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 refactor-check-core = { path = "../core" }
 servyi-ioprovider = { git = "https://github.com/servyi/ioprovider.git", branch = "main" }
+servyi-states = { git = "https://github.com/servyi/states.git", branch = "main", features = ["serde"] }
+servyi-states-snapshot = { git = "https://github.com/servyi/states.git", branch = "main" }
 servyi-servatui = { git = "https://github.com/servyi/servatui.git", branch = "main" }
 async-openai = { version = "0.36", features = ["chat-completion"] }
 futures = "0.3"

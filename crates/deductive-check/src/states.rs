@@ -1149,7 +1149,7 @@ impl AlgorithmState for FullFormalizer {
     ) -> Result<Step> {
         let functions_count = self.functions_count();
         let total_pieces = self.pieces.len();
-        let verification_dir = self.verification_dir;
+        let verification_dir = self.verification_dir.clone();
         let project_path = self.project_path;
         let branch_name = self.branch_name;
 
@@ -1160,11 +1160,34 @@ impl AlgorithmState for FullFormalizer {
             ctxs_only.push(ctx);
         }
 
+
         let ctx_labels: Vec<String> = ctxs_only.iter().map(|c| c.to_string()).collect();
 
-        let futs: Vec<_> = pieces_only.iter().zip(ctxs_only).map(|(piece, ctx)| {
-            process_piece(piece, ctx, providers, pm, &verification_dir)
-        }).collect();
+        // Checkpoint resume: pieces whose outcome a previous run already
+        // recorded are reused as-is — zero provider re-invocation.
+        let futs: Vec<_> = pieces_only
+            .iter()
+            .zip(ctxs_only)
+            .map(|(piece, ctx)| {
+                let verification_dir = verification_dir.clone();
+                async move {
+                // Outcome reuse is a RESTORED run's skip; in-process
+                // restart cycles keep re-verifying every piece.
+                if pm.is_resumed() {
+                    match pm.outcome_of(piece.function_id()) {
+                        Some((closed, unverified)) => {
+                            Ok::<PieceOutcome, anyhow::Error>(PieceOutcome { closed, unverified })
+                        }
+                        None => {
+                            process_piece(piece, ctx, providers, pm, &verification_dir).await
+                        }
+                    }
+                } else {
+                    process_piece(piece, ctx, providers, pm, &verification_dir).await
+                }
+                }
+            })
+            .collect();
 
         let results = futures::future::join_all(futs).await;
 
@@ -1174,10 +1197,14 @@ impl AlgorithmState for FullFormalizer {
         for (i, result) in results.into_iter().enumerate() {
             match result {
                 Ok(outcome) => {
-                    if let Some(cp) = outcome.closed {
+                    let (closed, unverified) = (outcome.closed, outcome.unverified);
+                    // Record per-piece outcomes so a snapshot taken from
+                    // this pm lets a resumed run skip this piece.
+                    pm.record_outcome(pieces_only[i].function_id(), closed.clone(), unverified.clone());
+                    if let Some(cp) = closed {
                         closed_pieces.push(cp);
                     }
-                    if let Some(up) = outcome.unverified {
+                    if let Some(up) = unverified {
                         unverified_pieces.push(up);
                     }
                 }
@@ -1188,7 +1215,8 @@ impl AlgorithmState for FullFormalizer {
                         piece,
                         Vec::new(),
                         Vec::new(),
-                        format!("Processing error: {}", e),
+                        format!("Processing error: {}", e,
+                        ),
                     ));
                 }
             }

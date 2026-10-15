@@ -9,6 +9,7 @@ use crate::code_piece::{DeductiveCodePiece, FunctionId};
 use crate::formula::{Formula, FormulaSource};
 use crate::phase::{CodePiecePhase, FormulaPhase};
 
+
 pub trait DeductivePieceManager: Send + Sync {
     fn new_piece(
         &self,
@@ -39,6 +40,33 @@ pub trait DeductivePieceManager: Send + Sync {
 
     fn store_function_docs(&self, function_id: FunctionId, docs: String);
     fn get_function_docs(&self, function_id: &FunctionId) -> String;
+
+    /// Record a completed piece's outcome (closed and/or unverified); a
+    /// restored run reuses it instead of re-invoking providers. Keyed by
+    /// the piece's stable FunctionId — a resumed run allocates fresh
+    /// ContextIds, so the identity must survive the restore.
+    fn record_outcome(
+        &self,
+        _function_id: &FunctionId,
+        _closed: Option<crate::result::ClosedPiece>,
+        _unverified: Option<crate::result::UnverifiedPiece>,
+    ) {
+    }
+    fn outcome_of(
+        &self,
+        _function_id: &FunctionId,
+    ) -> Option<(Option<crate::result::ClosedPiece>, Option<crate::result::UnverifiedPiece>)> {
+        None
+    }
+
+    /// Downcast hook for the checkpoint runner.
+    fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Whether outcome reuse is armed (post-restore). Default false —
+    /// only DefaultDeductivePieceManager supports restore.
+    fn is_resumed(&self) -> bool {
+        false
+    }
 }
 
 pub struct DefaultDeductivePieceManager {
@@ -46,6 +74,13 @@ pub struct DefaultDeductivePieceManager {
     formula_tracker: DefaultPhaseTracker<FormulaPhase>,
     function_docs: DashMap<FunctionId, String>,
     message_log: Arc<MessageLog>,
+    /// Completed piece outcomes — what a RESTORED run skips (in-process
+    /// restart cycles must re-verify). Keyed by the piece's stable
+    /// FunctionId; the payloads rebuild closed/unverified lists without
+    /// re-invoking any provider.
+    outcomes: DashMap<FunctionId, (Option<crate::result::ClosedPiece>, Option<crate::result::UnverifiedPiece>)>,
+    /// True after restore(): outcome reuse (the resume skip) is active.
+    resumed: std::sync::atomic::AtomicBool,
 }
 
 impl DefaultDeductivePieceManager {
@@ -56,6 +91,8 @@ impl DefaultDeductivePieceManager {
             formula_tracker: DefaultPhaseTracker::new(),
             function_docs: DashMap::new(),
             message_log,
+            outcomes: DashMap::new(),
+            resumed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -63,6 +100,91 @@ impl DefaultDeductivePieceManager {
 impl Default for DefaultDeductivePieceManager {
     fn default() -> Self {
         Self::new(Arc::new(MessageLog::new()))
+    }
+}
+
+impl DefaultDeductivePieceManager {
+    /// Downcast hook for the checkpoint runner (the protocol only knows
+    /// the trait).
+    pub fn as_default(pm: &dyn DeductivePieceManager) -> Option<&Self> {
+        pm.as_any().downcast_ref::<Self>()
+    }
+
+    /// The checkpoint shape: everything a resumed run needs — piece/formula
+    /// phases, the completed outcomes, and the final result. Function docs
+    /// are a cache and are deliberately NOT part of the shape.
+    #[must_use]
+    pub fn snapshot(
+        &self,
+        result: Option<&crate::result::VerificationResult>,
+    ) -> crate::checkpoint::MachineSnapshot {
+        crate::checkpoint::MachineSnapshot::from_pm(self, result)
+    }
+
+    /// Rebuild from a snapshot: outcomes restored and the resume skip
+    /// armed — ONLY a restored run reuses outcomes; in-process restart
+    /// cycles keep re-verifying every piece.
+    pub fn restore(&mut self, snap: &crate::checkpoint::MachineSnapshot) {
+        snap.apply_to(self);
+        let _prev = self.resumed.swap(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether outcome reuse is armed (post-restore).
+    pub fn is_resumed(&self) -> bool {
+        self.resumed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+
+    pub(crate) fn piece_phases(&self) -> Vec<(u64, CodePiecePhase)> {
+        let mut v: Vec<(u64, CodePiecePhase)> =
+            serde_json::from_str(&serde_json::to_string(&self.piece_tracker).unwrap_or_default())
+                .unwrap_or_default();
+        v.sort_by_key(|(hash, _)| *hash);
+        v
+    }
+
+    pub(crate) fn formula_phases(&self) -> Vec<(u64, FormulaPhase)> {
+        let mut v: Vec<(u64, FormulaPhase)> =
+            serde_json::from_str(&serde_json::to_string(&self.formula_tracker).unwrap_or_default())
+                .unwrap_or_default();
+        v.sort_by_key(|(hash, _)| *hash);
+        v
+    }
+
+    pub(crate) fn outcome_list(
+        &self,
+    ) -> Vec<(FunctionId, Option<crate::result::ClosedPiece>, Option<crate::result::UnverifiedPiece>)> {
+        self.outcomes
+            .iter()
+            .map(|e| {
+                let (closed, unverified) = e.value().clone();
+                (e.key().clone(), closed, unverified)
+            })
+            .collect()
+    }
+
+
+    pub(crate) fn set_piece_phases(&mut self, phases: &[(u64, CodePiecePhase)]) {
+        let entries: Vec<(u64, CodePiecePhase)> = phases.to_vec();
+        if let Ok(tracker) = serde_json::from_str(&serde_json::to_string(&entries).unwrap_or_default()) {
+            self.piece_tracker = tracker;
+        }
+    }
+
+    pub(crate) fn set_formula_phases(&mut self, phases: &[(u64, FormulaPhase)]) {
+        let entries: Vec<(u64, FormulaPhase)> = phases.to_vec();
+        if let Ok(tracker) = serde_json::from_str(&serde_json::to_string(&entries).unwrap_or_default()) {
+            self.formula_tracker = tracker;
+        }
+    }
+
+    pub(crate) fn restore_outcome(
+        &self,
+        function_id: FunctionId,
+        closed: Option<crate::result::ClosedPiece>,
+        unverified: Option<crate::result::UnverifiedPiece>,
+    ) {
+        let _prev = self.outcomes.insert(function_id, (closed, unverified));
     }
 }
 
@@ -145,8 +267,32 @@ impl DeductivePieceManager for DefaultDeductivePieceManager {
         let _prev = self.function_docs.insert(function_id, docs);
     }
 
+    fn record_outcome(
+        &self,
+        function_id: &FunctionId,
+        closed: Option<crate::result::ClosedPiece>,
+        unverified: Option<crate::result::UnverifiedPiece>,
+    ) {
+        let _prev = self.outcomes.insert(function_id.clone(), (closed, unverified));
+    }
+
+    fn outcome_of(
+        &self,
+        function_id: &FunctionId,
+    ) -> Option<(Option<crate::result::ClosedPiece>, Option<crate::result::UnverifiedPiece>)> {
+        self.outcomes.get(function_id).map(|e| e.value().clone())
+    }
+
     fn get_function_docs(&self, function_id: &FunctionId) -> String {
         self.function_docs.get(function_id).map(|g| g.value().clone()).unwrap_or_default()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn is_resumed(&self) -> bool {
+        Self::is_resumed(self)
     }
 }
 
@@ -159,6 +305,7 @@ pub fn test_pm() -> DefaultDeductivePieceManager {
 mod tests {
     use super::*;
     use crate::phase::{CodePiecePhase, FormulaPhase};
+
     use std::path::PathBuf;
 
     fn make_function_id(name: &str) -> FunctionId {
