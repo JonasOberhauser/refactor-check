@@ -53,7 +53,7 @@ pub enum Step {
 
 pub trait AlgorithmState: Send + Sync + 'static {
     fn execute(
-        self: Box<Self>,
+        &mut self,
         providers: &Providers<'_>,
         pm: &dyn crate::piece_manager::DeductivePieceManager,
     ) -> Result<Step>;
@@ -82,11 +82,11 @@ impl PreflightGit {
     }
 }
 impl AlgorithmState for PreflightGit {
-    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
+    fn execute(&mut self, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking git");
         let _resp = providers.git.invoke(GitRequest::CurrentCommitHash)?;
         info!("preflight: git OK");
-        Ok(Step::State(Box::new(PreflightSolver { project_path: self.project_path })))
+        Ok(Step::State(Box::new(PreflightSolver { project_path: std::mem::take(&mut self.project_path) })))
     }
 }
 
@@ -94,7 +94,7 @@ pub struct PreflightSolver {
     project_path: PathBuf,
 }
 impl AlgorithmState for PreflightSolver {
-    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
+    fn execute(&mut self, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking z3 solver");
         let root = ContextId::root();
         let resp = providers.solver.invoke(SolverRequest {
@@ -102,7 +102,7 @@ impl AlgorithmState for PreflightSolver {
             context_id: Box::new(root.new_child()),
         })?;
         info!(ctx = %resp.context_id, "preflight: solver OK");
-        Ok(Step::State(Box::new(PreflightPython { project_path: self.project_path })))
+        Ok(Step::State(Box::new(PreflightPython { project_path: std::mem::take(&mut self.project_path) })))
     }
 }
 
@@ -110,13 +110,13 @@ pub struct PreflightPython {
     project_path: PathBuf,
 }
 impl AlgorithmState for PreflightPython {
-    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
+    fn execute(&mut self, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking python3");
         let _resp = providers.python.invoke(PythonRequest {
             script: r#"print("(check-sat)")"#.to_string(),
         })?;
         info!("preflight: python3 OK");
-        Ok(Step::State(Box::new(PreflightAgent { project_path: self.project_path })))
+        Ok(Step::State(Box::new(PreflightAgent { project_path: std::mem::take(&mut self.project_path) })))
     }
 }
 
@@ -124,7 +124,7 @@ pub struct PreflightAgent {
     project_path: PathBuf,
 }
 impl AlgorithmState for PreflightAgent {
-    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
+    fn execute(&mut self, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking opencode agent");
         let resp = providers.agent.invoke(AgentRequest {
             prompt: "Say OK".to_string(),
@@ -139,7 +139,7 @@ impl AlgorithmState for PreflightAgent {
             anyhow::bail!("opencode agent check failed: {}", resp.stdout);
         }
         info!("preflight: opencode OK");
-        Ok(Step::State(Box::new(PreflightProject { project_path: self.project_path })))
+        Ok(Step::State(Box::new(PreflightProject { project_path: std::mem::take(&mut self.project_path) })))
     }
 }
 
@@ -147,7 +147,7 @@ pub struct PreflightProject {
     project_path: PathBuf,
 }
 impl AlgorithmState for PreflightProject {
-    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
+    fn execute(&mut self, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking project files");
         let resp = providers.git.invoke(GitRequest::WalkRustFiles {
             path: self.project_path.clone(),
@@ -158,13 +158,13 @@ impl AlgorithmState for PreflightProject {
         }
         info!("preflight: project OK ({count} rust files)");
         info!("preflight: all checks passed");
-        Ok(Step::State(Box::new(Initializer::new(self.project_path))))
+        Ok(Step::State(Box::new(Initializer::new(std::mem::take(&mut self.project_path)))))
     }
 }
 
 impl AlgorithmState for Initializer {
     fn execute(
-        self: Box<Self>,
+        &mut self,
         providers: &Providers<'_>,
         _pm: &dyn crate::piece_manager::DeductivePieceManager,
     ) -> Result<Step> {
@@ -242,7 +242,7 @@ impl AlgorithmState for Initializer {
         info!("IO response: {} rust files", all_rust_files.len());
 
         Ok(Step::State(Box::new(FunctionLister {
-            project_path: self.project_path,
+            project_path: std::mem::take(&mut self.project_path),
             verification_dir,
             branch_name,
             files: all_rust_files,
@@ -261,7 +261,7 @@ pub struct FunctionLister {
 
 impl AlgorithmState for FunctionLister {
     fn execute(
-        self: Box<Self>,
+        &mut self,
         providers: &Providers<'_>,
         _pm: &dyn crate::piece_manager::DeductivePieceManager,
     ) -> Result<Step> {
@@ -305,12 +305,12 @@ impl AlgorithmState for FunctionLister {
         }
 
         Ok(Step::State(Box::new(FunctionAnalyzer {
-            project_path: self.project_path,
-            verification_dir: self.verification_dir,
-            branch_name: self.branch_name,
+            project_path: std::mem::take(&mut self.project_path),
+            verification_dir: std::mem::take(&mut self.verification_dir),
+            branch_name: std::mem::take(&mut self.branch_name),
             functions: function_map,
             function_docs,
-            accumulated_bugs: self.accumulated_bugs,
+            accumulated_bugs: std::mem::take(&mut self.accumulated_bugs),
         })))
     }
 }
@@ -383,7 +383,7 @@ pub struct FunctionAnalyzer {
 
 impl AlgorithmState for FunctionAnalyzer {
     fn execute(
-        self: Box<Self>,
+        &mut self,
         providers: &Providers<'_>,
         _pm: &dyn crate::piece_manager::DeductivePieceManager,
     ) -> Result<Step> {
@@ -408,12 +408,12 @@ impl AlgorithmState for FunctionAnalyzer {
         }
 
         Ok(Step::State(Box::new(Splitter {
-            project_path: self.project_path,
-            verification_dir: self.verification_dir,
-            branch_name: self.branch_name,
+            project_path: std::mem::take(&mut self.project_path),
+            verification_dir: std::mem::take(&mut self.verification_dir),
+            branch_name: std::mem::take(&mut self.branch_name),
             function_bodies,
-            function_docs: self.function_docs,
-            accumulated_bugs: self.accumulated_bugs,
+            function_docs: std::mem::take(&mut self.function_docs),
+            accumulated_bugs: std::mem::take(&mut self.accumulated_bugs),
         })))
     }
 }
@@ -429,7 +429,7 @@ pub struct Splitter {
 
 impl AlgorithmState for Splitter {
     fn execute(
-        self: Box<Self>,
+        &mut self,
         providers: &Providers<'_>,
         pm: &dyn crate::piece_manager::DeductivePieceManager,
     ) -> Result<Step> {
@@ -447,12 +447,12 @@ impl AlgorithmState for Splitter {
         let code_pieces: Vec<(ArcCodePiece, ContextId)> = results.into_iter().flatten().collect();
 
         Ok(Step::State(Box::new(FullFormalizer {
-            project_path: self.project_path,
-            verification_dir: self.verification_dir,
-            branch_name: self.branch_name,
+            project_path: std::mem::take(&mut self.project_path),
+            verification_dir: std::mem::take(&mut self.verification_dir),
+            branch_name: std::mem::take(&mut self.branch_name),
             pieces: code_pieces,
             iteration: 0,
-            accumulated_bugs: self.accumulated_bugs,
+            accumulated_bugs: std::mem::take(&mut self.accumulated_bugs),
         })))
     }
 }
@@ -1091,19 +1091,19 @@ fn process_piece(
 
 impl AlgorithmState for FullFormalizer {
     fn execute(
-        self: Box<Self>,
+        &mut self,
         providers: &Providers<'_>,
         pm: &dyn crate::piece_manager::DeductivePieceManager,
     ) -> Result<Step> {
         let functions_count = self.functions_count();
         let total_pieces = self.pieces.len();
-        let verification_dir = self.verification_dir;
-        let project_path = self.project_path;
-        let branch_name = self.branch_name;
+        let verification_dir = std::mem::take(&mut self.verification_dir);
+        let project_path = std::mem::take(&mut self.project_path);
+        let branch_name = std::mem::take(&mut self.branch_name);
 
         let mut pieces_only = Vec::new();
         let mut ctxs_only = Vec::new();
-        for (piece, ctx) in self.pieces {
+        for (piece, ctx) in std::mem::take(&mut self.pieces) {
             pieces_only.push(piece);
             ctxs_only.push(ctx);
         }
@@ -1144,7 +1144,7 @@ impl AlgorithmState for FullFormalizer {
             Ok(Step::Result(VerificationResult {
                 closed_pieces,
                 unverified_pieces,
-                bug_reports: self.accumulated_bugs,
+                bug_reports: std::mem::take(&mut self.accumulated_bugs),
                 total_functions: functions_count,
                 total_pieces,
             }))
@@ -1157,7 +1157,7 @@ impl AlgorithmState for FullFormalizer {
                 unverified: unverified_pieces,
                 recheck_files: Vec::new(),
                 base_commit: String::new(),
-                accumulated_bugs: self.accumulated_bugs,
+                accumulated_bugs: std::mem::take(&mut self.accumulated_bugs),
                 total_pieces,
                 total_functions: functions_count,
             })))
@@ -1180,7 +1180,7 @@ pub struct ProblemAnalyzer {
 
 impl AlgorithmState for ProblemAnalyzer {
     fn execute(
-        self: Box<Self>,
+        &mut self,
         providers: &Providers<'_>,
         _pm: &dyn crate::piece_manager::DeductivePieceManager,
     ) -> Result<Step> {
@@ -1353,12 +1353,12 @@ If you respond RETRY, make sure to commit your changes first."#,
             }
         }
 
-        let mut all_bugs = self.accumulated_bugs;
+        let mut all_bugs = std::mem::take(&mut self.accumulated_bugs);
         all_bugs.extend(bug_reports);
 
         if remaining_unverified.is_empty() {
             Ok(Step::Result(VerificationResult {
-                closed_pieces: self.closed,
+                closed_pieces: std::mem::take(&mut self.closed),
                 unverified_pieces: Vec::new(),
                 bug_reports: all_bugs,
                 total_functions: self.total_functions,
@@ -1366,9 +1366,9 @@ If you respond RETRY, make sure to commit your changes first."#,
             }))
         } else {
             Ok(Step::State(Box::new(Restarter {
-                project_path: self.project_path,
-                verification_dir: self.verification_dir,
-                branch_name: self.branch_name,
+                project_path: std::mem::take(&mut self.project_path),
+                verification_dir: std::mem::take(&mut self.verification_dir),
+                branch_name: std::mem::take(&mut self.branch_name),
                 base_commit,
                 recheck_files: files_to_recheck,
                 accumulated_bugs: all_bugs,
@@ -1388,7 +1388,7 @@ pub struct Restarter {
 
 impl AlgorithmState for Restarter {
     fn execute(
-        self: Box<Self>,
+        &mut self,
         providers: &Providers<'_>,
         _pm: &dyn crate::piece_manager::DeductivePieceManager,
     ) -> Result<Step> {
@@ -1420,11 +1420,11 @@ impl AlgorithmState for Restarter {
         all_files.retain(|f| seen.insert(f.clone()));
 
         Ok(Step::State(Box::new(FunctionLister {
-            project_path: self.project_path,
-            verification_dir: self.verification_dir,
-            branch_name: self.branch_name,
+            project_path: std::mem::take(&mut self.project_path),
+            verification_dir: std::mem::take(&mut self.verification_dir),
+            branch_name: std::mem::take(&mut self.branch_name),
             files: all_files,
-            accumulated_bugs: self.accumulated_bugs,
+            accumulated_bugs: std::mem::take(&mut self.accumulated_bugs),
         })))
     }
 }
