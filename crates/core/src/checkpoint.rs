@@ -1,3 +1,13 @@
+//! Checkpointable machines on servyi-states' [`Handle`].
+//!
+//! A machine's root node is its current stage, and [`drive`] runs it. Fan-out
+//! stages run their children through [`fanout`] / [`try_fanout`], never
+//! `Handle::fanout` directly, which would bypass `sequential-fanout`. Each
+//! child keeps its progress and result in its own node and serves a safepoint
+//! before each IO call, so a resumed child that already holds its result does
+//! no work. Contexts the children use are handed out in child order before the
+//! fan-out, so their IDs do not depend on scheduling.
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 
