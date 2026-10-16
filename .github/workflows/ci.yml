@@ -20,6 +20,8 @@ jobs:
       # duv_demo integration tests skip themselves when the fixture
       # project is absent (it lives on dev machines only).
       - run: cargo test --workspace --all-targets
+      # The fuzz harness runs fan-outs in turns (sequential-fanout).
+      - run: cargo test -p refactor-check-core --features sequential-fanout
 
   lint-policy:
     # Shared Servyi policy (servyi/lints): clippy under the shared flag

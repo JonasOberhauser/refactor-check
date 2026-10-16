@@ -3476,7 +3476,7 @@ dependencies = [
 [[package]]
 name = "servyi-states"
 version = "0.1.0"
-source = "git+https://github.com/servyi/states.git?branch=main#d09516da6a16deb539ade8518daf8ee5b60557c0"
+source = "git+https://github.com/servyi/states.git?branch=main#4876a11b2765e433137ff419a288ee4fb8cf153a"
 dependencies = [
  "anyhow",
  "async-trait",

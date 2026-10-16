@@ -12,7 +12,9 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 deductive-check = { path = ".." }
-refactor-check-core = { path = "../../core" }
+# Fan-out children take turns, so the shared byte stream replays
+# deterministically.
+refactor-check-core = { path = "../../core", features = ["sequential-fanout"] }
 servyi-ioprovider = { git = "https://github.com/servyi/ioprovider.git", branch = "main" }
 arbitrary = "1"
 async-trait = "0.1"

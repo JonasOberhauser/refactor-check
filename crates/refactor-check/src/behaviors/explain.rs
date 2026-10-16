@@ -1,57 +1,28 @@
-use anyhow::Result;
-use refactor_check_core::context_id::ContextId;
+use refactor_check_core::checkpoint::Handle;
 use tracing::{info, warn};
 
 use crate::agent::build_explanation_messages;
 use crate::provider::{DynLlmProvider, LlmRequest, LlmRole};
-use crate::smt::SolverOutcome;
-use crate::states::WaitForExplanation;
+use crate::states::ExplanationSlot;
 
-pub fn execute(
-    state: &WaitForExplanation,
-    llm: &DynLlmProvider,
-    parent_ctx: &ContextId,
-) -> Result<Vec<Option<String>>> {
-    let needs_explanation: Vec<(usize, String, SolverOutcome)> = state
-        .result
-        .formulas
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| matches!(f.outcome, SolverOutcome::Sat | SolverOutcome::Unknown))
-        .map(|(i, f)| (i, f.formula.clone(), f.outcome.clone()))
-        .collect();
-
-    if needs_explanation.is_empty() {
-        return Ok(Vec::new());
+/// Stores an explanation of the slot's formula, unless an earlier run already
+/// did or failed to. A failed request leaves it `None`.
+pub fn explain(mut slot: Handle<'_, ExplanationSlot>, input_content: &str, llm: &DynLlmProvider) {
+    if slot.explanation.is_some() {
+        return;
     }
-
-    info!(count = needs_explanation.len(), "generating bug explanations");
-
-    let results: Vec<(usize, Result<String>)> = needs_explanation
-        .iter()
-        .map(|(i, formula, outcome)| {
-            let messages = build_explanation_messages(&state.input_content, formula, outcome);
-            let ctx = parent_ctx.new_child();
-            let resp = llm.invoke(LlmRequest { role: LlmRole::Fixer, messages, context_id: Box::new(ctx) });
-            (*i, resp.map(|r| r.value))
-        })
-        .collect();
-
-    let total = state.result.formulas.len();
-    let mut explanations = vec![None; total];
-
-    for (i, response) in results {
-        match response {
-            Ok(text) => {
-                info!("explanation received for formula {}", i);
-                explanations[i] = Some(text);
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to get explanation for formula {}", i);
-                explanations[i] = None;
-            }
+    let Some(ctx) = slot.ctx.take() else {
+        return;
+    };
+    let messages = build_explanation_messages(input_content, &slot.formula, &slot.outcome);
+    match llm.invoke(LlmRequest { role: LlmRole::Fixer, messages, context_id: ctx }) {
+        Ok(resp) => {
+            info!(ctx = %resp.context_id, "explanation received for formula {}", slot.formula_index);
+            slot.ctx = Some(resp.context_id);
+            slot.explanation = Some(resp.value);
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to get explanation for formula {}", slot.formula_index);
         }
     }
-
-    Ok(explanations)
 }

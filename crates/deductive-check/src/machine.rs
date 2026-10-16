@@ -1,10 +1,11 @@
 use anyhow::Result;
+use refactor_check_core::checkpoint::drive;
 use tracing::info;
 
 use crate::piece_manager::DeductivePieceManager;
 use crate::provider::Providers;
 use crate::result::VerificationResult;
-use crate::states::{AlgorithmState, PreflightGit, Step};
+use crate::states::{fan_out, AlgorithmState, PreflightGit, Stage, Step};
 
 pub fn run(
     project_path: &str,
@@ -12,24 +13,22 @@ pub fn run(
     pm: &dyn DeductivePieceManager,
 ) -> Result<VerificationResult> {
     let project_path = std::path::PathBuf::from(project_path);
-    let mut state: Box<dyn AlgorithmState> = Box::new(PreflightGit::new(project_path));
-
-    loop {
-        state = match state.execute(providers, pm)? {
-            Step::State(next) => {
-                info!("State transition complete");
-                next
-            }
-            Step::Result(result) => {
-                info!(
+    drive(
+        Stage::PreflightGit(PreflightGit::new(project_path)),
+        |h| fan_out(h, providers, pm),
+        |stage| {
+            let step = stage.execute(providers, pm)?;
+            match &step {
+                Step::State(_) => info!("State transition complete"),
+                Step::Result(result) => info!(
                     total_pieces = result.total_pieces,
                     closed = result.closed_pieces.len(),
                     unverified = result.unverified_pieces.len(),
                     bugs = result.bug_reports.len(),
                     "Verification complete"
-                );
-                return Ok(result);
+                ),
             }
-        };
-    }
+            Ok(step)
+        },
+    )
 }

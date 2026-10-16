@@ -1,11 +1,14 @@
+use std::sync::Arc;
+
 use anyhow::Result;
+use refactor_check_core::checkpoint::Handle;
 use tracing::{debug, warn};
 
 use crate::phase::PiecePhase;
 use crate::piece_manager::PieceManager;
 use crate::provider::{DynLlmProvider, LlmRequest, LlmRole};
 use crate::smt::{extract_all_formulas, extract_single_formula};
-use crate::states::{CodePiece, InsistState, VerifiedPiece, WaitForGeneration};
+use crate::states::{CodePiece, GenerationSlot, VerifiedPiece, WaitForGeneration};
 
 pub fn role_for_iteration(iteration: usize) -> LlmRole {
     if iteration == 0 {
@@ -15,51 +18,78 @@ pub fn role_for_iteration(iteration: usize) -> LlmRole {
     }
 }
 
-/// # Panics
-///
-/// Panics via [`CodePiece::with_ctx`] if the piece's context was already
-/// taken and not restored.
-pub fn execute(
-    state: &WaitForGeneration,
-    llm: &DynLlmProvider,
-    pm: &dyn PieceManager,
-) -> Result<Vec<String>> {
-    let role = role_for_iteration(state.iteration);
-    let new_phase = if role == LlmRole::Formalizer { PiecePhase::Forming } else { PiecePhase::Fixing };
-    for piece in &state.pieces {
-        piece.with_ctx(|ctx| pm.enter_generation(ctx, new_phase));
+fn phase_for_role(role: LlmRole) -> PiecePhase {
+    if role == LlmRole::Formalizer { PiecePhase::Forming } else { PiecePhase::Fixing }
+}
+
+/// What the per-piece workers of one generation fan-out share, copied out of
+/// the stage before the fan-out borrows it.
+pub struct GenerationJob {
+    input_content: Arc<String>,
+    verified_summary: String,
+    role: LlmRole,
+}
+
+impl GenerationJob {
+    /// # Panics
+    ///
+    /// Panics if the stage has no pieces.
+    pub fn new(state: &WaitForGeneration) -> Self {
+        assert!(!state.pieces.is_empty(), "must have pieces");
+        Self {
+            input_content: Arc::clone(&state.input_content),
+            verified_summary: verified_summary(&state.verified),
+            role: role_for_iteration(state.iteration),
+        }
     }
 
-    if let InsistState::Insisting { ref last_response, .. } = &state.insist {
-        return generate_insist(state, llm, role, last_response);
+    /// Generates the slot's formula, unless an earlier run already stored it.
+    ///
+    /// # Panics
+    ///
+    /// Panics via [`CodePiece::with_ctx`] if the piece's context was already
+    /// taken and not restored.
+    pub fn run(
+        &self,
+        mut slot: Handle<'_, GenerationSlot>,
+        llm: &DynLlmProvider,
+        pm: &dyn PieceManager,
+    ) -> Result<()> {
+        if slot.formula.is_some() {
+            return Ok(());
+        }
+        slot.piece.with_ctx(|ctx| pm.enter_generation(ctx, phase_for_role(self.role)));
+        debug!(ctx = %slot.piece.ctx_display(), label = %slot.piece.label(), "dispatching generation for piece");
+        let formula = generate_one_formula(&slot.piece, &self.input_content, &self.verified_summary, llm, self.role)?;
+        slot.formula = Some(formula);
+        Ok(())
     }
+}
 
-    assert!(!state.pieces.is_empty(), "must have pieces");
-
+/// The formulas the generation fan-out stored, or none if any piece lacks a
+/// valid one (the caller then insists).
+pub fn collect(state: &WaitForGeneration) -> Vec<String> {
     let formulas: Vec<String> = state
         .pieces
         .iter()
-        .map(|piece| {
-            debug!(ctx = %piece.ctx_display(), label = %piece.label(), "dispatching generation for piece");
-            generate_one_formula(piece, &state.input_content, &state.verified, llm, role)
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .map(|slot| slot.formula.clone().unwrap_or_default())
+        .collect();
     if formulas.iter().any(|f| f.is_empty()) {
         warn!("one or more pieces produced no valid formula, entering insist loop");
-        return Ok(Vec::new());
+        return Vec::new();
     }
     debug!(count = formulas.len(), "generation complete for all pieces");
-    Ok(formulas)
+    formulas
 }
 
 fn generate_one_formula(
     piece: &CodePiece,
     input_content: &str,
-    verified: &[VerifiedPiece],
+    verified_summary: &str,
     llm: &DynLlmProvider,
     role: LlmRole,
 ) -> Result<String> {
-    let messages = build_single_piece_messages(piece, input_content, verified);
+    let messages = build_single_piece_messages(piece, input_content, verified_summary);
     let ctx = piece.take_context().map_err(anyhow::Error::msg)?;
     let resp = llm.invoke(LlmRequest { role, messages, context_id: ctx })?;
     piece.restore_context(resp.context_id);
@@ -69,17 +99,30 @@ fn generate_one_formula(
     Ok(formula)
 }
 
-fn generate_insist(
+/// Asks for all of the stage's formulas in one response, after a fan-out left
+/// some piece without a valid one.
+///
+/// # Panics
+///
+/// Panics via [`CodePiece::with_ctx`] if a piece's context was already taken
+/// and not restored, or if the stage has no pieces.
+pub fn generate_insist(
     state: &WaitForGeneration,
     llm: &DynLlmProvider,
-    role: LlmRole,
+    pm: &dyn PieceManager,
     last_response: &str,
 ) -> Result<Vec<String>> {
+    let role = role_for_iteration(state.iteration);
+    for slot in &state.pieces {
+        slot.piece.with_ctx(|ctx| pm.enter_generation(ctx, phase_for_role(role)));
+    }
+
     let pieces_text: String = state
         .pieces
         .iter()
         .enumerate()
-        .fold(String::new(), |mut s, (i, piece)| {
+        .fold(String::new(), |mut s, (i, slot)| {
+            let piece = &slot.piece;
             let _ = std::fmt::Write::write_fmt(
                 &mut s,
                 format_args!(
@@ -109,9 +152,10 @@ fn generate_insist(
         )),
     ];
 
-    let ctx = state.pieces[0].take_context().map_err(anyhow::Error::msg)?;
+    let first = &state.pieces[0].piece;
+    let ctx = first.take_context().map_err(anyhow::Error::msg)?;
     let resp = llm.invoke(LlmRequest { role, messages, context_id: ctx })?;
-    state.pieces[0].restore_context(resp.context_id);
+    first.restore_context(resp.context_id);
     let response = resp.value;
     let mut formulas = extract_all_formulas(&response);
 
@@ -128,18 +172,30 @@ fn generate_insist(
         .pieces
         .iter()
         .zip(formulas.drain(..))
-        .map(|(piece, formula)| {
-            debug!(ctx = %piece.ctx_display(), label = %piece.label(), "collected insist formula for piece");
+        .map(|(slot, formula)| {
+            debug!(ctx = %slot.piece.ctx_display(), label = %slot.piece.label(), "collected insist formula for piece");
             formula
         })
         .collect();
     Ok(results)
 }
 
+fn verified_summary(verified: &[VerifiedPiece]) -> String {
+    let mut summary = String::new();
+    if !verified.is_empty() {
+        summary.push_str("Already verified pieces:\n");
+        for v in verified {
+            summary.push_str(&format!("  {}: {:?}\n", v.piece.label(), v.outcome));
+        }
+        summary.push('\n');
+    }
+    summary
+}
+
 fn build_single_piece_messages(
     piece: &CodePiece,
     input_content: &str,
-    verified: &[VerifiedPiece],
+    verified_summary: &str,
 ) -> Vec<crate::llm::Message> {
     let mut messages = Vec::new();
 
@@ -172,13 +228,7 @@ fn build_single_piece_messages(
     if !input_content.is_empty() {
         content = format!("Original refactoring context:\n\n{}\n\n{}", input_content, content);
     }
-    if !verified.is_empty() {
-        content.push_str("Already verified pieces:\n");
-        for v in verified {
-            content.push_str(&format!("  {}: {:?}\n", v.piece.label(), v.outcome));
-        }
-        content.push('\n');
-    }
+    content.push_str(verified_summary);
 
     messages.push(crate::llm::user_message(&content));
     messages

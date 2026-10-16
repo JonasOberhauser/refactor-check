@@ -20,3 +20,8 @@ ratatui = { version = "0.28", features = ["unstable-widget-ref"] }
 crossterm = "0.28"
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+# Fan-out children take turns in child order instead of running in parallel,
+# so a fuzz input drives the shared provider stream deterministically.
+sequential-fanout = []

@@ -10,11 +10,15 @@
 //!            FullFormalizer returns Result directly (bug_reports: Vec::new()).
 //!
 //! The f0 bug report from cycle 1 must survive into the final result.
+//!
+//! Also: the fan-outs run concurrently, pieces still aggregate in piece order,
+//! and each piece commits only its own formula files.
 #![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 
@@ -22,7 +26,7 @@ use deductive_check::code_piece::FunctionId;
 use deductive_check::machine;
 use deductive_check::piece_manager::DefaultDeductivePieceManager;
 use deductive_check::provider::{
-    AgentRequest, AgentResponse, CalledFunctionCode, FileSystemRequest, FileSystemResponse,
+    AgentRequest, AgentResponse, CalledFunction, CalledFunctionCode, FileSystemRequest, FileSystemResponse,
     FunctionInfo, GitRequest, GitResponse, Providers, PythonRequest, PythonResponse,
     RustAnalyzerRequest, RustAnalyzerResponse,
 };
@@ -355,4 +359,156 @@ fn no_formula_on_last_judge_attempt_does_not_panic() {
         !result.bug_reports.is_empty() || !result.unverified_pieces.is_empty(),
         "the no-formula piece should surface as a bug or unverified, not crash"
     );
+}
+
+// ── Concurrency: rendezvous wrappers, recording git ────────────────────────
+
+/// Holds callers until `expected` of them are in flight together.
+struct Rendezvous {
+    expected: usize,
+    arrived: Mutex<usize>,
+    all_arrived: Condvar,
+}
+
+const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(10);
+
+impl Rendezvous {
+    fn new(expected: usize) -> Self {
+        Self { expected, arrived: Mutex::new(0), all_arrived: Condvar::new() }
+    }
+
+    fn wait(&self, what: &str) {
+        let mut arrived = self.arrived.lock().unwrap();
+        *arrived += 1;
+        self.all_arrived.notify_all();
+        let (arrived, wait) = self
+            .all_arrived
+            .wait_timeout_while(arrived, RENDEZVOUS_TIMEOUT, |n| *n < self.expected)
+            .unwrap();
+        assert!(!wait.timed_out(), "only {} of {} {what} calls were in flight together", *arrived, self.expected);
+    }
+}
+
+/// [`MockLlm`] whose splitter calls meet.
+struct RendezvousLlm {
+    inner: MockLlm,
+    splits: Rendezvous,
+}
+
+impl IOProvider<LlmRequest, WithContext<String>> for RendezvousLlm {
+    fn invoke(&self, input: LlmRequest) -> Result<WithContext<String>> {
+        if input.role == LlmRole::Splitter {
+            self.splits.wait("splitter");
+        }
+        self.inner.invoke(input)
+    }
+}
+
+/// [`MockRa`] where every function calls two helpers; the function-code and
+/// the helper-code lookups each meet.
+struct RendezvousRa {
+    code: Rendezvous,
+    callee_code: Rendezvous,
+}
+
+impl IOProvider<RustAnalyzerRequest, RustAnalyzerResponse> for RendezvousRa {
+    fn invoke(&self, input: RustAnalyzerRequest) -> Result<RustAnalyzerResponse> {
+        match input {
+            RustAnalyzerRequest::GetFunctionCode { .. } => self.code.wait("function code"),
+            RustAnalyzerRequest::GetCalledFunctions { .. } => {
+                let called = ["helper_a", "helper_b"]
+                    .iter()
+                    .map(|name| CalledFunction { name: name.to_string(), file: None, start_line: None })
+                    .collect();
+                return Ok(RustAnalyzerResponse::CalledFunctionList(called));
+            }
+            RustAnalyzerRequest::GetCalledFunctionCode { .. } => self.callee_code.wait("helper code"),
+            _ => {}
+        }
+        MockRa.invoke(input)
+    }
+}
+
+/// Unsat for everything; the formula checks (not the preflight) meet.
+struct RendezvousSolver(Rendezvous);
+
+impl IOProvider<SolverRequest, WithContext<SolverResult>> for RendezvousSolver {
+    fn invoke(&self, input: SolverRequest) -> Result<WithContext<SolverResult>> {
+        if input.formula.contains("declare-const") {
+            self.0.wait("solver");
+        }
+        Ok(WithContext {
+            value: SolverResult { outcome: SolverOutcome::Unsat, stdout: "unsat".to_string(), stderr: String::new() },
+            context_id: input.context_id,
+        })
+    }
+}
+
+/// Records what each commit staged.
+#[derive(Default)]
+struct RecordingGit {
+    staged: Mutex<Vec<PathBuf>>,
+    commits: Mutex<Vec<(String, Vec<PathBuf>)>>,
+}
+
+impl IOProvider<GitRequest, GitResponse> for RecordingGit {
+    fn invoke(&self, input: GitRequest) -> Result<GitResponse> {
+        match input {
+            GitRequest::AddFiles { paths } => self.staged.lock().unwrap().extend(paths),
+            GitRequest::Commit { message } => {
+                let staged = std::mem::take(&mut *self.staged.lock().unwrap());
+                self.commits.lock().unwrap().push((message, staged));
+            }
+            other => return MockGit.invoke(other),
+        }
+        Ok(GitResponse { success: true, output: String::new() })
+    }
+}
+
+/// Two functions, one piece each, two helpers and two formulas per piece: the
+/// code lookups, the splits, all four helper lookups and all four formula
+/// checks run concurrently.
+#[test]
+fn parallel_pieces_aggregate_in_order_and_commit_separately() {
+    let project = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(project.path().join(".git")).expect("create .git marker");
+
+    let llm = RendezvousLlm {
+        inner: MockLlm { formalizer_out: format!("{SMT_OUT}{SMT_OUT}") },
+        splits: Rendezvous::new(2),
+    };
+    let ra = RendezvousRa { code: Rendezvous::new(2), callee_code: Rendezvous::new(4) };
+    let solver = RendezvousSolver(Rendezvous::new(4));
+    let git = RecordingGit::default();
+    let agent = MockAgent { responses: Mutex::new(VecDeque::from([(true, "OK".to_string())])) };
+    let providers = Providers {
+        llm: &llm,
+        solver: &solver,
+        rust_analyzer: &ra,
+        git: &git,
+        filesystem: &MockFs,
+        python: &MockPython,
+        agent: &agent,
+    };
+
+    let pm = DefaultDeductivePieceManager::default();
+    let result = machine::run(project.path().to_str().expect("utf8 temp path"), &providers, &pm)
+        .expect("machine ran");
+
+    let names: Vec<&str> = result.closed_pieces.iter().map(|p| p.function_id.name.as_str()).collect();
+    assert_eq!(names, ["f0", "f1"], "pieces aggregate in piece order");
+
+    let commits = git.commits.lock().unwrap();
+    assert_eq!(commits.len(), 2, "one commit per piece: {commits:?}");
+    for (message, staged) in commits.iter() {
+        let ctx = message
+            .strip_prefix("Add formulas for ctx ")
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap_or_else(|| panic!("unexpected commit message {message:?}"));
+        assert_eq!(staged.len(), 2, "commit {message:?} must stage its piece's two formulas");
+        for path in staged {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap();
+            assert!(name.starts_with(&format!("ctx{ctx}.")), "commit {message:?} staged {name}");
+        }
+    }
 }

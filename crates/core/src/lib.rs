@@ -1,5 +1,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results))]
 
+pub mod checkpoint;
 pub mod config_update;
 pub mod consts;
 pub mod context_id;

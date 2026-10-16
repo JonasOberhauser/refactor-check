@@ -232,7 +232,7 @@ collect these files as modified files. Go to:
 - Replaced `Analysis::from_single_file()` with `ProjectWorkspace`-based `CliRustAnalyzerProvider` that loads entire Cargo project via `ra_ap_project_model`
 - Fixed byte offset vs line number bug: `node_range.start()/end()` are `TextSize` (byte offsets), not line numbers — added `byte_offset_to_line()` / `line_to_byte_offset()` conversion helpers with bounds-checking assertions
 - Fixed VFS setup: use `vfs.take_changes()` to get file contents instead of re-reading from disk (was causing rowan "Bad offset" panics)
-- Fixed empty code passed to formalizer/judge: `split_function` retries up to 3 times on empty splitter response, filters out empty-code pieces, skips functions with empty bodies
+- Fixed empty code passed to formalizer/judge: `split_attempt` retries up to 3 times on empty splitter response, filters out empty-code pieces, skips functions with empty bodies
 - Fixed formula not shown to fixer LLM on solver error: `check_formula` now returns `(Formula, SolverOutcome, String)` where third element is the actual SMT content sent to solver; fix loop passes `current_smt` to `fix_formula` instead of raw `ef.content`
 - Formula summary shown to judge now includes actual formula content (not just outcome)
 - Judge prompt uses `refactor_check_core::consts::JUDGE_REASONABLE` constant instead of hardcoded "REASONABLE"
@@ -246,6 +246,7 @@ collect these files as modified files. Go to:
 - `formalizer_user`, `judge_user`, `analyzer_user` prompts accept `docs_section: &str` parameter
 - Added `store_function_docs`/`get_function_docs` to `DeductivePieceManager` trait and impl (backed by `DashMap<FunctionId, String>`)
 - Build, clippy, and tests pass
+- Checkpointable machine on `servyi_states::checkpoint::Handle` (see "Checkpointable machine" in `crates/refactor-check/AGENTS.md`): `FunctionAnalyzer` and `Splitter` (per function) and `FullFormalizer` (per piece, nested per callee and per formula) fan out in parallel. `SplitTask` / `PieceTask` / `FormulaTask` hold each child's split-attempt, judge-attempt and fix-attempt progress. Pieces stage and commit only their own formula files, serialized by a lock. `ProblemAnalyzer` stays sequential (its agent edits and commits source files) but analyzes one piece per step.
 
 ### Outstanding: Postconditions Detection (HIGH PRIORITY)
 

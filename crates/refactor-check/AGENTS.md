@@ -1,5 +1,14 @@
 # Refactor-Check Crate — Design Decisions
 
+### Checkpointable machine on `Handle` (2026-10-16)
+
+- Both machines (this crate and deductive-check) run under `servyi_states::checkpoint` through `refactor_check_core::checkpoint::drive`: the root node is the current `Stage` (an enum of the state structs, replacing `Box<dyn AlgorithmState>`), and `AlgorithmState::execute` takes the state by value.
+- A step serves a safepoint, runs the stage's fan-out on the root `Handle` (`machine::fan_out`), then the owned transition. A fan-out stage's transition only collects what its children stored; the other stages do their IO in the transition.
+- Fan-outs use core's `fanout` / `try_fanout` (one scoped thread per child), never `Handle::fanout` directly: `GenerationSlot` (one per piece), `FormulaBranch` (phase, retry count, latest formula and `done` outcome, advanced in place), `ExplanationSlot`. A child that already holds its result does no work, so a snapshot taken mid-fan-out resumes without re-running finished children.
+- `try_fanout` returns the first child error once all children joined and cancels the siblings; multi-step children check `Cancellation` before each IO step, next to their safepoint.
+- Contexts the children use (explanations here; functions and formulas in deductive-check) are handed out in child order before the fan-out, so IDs do not depend on scheduling.
+- The `sequential-fanout` feature of core makes children take turns in child order; the fuzz harness enables it so one input replays deterministically against its shared byte stream.
+
 ### WaitForSplittingJudge (2026-05-27)
 
 - After the splitter produces code pieces, a `WaitForSplittingJudge` state evaluates the decomposition before proceeding to `WaitForGeneration`.

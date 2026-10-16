@@ -2,7 +2,8 @@
 //!
 //! All providers share a single [`FuzzData`] byte stream (via `Arc<Mutex<...>>`),
 //! so one libFuzzer input deterministically drives every provider call in
-//! sequence. The two context-bearing providers (LLM, solver) use
+//! sequence; the `sequential-fanout` feature of `refactor-check-core` keeps
+//! that sequence fixed by running fan-out children one at a time, in order. The two context-bearing providers (LLM, solver) use
 //! [`ContextFuzzProvider`], which moves the non-cloneable `Box<ContextId>` out
 //! of the owned request after the fuzz draw borrows it.
 
@@ -390,6 +391,7 @@ impl Fuzz<AgentRequest, AgentResponse> for FuzzAgent {
 /// Owns all seven fuzz providers, all sharing one byte stream, and lends out a
 /// [`Providers`] borrowing them.
 pub struct FuzzProviders {
+    stream: Arc<Mutex<FuzzData>>,
     llm: ContextFuzzProvider<FuzzLlm>,
     solver: ContextFuzzProvider<FuzzSolver>,
     rust_analyzer: FuzzProvider<FuzzRustAnalyzer, RustAnalyzerRequest, RustAnalyzerResponse>,
@@ -403,6 +405,7 @@ impl FuzzProviders {
     pub fn new(data: Vec<u8>) -> Self {
         let stream = fuzz_stream_from_bytes(data);
         Self {
+            stream: Arc::clone(&stream),
             llm: ContextFuzzProvider::new(FuzzLlm, Arc::clone(&stream)),
             solver: ContextFuzzProvider::new(FuzzSolver, Arc::clone(&stream)),
             rust_analyzer: FuzzProvider::with_stream(FuzzRustAnalyzer, Arc::clone(&stream)),
@@ -411,6 +414,11 @@ impl FuzzProviders {
             python: FuzzProvider::with_stream(FuzzPython, Arc::clone(&stream)),
             agent: FuzzProvider::with_stream(FuzzAgent, stream),
         }
+    }
+
+    /// Bytes of the shared stream the providers consumed so far.
+    pub fn consumed(&self) -> usize {
+        self.stream.lock().expect("fuzz stream poisoned").pos()
     }
 
     pub fn providers(&self) -> Providers<'_> {
@@ -491,50 +499,37 @@ mod tests {
         }
     }
 
-    /// Pick the largest corpus input (richest execution) for a representative trace.
-    fn pick_corpus_input() -> Option<Vec<u8>> {
-        let dir = std::path::PathBuf::from("corpus/state_machine");
-        let mut entries: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(&dir)
-            .ok()?
-            .filter_map(Result::ok)
-            .filter_map(|e| Some((e.metadata().ok()?.len(), e.path())))
-            .collect();
-        entries.sort_by_key(|(len, _)| *len);
-        entries.last().map(|(_, p)| std::fs::read(p).ok())?
+    /// A run's footprint: stream bytes consumed and, if it finished, the
+    /// closed/unverified/bug counts.
+    fn footprint(data: &[u8]) -> (usize, Option<(usize, usize, usize)>) {
+        let project = setup_temp_project();
+        let providers = FuzzProviders::new(data.to_vec());
+        let pm = DefaultDeductivePieceManager::default();
+        let result = machine::run(
+            project.path().to_str().expect("non-utf8 temp path"),
+            &providers.providers(),
+            &pm,
+        );
+        let counts = result
+            .ok()
+            .map(|r| (r.closed_pieces.len(), r.unverified_pieces.len(), r.bug_reports.len()));
+        (providers.consumed(), counts)
     }
 
-    /// Runs one state-machine execution with a tracing subscriber writing the
-    /// full `deductive_check` event flow to a file. Run with:
-    ///   cargo +nightly test trace_one_run -- --nocapture
+    /// Fan-out children take turns (`sequential-fanout`), so they draw from
+    /// the shared stream in a fixed order and an input replays identically.
     #[test]
-    fn trace_one_run() {
-        use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-
-        let trace_path = std::path::PathBuf::from(
-            std::env::var("FUZZ_TRACE_PATH")
-                .unwrap_or_else(|_| "/tmp/opencode/fuzz_trace.log".to_string()),
-        );
-        if let Some(parent) = trace_path.parent() {
-            std::fs::create_dir_all(parent).ok();
+    fn replays_deterministically() {
+        // Seeds whose runs fan out enough to diverge without the feature.
+        for seed in [1u64, 4, 7, 16] {
+            let data: Vec<u8> = (0..2048u64)
+                .map(|i| ((i.wrapping_mul(seed).wrapping_add(seed) ^ (i >> 3)) % 251) as u8)
+                .collect();
+            let first = footprint(&data);
+            assert!(first.0 > 128, "seed {seed}: the run should exercise the machine, consumed {}", first.0);
+            for _ in 0..3 {
+                assert_eq!(footprint(&data), first, "seed {seed} did not replay identically");
+            }
         }
-        let file = std::fs::File::create(&trace_path).expect("create trace file");
-
-        // Thread-local default subscriber; run_state_machine runs on this same
-        // thread (current-thread runtime), so all events are captured.
-        let _guard = tracing_subscriber::registry()
-            .with(EnvFilter::new(
-                "deductive_check=info,deductive_check_fuzz=info,refactor_check_core=warn,warn",
-            ))
-            .with(fmt::layer().with_writer(file).with_ansi(false).with_target(false))
-            .set_default();
-
-        let data = match std::env::var("FUZZ_INPUT_PATH") {
-            Ok(p) => std::fs::read(&p)
-                .unwrap_or_else(|e| panic!("FUZZ_INPUT_PATH read failed ({p}): {e}")),
-            Err(_) => pick_corpus_input().unwrap_or_else(|| vec![123u8; 200]),
-        };
-        eprintln!("tracing input of {} bytes -> {}", data.len(), trace_path.display());
-        run_state_machine(&data);
-        eprintln!("trace written to {}", trace_path.display());
     }
 }

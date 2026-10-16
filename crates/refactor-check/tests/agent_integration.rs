@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 
 use refactor_check::consts::JUDGE_REASONABLE;
@@ -346,4 +347,111 @@ fn test_split_sat_piece_detected() {
     assert_eq!(result.formulas.len(), 1);
     assert_eq!(result.reasonable_sat, 1);
     assert!(!result.overall_equivalent);
+}
+
+/// Holds callers until `expected` of them are in flight together.
+struct Rendezvous {
+    expected: usize,
+    arrived: Mutex<usize>,
+    all_arrived: Condvar,
+}
+
+impl Rendezvous {
+    const TIMEOUT: Duration = Duration::from_secs(10);
+
+    fn new(expected: usize) -> Self {
+        Self { expected, arrived: Mutex::new(0), all_arrived: Condvar::new() }
+    }
+
+    /// The caller's arrival index, once all callers arrived.
+    fn wait(&self) -> anyhow::Result<usize> {
+        let mut arrived = self.arrived.lock().expect("lock poisoned");
+        let index = *arrived;
+        *arrived += 1;
+        self.all_arrived.notify_all();
+        let (arrived, wait) = self
+            .all_arrived
+            .wait_timeout_while(arrived, Self::TIMEOUT, |n| *n < self.expected)
+            .expect("lock poisoned");
+        if wait.timed_out() {
+            anyhow::bail!("only {} of {} calls were in flight together", *arrived, self.expected);
+        }
+        Ok(index)
+    }
+}
+
+fn unsat(context_id: Box<refactor_check_core::context_id::ContextId>) -> WithContext<SolverResult> {
+    WithContext {
+        value: SolverResult {
+            outcome: SolverOutcome::Unsat,
+            stdout: "unsat".to_string(),
+            stderr: String::new(),
+        },
+        context_id,
+    }
+}
+
+/// The branches of one fan-out run concurrently: every solver call waits until
+/// all four are in flight. The results still come out in piece order.
+#[test_log::test]
+fn test_branches_run_in_parallel() {
+    const PIECES: usize = 4;
+
+    struct RendezvousSolver(Rendezvous);
+    impl IOProvider<SolverRequest, WithContext<SolverResult>> for RendezvousSolver {
+        fn invoke(&self, input: SolverRequest) -> anyhow::Result<WithContext<SolverResult>> {
+            let _arrival = self.0.wait()?;
+            Ok(unsat(input.context_id))
+        }
+    }
+
+    let llm = SequenceLlm::with_accepting_judge(
+        vec![formula_response_single(); PIECES],
+        vec![],
+        vec![JUDGE_REASONABLE.to_string(); PIECES],
+        vec![split_four_pieces()],
+    );
+    let solver = RendezvousSolver(Rendezvous::new(PIECES));
+
+    let pm = test_pm();
+    let result = machine::run("refactoring desc", &llm, &solver, &pm)
+        .expect("agent should succeed");
+
+    let labels: Vec<&str> = result.formulas.iter().map(|f| f.piece_label.as_str()).collect();
+    assert_eq!(labels, ["a", "b", "c", "d"]);
+    assert!(result.overall_equivalent);
+}
+
+/// A branch whose solver call fails aborts the run, and its sibling stops at
+/// its next step instead of going on to the judge.
+#[test_log::test]
+fn test_failed_branch_cancels_its_sibling() {
+    const SIBLING_DELAY: Duration = Duration::from_millis(200);
+
+    struct FailFirstSolver(Rendezvous);
+    impl IOProvider<SolverRequest, WithContext<SolverResult>> for FailFirstSolver {
+        fn invoke(&self, input: SolverRequest) -> anyhow::Result<WithContext<SolverResult>> {
+            if self.0.wait()? == 0 {
+                anyhow::bail!("solver crashed");
+            }
+            std::thread::sleep(SIBLING_DELAY);
+            Ok(unsat(input.context_id))
+        }
+    }
+
+    let llm = SequenceLlm::with_accepting_judge(
+        vec![formula_response_single(), formula_response_single()],
+        vec![],
+        vec![JUDGE_REASONABLE.to_string(), JUDGE_REASONABLE.to_string()],
+        vec![split_two_pieces()],
+    );
+    let solver = FailFirstSolver(Rendezvous::new(2));
+
+    let pm = test_pm();
+    let err = machine::run("refactoring desc", &llm, &solver, &pm)
+        .err()
+        .expect("a failed solver call aborts the run");
+
+    assert!(err.to_string().contains("solver crashed"), "{err:#}");
+    assert_eq!(llm.judge_remaining(), 2, "the sibling must not reach the judge");
 }

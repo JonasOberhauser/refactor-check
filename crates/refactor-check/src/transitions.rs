@@ -16,14 +16,14 @@ use crate::states::*;
 
 impl AlgorithmState for WaitForSplit {
     fn execute(
-        self: Box<Self>,
+        self,
         llm: &DynLlmProvider,
         _solver: &DynSolverProvider,
         pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
         let raw_pieces = behaviors::splitter::execute(&self, llm, pm, ContextId::root())?;
         let pieces: Vec<Arc<CodePiece>> = raw_pieces.into_iter().map(Arc::new).collect();
-        Ok(Step::State(Box::new(WaitForSplittingJudge {
+        Ok(Step::State(Stage::SplittingJudge(WaitForSplittingJudge {
             input_content: self.input_content,
             pieces,
             pieces_to_resplit: self.pieces_to_resplit,
@@ -37,7 +37,7 @@ impl AlgorithmState for WaitForSplit {
 
 impl AlgorithmState for WaitForSplittingJudge {
     fn execute(
-        self: Box<Self>,
+        self,
         llm: &DynLlmProvider,
         _solver: &DynSolverProvider,
         _pm: &dyn PieceManager,
@@ -46,13 +46,13 @@ impl AlgorithmState for WaitForSplittingJudge {
         match verdict {
             behaviors::splitting_judge::SplittingJudgeVerdict::Accept => {
                 debug!("splitting judge accepted the decomposition");
-                Ok(Step::State(Box::new(WaitForGeneration {
+                Ok(Step::State(Stage::Generation(WaitForGeneration {
                     input_content: self.input_content,
                     verified: self.verified,
                     open: self.open,
                     iteration: self.iteration,
                     insist: InsistState::Idle,
-                    pieces: self.pieces,
+                    pieces: self.pieces.into_iter().map(GenerationSlot::new).collect(),
                 })))
             }
             behaviors::splitting_judge::SplittingJudgeVerdict::Retry(feedback) => {
@@ -72,10 +72,10 @@ impl AlgorithmState for WaitForSplittingJudge {
                     let counts = OutcomeCounts::from_verified(&self.verified);
                     if open.is_empty() {
                         if counts.needs_explanation() {
-                            return Ok(Step::State(Box::new(WaitForExplanation {
-                                input_content: self.input_content,
-                                result: build_result(&self.verified, 0, &counts),
-                            })));
+                            return Ok(Step::State(Stage::Explanation(WaitForExplanation::new(
+                                self.input_content,
+                                build_result(&self.verified, 0, &counts),
+                            ))));
                         }
                         return Ok(Step::Result(build_result(&self.verified, 0, &counts)));
                     }
@@ -88,8 +88,9 @@ impl AlgorithmState for WaitForSplittingJudge {
                             &counts,
                         )));
                     }
-                    let pieces: Vec<Arc<CodePiece>> = open.iter().map(|o| Arc::clone(&o.piece)).collect();
-                    return Ok(Step::State(Box::new(WaitForGeneration {
+                    let pieces: Vec<GenerationSlot> =
+                        open.iter().map(|o| GenerationSlot::new(Arc::clone(&o.piece))).collect();
+                    return Ok(Step::State(Stage::Generation(WaitForGeneration {
                         input_content: self.input_content,
                         verified: self.verified,
                         open: Vec::new(),
@@ -99,7 +100,7 @@ impl AlgorithmState for WaitForSplittingJudge {
                     })));
                 }
                 debug!(depth = new_depth, feedback = %feedback, "splitting judge rejected, re-splitting");
-                Ok(Step::State(Box::new(WaitForSplit {
+                Ok(Step::State(Stage::Split(WaitForSplit {
                     input_content: self.input_content,
                     pieces_to_resplit: self.pieces_to_resplit,
                     verified: self.verified,
@@ -115,19 +116,23 @@ impl AlgorithmState for WaitForSplittingJudge {
 
 impl AlgorithmState for WaitForGeneration {
     fn execute(
-        self: Box<Self>,
+        self,
         llm: &DynLlmProvider,
         _solver: &DynSolverProvider,
         pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
-        if let InsistState::Insisting { attempt, .. } = &self.insist {
-            if *attempt >= MAX_INSIST_ATTEMPTS {
-                anyhow::bail!("failed to extract any SMT formula after {MAX_INSIST_ATTEMPTS} insist attempts");
+        let formulas = match &self.insist {
+            InsistState::Insisting { attempt, last_response } => {
+                if *attempt >= MAX_INSIST_ATTEMPTS {
+                    anyhow::bail!("failed to extract any SMT formula after {MAX_INSIST_ATTEMPTS} insist attempts");
+                }
+                generation::generate_insist(&self, llm, pm, last_response)?
             }
-        }
-        let formulas = generation::execute(&self, llm, pm)?;
+            InsistState::Idle => generation::collect(&self),
+        };
+        let pieces = self.pieces.into_iter().map(|slot| slot.piece);
         if formulas.is_empty() {
-            return Ok(Step::State(Box::new(WaitForGeneration {
+            return Ok(Step::State(Stage::Generation(WaitForGeneration {
                 input_content: self.input_content,
                 verified: self.verified,
                 open: self.open,
@@ -136,12 +141,11 @@ impl AlgorithmState for WaitForGeneration {
                     last_response: String::new(),
                     attempt: self.insist.attempt() + 1,
                 },
-                pieces: self.pieces,
+                pieces: pieces.map(GenerationSlot::new).collect(),
             })));
         }
 
-        let branches: Vec<FormulaBranch> = self.pieces
-            .into_iter()
+        let branches: Vec<FormulaBranch> = pieces
             .zip(formulas)
             .map(|(piece, formula)| {
                 debug!(ctx = %piece.ctx_display(), label = %piece.label(), "paired piece with formula");
@@ -153,11 +157,12 @@ impl AlgorithmState for WaitForGeneration {
                         formula,
                     },
                     retry_count: 0,
+                    done: None,
                 }
             })
             .collect();
 
-        Ok(Step::State(Box::new(WaitForResults {
+        Ok(Step::State(Stage::Results(WaitForResults {
             input_content: self.input_content,
             verified: self.verified,
             open: self.open,
@@ -169,20 +174,22 @@ impl AlgorithmState for WaitForGeneration {
 
 impl AlgorithmState for WaitForResults {
     fn execute(
-        self: Box<Self>,
-        llm: &DynLlmProvider,
-        solver: &DynSolverProvider,
-        pm: &dyn PieceManager,
+        self,
+        _llm: &DynLlmProvider,
+        _solver: &DynSolverProvider,
+        _pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
-        let WaitForResults { input_content, verified, open, iteration, branches } = *self;
-        let done = behaviors::results::execute_all(branches, llm, solver, pm)?;
+        let WaitForResults { input_content, verified, open, iteration, branches } = self;
 
         let mut verified = verified;
         let mut open = open;
         let mut needs_resplit: Vec<(Arc<CodePiece>, String)> = Vec::new();
 
-        for cd in done {
-            match cd {
+        for branch in branches {
+            let done = branch.done.ok_or_else(|| {
+                anyhow::anyhow!("branch {} ended without an outcome", branch.piece.label())
+            })?;
+            match done {
                 ChildDone::Verified(piece) => verified.push(piece),
                 ChildDone::Open(item) => open.push(item),
                 ChildDone::NeedsResplit { piece, formula: _, reason } => {
@@ -192,7 +199,7 @@ impl AlgorithmState for WaitForResults {
         }
 
         if !needs_resplit.is_empty() {
-            return Ok(Step::State(Box::new(WaitForSplit {
+            return Ok(Step::State(Stage::Split(WaitForSplit {
                 input_content: Arc::clone(&input_content),
                 pieces_to_resplit: needs_resplit,
                 verified,
@@ -207,16 +214,17 @@ impl AlgorithmState for WaitForResults {
 
         if open.is_empty() {
             if counts.needs_explanation() {
-                return Ok(Step::State(Box::new(WaitForExplanation {
+                return Ok(Step::State(Stage::Explanation(WaitForExplanation::new(
                     input_content,
-                    result: build_result(&verified, 0, &counts),
-                })));
+                    build_result(&verified, 0, &counts),
+                ))));
             }
             return Ok(Step::Result(build_result(&verified, 0, &counts)));
         }
 
         let next_iteration = iteration + 1;
-        let pieces: Vec<Arc<CodePiece>> = open.iter().map(|o| Arc::clone(&o.piece)).collect();
+        let pieces: Vec<GenerationSlot> =
+            open.iter().map(|o| GenerationSlot::new(Arc::clone(&o.piece))).collect();
         let next = WaitForGeneration {
             input_content,
             verified,
@@ -235,23 +243,41 @@ impl AlgorithmState for WaitForResults {
             )));
         }
 
-        Ok(Step::State(Box::new(next)))
+        Ok(Step::State(Stage::Generation(next)))
     }
 }
 
 impl AlgorithmState for WaitForExplanation {
     fn execute(
-        self: Box<Self>,
-        llm: &DynLlmProvider,
+        self,
+        _llm: &DynLlmProvider,
         _solver: &DynSolverProvider,
         _pm: &dyn PieceManager,
     ) -> anyhow::Result<Step> {
-        let explanations = behaviors::explain::execute(&self, llm, ContextId::root())?;
         let mut result = self.result;
-        for (f, explanation) in result.formulas.iter_mut().zip(explanations) {
-            f.explanation = explanation;
+        for slot in self.explanations {
+            if let Some(f) = result.formulas.get_mut(slot.formula_index) {
+                f.explanation = slot.explanation;
+            }
         }
         Ok(Step::Result(result))
+    }
+}
+
+impl AlgorithmState for Stage {
+    fn execute(
+        self,
+        llm: &DynLlmProvider,
+        solver: &DynSolverProvider,
+        pm: &dyn PieceManager,
+    ) -> anyhow::Result<Step> {
+        match self {
+            Stage::Split(s) => s.execute(llm, solver, pm),
+            Stage::SplittingJudge(s) => s.execute(llm, solver, pm),
+            Stage::Generation(s) => s.execute(llm, solver, pm),
+            Stage::Results(s) => s.execute(llm, solver, pm),
+            Stage::Explanation(s) => s.execute(llm, solver, pm),
+        }
     }
 }
 

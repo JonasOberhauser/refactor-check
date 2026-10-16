@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use refactor_check_core::context_id::ContextId;
 
 pub use crate::piece::CodePiece;
 use crate::piece_manager::PieceManager;
@@ -7,14 +8,25 @@ use crate::result::AgentResult;
 use crate::provider::{DynLlmProvider, DynSolverProvider};
 use crate::smt::{SolverOutcome, SolverResult};
 
-pub enum Step {
-    State(Box<dyn AlgorithmState>),
-    Result(AgentResult),
+pub type Step = refactor_check_core::checkpoint::Step<Stage, AgentResult>;
+
+/// The machine between two steps, and the root node of its checkpoint tree.
+/// Fan-out stages keep their children inside, and every child stores its own
+/// progress and result, so a snapshot taken mid-fan-out records which
+/// children already finished.
+pub enum Stage {
+    Split(WaitForSplit),
+    SplittingJudge(WaitForSplittingJudge),
+    Generation(WaitForGeneration),
+    Results(WaitForResults),
+    Explanation(WaitForExplanation),
 }
 
+/// A stage's transition. Fan-out stages run their children first (see
+/// `machine::fan_out`), so `execute` only collects what the children stored.
 pub trait AlgorithmState: Send + Sync {
     fn execute(
-        self: Box<Self>,
+        self,
         llm: &DynLlmProvider,
         solver: &DynSolverProvider,
         pm: &dyn PieceManager,
@@ -61,7 +73,20 @@ pub struct WaitForGeneration {
     pub open: Vec<OpenItem>,
     pub iteration: usize,
     pub insist: InsistState,
-    pub pieces: Vec<Arc<CodePiece>>,
+    pub pieces: Vec<GenerationSlot>,
+}
+
+/// One piece of a [`WaitForGeneration`] fan-out. `formula` is `None` until the
+/// piece's worker has run; an empty formula means none could be extracted.
+pub struct GenerationSlot {
+    pub piece: Arc<CodePiece>,
+    pub formula: Option<String>,
+}
+
+impl GenerationSlot {
+    pub fn new(piece: Arc<CodePiece>) -> Self {
+        Self { piece, formula: None }
+    }
 }
 
 pub struct WaitForResults {
@@ -75,6 +100,41 @@ pub struct WaitForResults {
 pub struct WaitForExplanation {
     pub input_content: Arc<String>,
     pub result: AgentResult,
+    /// One per SAT or UNKNOWN formula of `result`, in formula order.
+    pub explanations: Vec<ExplanationSlot>,
+}
+
+impl WaitForExplanation {
+    /// Contexts are handed out here, in formula order, so the explanation
+    /// workers number them the same way however they are scheduled.
+    pub fn new(input_content: Arc<String>, result: AgentResult) -> Self {
+        let root = ContextId::root();
+        let explanations = result
+            .formulas
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| matches!(f.outcome, SolverOutcome::Sat | SolverOutcome::Unknown))
+            .map(|(formula_index, f)| ExplanationSlot {
+                formula_index,
+                formula: f.formula.clone(),
+                outcome: f.outcome.clone(),
+                ctx: Some(Box::new(root.new_child())),
+                explanation: None,
+            })
+            .collect();
+        Self { input_content, result, explanations }
+    }
+}
+
+/// One formula of the [`WaitForExplanation`] fan-out; its worker stores the
+/// explanation.
+pub struct ExplanationSlot {
+    pub formula_index: usize,
+    pub formula: String,
+    pub outcome: SolverOutcome,
+    /// `None` once a request took it and failed; the slot is then done.
+    pub ctx: Option<Box<ContextId>>,
+    pub explanation: Option<String>,
 }
 
 #[derive(Debug)]
@@ -105,12 +165,15 @@ pub enum JudgeVerdict {
     Retry(String),
 }
 
+/// One piece of a [`WaitForResults`] fan-out. Its worker advances `phase` in
+/// place; `formula` is the latest formula and `done` the outcome once reached.
 pub struct FormulaBranch {
     pub piece: Arc<CodePiece>,
     pub input_content: Arc<String>,
     pub formula: String,
     pub phase: BranchPhase,
     pub retry_count: usize,
+    pub done: Option<ChildDone>,
 }
 
 #[derive(Clone)]
