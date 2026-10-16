@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+servyi-states = { git = "https://github.com/servyi/states.git", branch = "main" }
 refactor-check-core = { path = "../core" }
 servyi-ioprovider = { git = "https://github.com/servyi/ioprovider.git", branch = "main" }
 servyi-servatui = { git = "https://github.com/servyi/servatui.git", branch = "main" }
-async-openai = { version = "0.36", features = ["chat-completion"] }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

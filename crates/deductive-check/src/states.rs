@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use refactor_check_core::context_id::ContextId;
+use servyi_states::checkpoint::Handle;
 use tracing::{debug, info, warn};
 
 use crate::code_piece::{ArcCodePiece, FunctionId};
@@ -46,273 +47,860 @@ fn unverified_from_piece(
     }
 }
 
-pub enum Step {
-    State(Box<dyn AlgorithmState>),
-    Result(VerificationResult),
+
+
+// ── The machine state ───────────────────────────────────────────────────────
+//
+// The machine's state is the checkpoint pair's node type — `Handle<MachineState>`
+// IS the running machine. Every transition reads its data through the handle
+// and installs the next state through the handle. Two disciplines keep the
+// state checkpointable at all times:
+//
+//   1. IO runs with data borrowed (or cheaply cloned) from the state; big
+//      work (pieces, function bodies) lives in the state's slot vectors and
+//      fans out directly off them — it never leaves the tree.
+//   2. A transition computes the next state from `&mut` of the current one
+//      and installs it in one window that contains no safepoint, so a save
+//      can never observe an emptied intermediate.
+
+/// One piece verification: a fan-out child. The piece and its ctx live in
+/// the state for the child's whole life — the child accesses them through
+/// its handle; they are never moved out. `outcome` is written once, at
+/// completion.
+pub struct PieceSlot {
+    pub piece: ArcCodePiece,
+    pub ctx: ContextId,
+    pub outcome: Option<Result<PieceOutcome>>,
 }
 
-pub trait AlgorithmState: Send + Sync + 'static {
-    fn execute(
-        self: Box<Self>,
-        providers: &Providers<'_>,
-        pm: &dyn crate::piece_manager::DeductivePieceManager,
-    ) -> Result<Step>;
+/// One splitter invocation: a fan-out child. Same rule: data lives in the
+/// state, accessed through the handle.
+pub struct SplitSlot {
+    pub file: PathBuf,
+    pub fid: FunctionId,
+    pub body: String,
+    pub outcome: Option<Result<Vec<(ArcCodePiece, ContextId)>>>,
 }
 
-pub struct Initializer {
-    project_path: PathBuf,
+/// The machine state: which transition runs next, plus its data.
+pub enum MachineState {
+    PreflightGit { project_path: PathBuf },
+    PreflightSolver { project_path: PathBuf },
+    PreflightPython { project_path: PathBuf },
+    PreflightAgent { project_path: PathBuf },
+    PreflightProject { project_path: PathBuf },
+    Initializing { project_path: PathBuf },
+    ListingFunctions {
+        project_path: PathBuf,
+        verification_dir: PathBuf,
+        branch_name: String,
+        files: Vec<PathBuf>,
+        accumulated_bugs: Vec<BugReport>,
+    },
+    AnalyzingFunctions {
+        project_path: PathBuf,
+        verification_dir: PathBuf,
+        branch_name: String,
+        functions: HashMap<PathBuf, Vec<FunctionId>>,
+        function_docs: HashMap<FunctionId, String>,
+        accumulated_bugs: Vec<BugReport>,
+    },
+    Splitting {
+        project_path: PathBuf,
+        verification_dir: PathBuf,
+        branch_name: String,
+        function_bodies: Vec<SplitSlot>,
+        function_docs: HashMap<FunctionId, String>,
+        accumulated_bugs: Vec<BugReport>,
+    },
+    Formalizing {
+        project_path: PathBuf,
+        verification_dir: PathBuf,
+        branch_name: String,
+        pieces: Vec<PieceSlot>,
+        accumulated_bugs: Vec<BugReport>,
+    },
+    AnalyzingProblems {
+        project_path: PathBuf,
+        verification_dir: PathBuf,
+        branch_name: String,
+        closed: Vec<ClosedPiece>,
+        unverified: Vec<UnverifiedPiece>,
+        recheck_files: Vec<PathBuf>,
+        base_commit: String,
+        accumulated_bugs: Vec<BugReport>,
+        total_pieces: usize,
+        total_functions: usize,
+    },
+    Restarting {
+        project_path: PathBuf,
+        verification_dir: PathBuf,
+        branch_name: String,
+        base_commit: String,
+        recheck_files: Vec<PathBuf>,
+        accumulated_bugs: Vec<BugReport>,
+    },
 }
 
-impl Initializer {
-    pub fn new(project_path: PathBuf) -> Self {
-        Self { project_path }
+impl MachineState {
+    /// A fresh machine starting at the git preflight.
+    #[must_use]
+    pub fn start(project_path: PathBuf) -> Self {
+        Self::PreflightGit { project_path }
     }
 }
 
-/// Preflight: verify all external tools are installed and working before
-/// starting the verification pipeline. Each check is a separate state using
-/// the appropriate IOProvider, so failures are individually recoverable via
-/// the error gate.
-pub struct PreflightGit {
-    project_path: PathBuf,
+/// What a machine step decided.
+pub enum Flow {
+    /// Transition installed; keep stepping.
+    Continue,
+    /// Verification finished.
+    Done(VerificationResult),
 }
-impl PreflightGit {
-    pub fn new(project_path: PathBuf) -> Self {
-        Self { project_path }
-    }
-}
-impl AlgorithmState for PreflightGit {
-    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
-        info!("preflight: checking git");
-        let _resp = providers.git.invoke(GitRequest::CurrentCommitHash)?;
-        info!("preflight: git OK");
-        Ok(Step::State(Box::new(PreflightSolver { project_path: self.project_path })))
+
+/// Advance the machine by one transition. Parks at the step boundary.
+pub fn step(
+    handle: &mut Handle<'_, MachineState>,
+    providers: &Providers<'_>,
+    pm: &dyn crate::piece_manager::DeductivePieceManager,
+) -> Result<Flow> {
+    handle.safepoint();
+    match &**handle {
+        MachineState::PreflightGit { .. } => step_preflight_git(handle, providers),
+        MachineState::PreflightSolver { .. } => step_preflight_solver(handle, providers),
+        MachineState::PreflightPython { .. } => step_preflight_python(handle, providers),
+        MachineState::PreflightAgent { .. } => step_preflight_agent(handle, providers),
+        MachineState::PreflightProject { .. } => step_preflight_project(handle, providers),
+        MachineState::Initializing { .. } => step_initializing(handle, providers),
+        MachineState::ListingFunctions { .. } => step_listing_functions(handle, providers),
+        MachineState::AnalyzingFunctions { .. } => step_analyzing_functions(handle, providers),
+        MachineState::Splitting { .. } => step_splitting(handle, providers, pm),
+        MachineState::Formalizing { .. } => step_formalizing(handle, providers, pm),
+        MachineState::AnalyzingProblems { .. } => step_analyzing_problems(handle, providers),
+        MachineState::Restarting { .. } => step_restarting(handle, providers),
     }
 }
 
-pub struct PreflightSolver {
-    project_path: PathBuf,
-}
-impl AlgorithmState for PreflightSolver {
-    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
-        info!("preflight: checking z3 solver");
-        let root = ContextId::root();
-        let resp = providers.solver.invoke(SolverRequest {
-            formula: "(check-sat)".to_string(),
-            context_id: Box::new(root.new_child()),
-        })?;
-        info!(ctx = %resp.context_id, "preflight: solver OK");
-        Ok(Step::State(Box::new(PreflightPython { project_path: self.project_path })))
-    }
-}
-
-pub struct PreflightPython {
-    project_path: PathBuf,
-}
-impl AlgorithmState for PreflightPython {
-    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
-        info!("preflight: checking python3");
-        let _resp = providers.python.invoke(PythonRequest {
-            script: r#"print("(check-sat)")"#.to_string(),
-        })?;
-        info!("preflight: python3 OK");
-        Ok(Step::State(Box::new(PreflightAgent { project_path: self.project_path })))
-    }
+fn step_preflight_git(
+    handle: &mut Handle<'_, MachineState>,
+    providers: &Providers<'_>,
+) -> Result<Flow> {
+    info!("preflight: checking git");
+    let _resp = providers.git.invoke(GitRequest::CurrentCommitHash)?;
+    info!("preflight: git OK");
+    let next = match &mut **handle {
+        MachineState::PreflightGit { project_path } => MachineState::PreflightSolver {
+                project_path: std::mem::take(project_path),
+        },
+        _ => anyhow::bail!("phase mismatch: expected PreflightGit"),
+    };
+    **handle = next;
+    Ok(Flow::Continue)
 }
 
-pub struct PreflightAgent {
-    project_path: PathBuf,
+fn step_preflight_solver(
+    handle: &mut Handle<'_, MachineState>,
+    providers: &Providers<'_>,
+) -> Result<Flow> {
+    info!("preflight: checking z3 solver");
+    let root = ContextId::root();
+    let resp = providers.solver.invoke(SolverRequest {
+        formula: "(check-sat)".to_string(),
+        context_id: Box::new(root.new_child()),
+    })?;
+    info!(ctx = %resp.context_id, "preflight: solver OK");
+    let next = match &mut **handle {
+        MachineState::PreflightSolver { project_path } => MachineState::PreflightPython {
+                project_path: std::mem::take(project_path),
+        },
+        _ => anyhow::bail!("phase mismatch: expected PreflightSolver"),
+    };
+    **handle = next;
+    Ok(Flow::Continue)
 }
-impl AlgorithmState for PreflightAgent {
-    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
-        info!("preflight: checking opencode agent");
-        let resp = providers.agent.invoke(AgentRequest {
-            prompt: "Say OK".to_string(),
-            working_directory: self.project_path.clone(),
-            files_to_read: vec![],
-            // Recoverable: a bad key or missing binary parks in the error
-            // gate, the user fixes it and hits RETRY (the agent re-reads
-            // the live key on every call).
-            recoverable: true,
-        })?;
+
+fn step_preflight_python(
+    handle: &mut Handle<'_, MachineState>,
+    providers: &Providers<'_>,
+) -> Result<Flow> {
+    info!("preflight: checking python3");
+    let _resp = providers.python.invoke(PythonRequest {
+        script: r#"print("(check-sat)")"#.to_string(),
+    })?;
+    info!("preflight: python3 OK");
+    let next = match &mut **handle {
+        MachineState::PreflightPython { project_path } => MachineState::PreflightAgent {
+                project_path: std::mem::take(project_path),
+        },
+        _ => anyhow::bail!("phase mismatch: expected PreflightPython"),
+    };
+    **handle = next;
+    Ok(Flow::Continue)
+}
+
+fn step_preflight_agent(
+    handle: &mut Handle<'_, MachineState>,
+    providers: &Providers<'_>,
+) -> Result<Flow> {
+    info!("preflight: checking opencode agent");
+    let working_directory = match &**handle {
+        MachineState::PreflightAgent { project_path } => project_path.clone(),
+        _ => anyhow::bail!("phase mismatch: expected PreflightAgent"),
+    };
+    let resp = providers.agent.invoke(AgentRequest {
+        prompt: "Say OK".to_string(),
+        working_directory,
+        files_to_read: vec![],
+        // Recoverable: a bad key or missing binary parks in the error
+        // gate, the user fixes it and hits RETRY (the agent re-reads
+        // the live key on every call).
+        recoverable: true,
+    })?;
+    if !resp.success {
+        anyhow::bail!("opencode agent check failed: {}", resp.stdout);
+    }
+    info!("preflight: opencode OK");
+    let next = match &mut **handle {
+        MachineState::PreflightAgent { project_path } => MachineState::PreflightProject {
+                project_path: std::mem::take(project_path),
+        },
+        _ => anyhow::bail!("phase mismatch: expected PreflightAgent"),
+    };
+    **handle = next;
+    Ok(Flow::Continue)
+}
+
+fn step_preflight_project(
+    handle: &mut Handle<'_, MachineState>,
+    providers: &Providers<'_>,
+) -> Result<Flow> {
+    info!("preflight: checking project files");
+    let project_path = match &**handle {
+        MachineState::PreflightProject { project_path } => project_path.clone(),
+        _ => anyhow::bail!("phase mismatch: expected PreflightProject"),
+    };
+    let resp = providers.git.invoke(GitRequest::WalkRustFiles { path: project_path })?;
+    let count = resp.output.lines().filter(|l| !l.is_empty()).count();
+    if count == 0 {
+        anyhow::bail!("no .rs files found in project");
+    }
+    info!("preflight: project OK ({count} rust files)");
+    info!("preflight: all checks passed");
+    let next = match &mut **handle {
+        MachineState::PreflightProject { project_path } => MachineState::Initializing {
+                project_path: std::mem::take(project_path),
+        },
+        _ => anyhow::bail!("phase mismatch: expected PreflightProject"),
+    };
+    **handle = next;
+    Ok(Flow::Continue)
+}
+
+fn step_initializing(
+    handle: &mut Handle<'_, MachineState>,
+    providers: &Providers<'_>,
+) -> Result<Flow> {
+    let project_path = match &**handle {
+        MachineState::Initializing { project_path } => project_path.clone(),
+        _ => anyhow::bail!("phase mismatch: expected Initializing"),
+    };
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let branch_name = format!("verification/{timestamp}");
+
+    // Ensure the project is inside a git work tree. Ask git itself — a
+    // subcrate of a bigger repo has no .git of its own, and git-init'ing
+    // a nested repo there would be wrong; we branch in the enclosing
+    // repo instead.
+    let repo_root = providers.git.invoke(GitRequest::RepoRoot)?;
+    if !repo_root.success {
+        info!(project = %project_path.display(), "not inside a git work tree, initializing git repo");
+        let resp = providers.git.invoke(GitRequest::Init { path: project_path.clone() })?;
         if !resp.success {
-            anyhow::bail!("opencode agent check failed: {}", resp.stdout);
+            anyhow::bail!("Failed to init git repo: {}", resp.output);
         }
-        info!("preflight: opencode OK");
-        Ok(Step::State(Box::new(PreflightProject { project_path: self.project_path })))
+        info!("adding rust files to git");
+        let resp = providers.git.invoke(GitRequest::AddAll { path: project_path.clone() })?;
+        if !resp.success {
+            anyhow::bail!("Failed to add files: {}", resp.output);
+        }
+        let resp = providers.git.invoke(GitRequest::Commit { message: "Initial commit".to_string() })?;
+        if !resp.success {
+            anyhow::bail!("Failed to create initial commit: {}", resp.output);
+        }
+        info!("git repo initialized with initial commit");
+    } else {
+        info!(root = %repo_root.output.trim(), "using existing git work tree");
     }
+
+    info!("IO: git CreateBranch");
+    let resp = providers.git.invoke(GitRequest::CreateBranch { name: branch_name.clone() })?;
+    info!("IO response: git CreateBranch");
+    if !resp.success {
+        anyhow::bail!("Failed to create verification branch: {}", resp.output);
+    }
+
+    let verification_dir = project_path.join("verification").join(&timestamp);
+    info!("IO: git CreateDirectory");
+    let resp = providers.git.invoke(GitRequest::CreateDirectory { path: verification_dir.clone() })?;
+    info!("IO response: git CreateDirectory");
+    if !resp.success {
+        anyhow::bail!("Failed to create verification directory: {}", resp.output);
+    }
+
+    info!("IO: git WalkRustFiles");
+    let resp = providers.git.invoke(GitRequest::WalkRustFiles { path: project_path.clone() })?;
+    let mut all_rust_files: Vec<PathBuf> = resp
+        .output
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    all_rust_files.retain(|f| seen.insert(f.clone()));
+    info!("IO response: {} rust files", all_rust_files.len());
+
+    let next = match &mut **handle {
+        MachineState::Initializing { .. } => MachineState::ListingFunctions {
+                project_path,
+                verification_dir,
+                branch_name,
+                files: all_rust_files,
+                accumulated_bugs: Vec::new(),
+        },
+        _ => anyhow::bail!("phase mismatch: expected Initializing"),
+    };
+    **handle = next;
+    Ok(Flow::Continue)
 }
 
-pub struct PreflightProject {
-    project_path: PathBuf,
-}
-impl AlgorithmState for PreflightProject {
-    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
-        info!("preflight: checking project files");
-        let resp = providers.git.invoke(GitRequest::WalkRustFiles {
-            path: self.project_path.clone(),
+fn step_listing_functions(
+    handle: &mut Handle<'_, MachineState>,
+    providers: &Providers<'_>,
+) -> Result<Flow> {
+    let files = match &**handle {
+        MachineState::ListingFunctions { files, .. } => files.clone(),
+        _ => anyhow::bail!("phase mismatch: expected ListingFunctions"),
+    };
+    info!("IO: rust-analyzer ListFunctions");
+    let resp = providers
+        .rust_analyzer
+        .invoke(RustAnalyzerRequest::ListFunctions {
+            files: files.clone(),
+            cfg_verification: true,
         })?;
-        let count = resp.output.lines().filter(|l| !l.is_empty()).count();
-        if count == 0 {
-            anyhow::bail!("no .rs files found in project");
-        }
-        info!("preflight: project OK ({count} rust files)");
-        info!("preflight: all checks passed");
-        Ok(Step::State(Box::new(Initializer::new(self.project_path))))
-    }
-}
+    info!("IO response: rust-analyzer ListFunctions");
 
-impl AlgorithmState for Initializer {
-    fn execute(
-        self: Box<Self>,
-        providers: &Providers<'_>,
-        _pm: &dyn crate::piece_manager::DeductivePieceManager,
-    ) -> Result<Step> {
-        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
-        let branch_name = format!("verification/{timestamp}");
+    let functions = match resp {
+        RustAnalyzerResponse::FunctionList(fns) => fns,
+        _ => anyhow::bail!("Expected FunctionList from rust-analyzer"),
+    };
 
-        // Ensure the project is inside a git work tree. Ask git itself — a
-        // subcrate of a bigger repo has no .git of its own, and git-init'ing
-        // a nested repo there would be wrong; we branch in the enclosing
-        // repo instead.
-        let repo_root = providers.git.invoke(GitRequest::RepoRoot)?;
-        if !repo_root.success {
-            info!(project = %self.project_path.display(), "not inside a git work tree, initializing git repo");
-            let resp = providers
-                .git
-                .invoke(GitRequest::Init { path: self.project_path.clone() })?;
-            if !resp.success {
-                anyhow::bail!("Failed to init git repo: {}", resp.output);
-            }
-            info!("adding rust files to git");
-            let resp = providers
-                .git
-                .invoke(GitRequest::AddAll { path: self.project_path.clone() })?;
-            if !resp.success {
-                anyhow::bail!("Failed to add files: {}", resp.output);
-            }
-            let resp = providers
-                .git
-                .invoke(GitRequest::Commit { message: "Initial commit".to_string() })?;
-            if !resp.success {
-                anyhow::bail!("Failed to create initial commit: {}", resp.output);
-            }
-            info!("git repo initialized with initial commit");
-        } else {
-            info!(root = %repo_root.output.trim(), "using existing git work tree");
-        }
+    let target_file_set: HashSet<PathBuf> = files.iter().cloned().collect();
+    let filtered = filter_connected_functions(functions, &target_file_set);
 
-        info!("IO: git CreateBranch");
-        let resp = providers
-            .git
-            .invoke(GitRequest::CreateBranch {
-                name: branch_name.clone(),
-            })?;
-        info!("IO response: git CreateBranch");
-        if !resp.success {
-            anyhow::bail!("Failed to create verification branch: {}", resp.output);
-        }
+    let mut seen_fns = std::collections::HashSet::new();
+    let guaranteed: Vec<FunctionInfo> = filtered
+        .into_iter()
+        .filter(|fi| fi.has_guarantees)
+        .filter(|fi| seen_fns.insert((fi.id.file.clone(), fi.id.name.clone(), fi.id.line)))
+        .collect();
 
-        let verification_dir = self.project_path.join("verification").join(&timestamp);
-        info!("IO: git CreateDirectory");
-        let resp = providers
-            .git
-            .invoke(GitRequest::CreateDirectory {
-                path: verification_dir.clone(),
-            })?;
-        info!("IO response: git CreateDirectory");
-        if !resp.success {
-            anyhow::bail!("Failed to create verification directory: {}", resp.output);
-        }
-
-        info!("IO: git WalkRustFiles");
-        let resp = providers
-            .git
-            .invoke(GitRequest::WalkRustFiles {
-                path: self.project_path.clone(),
-            })?;
-        let mut all_rust_files: Vec<PathBuf> = resp
-            .output
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(PathBuf::from)
-            .collect();
-        let mut seen = std::collections::HashSet::new();
-        all_rust_files.retain(|f| seen.insert(f.clone()));
-        info!("IO response: {} rust files", all_rust_files.len());
-
-        Ok(Step::State(Box::new(FunctionLister {
-            project_path: self.project_path,
-            verification_dir,
-            branch_name,
-            files: all_rust_files,
-            accumulated_bugs: Vec::new(),
-        })))
-    }
-}
-
-pub struct FunctionLister {
-    project_path: PathBuf,
-    verification_dir: PathBuf,
-    branch_name: String,
-    files: Vec<PathBuf>,
-    accumulated_bugs: Vec<BugReport>,
-}
-
-impl AlgorithmState for FunctionLister {
-    fn execute(
-        self: Box<Self>,
-        providers: &Providers<'_>,
-        _pm: &dyn crate::piece_manager::DeductivePieceManager,
-    ) -> Result<Step> {
-        info!("IO: rust-analyzer ListFunctions");
-        let resp = providers
-            .rust_analyzer
-            .invoke(RustAnalyzerRequest::ListFunctions {
-                files: self.files.clone(),
-                cfg_verification: true,
-            })?;
-        info!("IO response: rust-analyzer ListFunctions");
-
-        let functions = match resp {
-            RustAnalyzerResponse::FunctionList(fns) => fns,
-            _ => anyhow::bail!("Expected FunctionList from rust-analyzer"),
-        };
-
-        let target_file_set: HashSet<PathBuf> = self.files.iter().cloned().collect();
-        let filtered = filter_connected_functions(functions, &target_file_set);
-
-        let mut seen_fns = std::collections::HashSet::new();
-        let guaranteed: Vec<FunctionInfo> = filtered
-            .into_iter()
-            .filter(|fi| fi.has_guarantees)
-            .filter(|fi| seen_fns.insert((fi.id.file.clone(), fi.id.name.clone(), fi.id.line)))
-            .collect();
-
-        let function_map: std::collections::HashMap<PathBuf, Vec<FunctionId>> = {
-            let mut map: std::collections::HashMap<PathBuf, Vec<FunctionId>> = std::collections::HashMap::new();
-            for fi in &guaranteed {
-                map.entry(fi.id.file.clone()).or_default().push(fi.id.clone());
-            }
-            map
-        };
-
-        let mut function_docs: HashMap<FunctionId, String> = HashMap::new();
+    let function_map: std::collections::HashMap<PathBuf, Vec<FunctionId>> = {
+        let mut map: std::collections::HashMap<PathBuf, Vec<FunctionId>> = std::collections::HashMap::new();
         for fi in &guaranteed {
-            if !fi.docs.is_empty() {
-                let _prev = function_docs.insert(fi.id.clone(), fi.docs.clone());
+            map.entry(fi.id.file.clone()).or_default().push(fi.id.clone());
+        }
+        map
+    };
+    drop(seen_fns);
+
+    let mut function_docs: HashMap<FunctionId, String> = HashMap::new();
+    for fi in &guaranteed {
+        if !fi.docs.is_empty() {
+            let _prev = function_docs.insert(fi.id.clone(), fi.docs.clone());
+        }
+    }
+
+    let next = match &mut **handle {
+        MachineState::ListingFunctions { project_path, verification_dir, branch_name, accumulated_bugs, .. } => MachineState::AnalyzingFunctions {
+                project_path: std::mem::take(project_path),
+                verification_dir: std::mem::take(verification_dir),
+                branch_name: std::mem::take(branch_name),
+                functions: function_map,
+                function_docs,
+                accumulated_bugs: std::mem::take(accumulated_bugs),
+        },
+        _ => anyhow::bail!("phase mismatch: expected ListingFunctions"),
+    };
+    **handle = next;
+    Ok(Flow::Continue)
+}
+
+fn step_analyzing_functions(
+    handle: &mut Handle<'_, MachineState>,
+    providers: &Providers<'_>,
+) -> Result<Flow> {
+    let functions = match &**handle {
+        MachineState::AnalyzingFunctions { functions, .. } => functions,
+        _ => anyhow::bail!("phase mismatch: expected AnalyzingFunctions"),
+    };
+    let mut function_bodies = Vec::new();
+    for (file, function_ids) in functions {
+        for fid in function_ids {
+            debug!("IO: rust-analyzer GetFunctionCode");
+            let resp = providers
+                .rust_analyzer
+                .invoke(RustAnalyzerRequest::GetFunctionCode {
+                    function_id: fid.clone(),
+                })?;
+            debug!("IO response: rust-analyzer GetFunctionCode");
+            let body = match resp {
+                RustAnalyzerResponse::FunctionCode(code) => code,
+                _ => anyhow::bail!("Expected FunctionCode from rust-analyzer"),
+            };
+            if !body.trim().is_empty() {
+                function_bodies.push(SplitSlot {
+                    file: file.clone(),
+                    fid: fid.clone(),
+                    body,
+                    outcome: None,
+                });
             }
         }
-
-        Ok(Step::State(Box::new(FunctionAnalyzer {
-            project_path: self.project_path,
-            verification_dir: self.verification_dir,
-            branch_name: self.branch_name,
-            functions: function_map,
-            function_docs,
-            accumulated_bugs: self.accumulated_bugs,
-        })))
     }
+
+    let next = match &mut **handle {
+        MachineState::AnalyzingFunctions { project_path, verification_dir, branch_name, function_docs, accumulated_bugs, .. } => MachineState::Splitting {
+                project_path: std::mem::take(project_path),
+                verification_dir: std::mem::take(verification_dir),
+                branch_name: std::mem::take(branch_name),
+                function_bodies,
+                function_docs: std::mem::take(function_docs),
+                accumulated_bugs: std::mem::take(accumulated_bugs),
+        },
+        _ => anyhow::bail!("phase mismatch: expected AnalyzingFunctions"),
+    };
+    **handle = next;
+    Ok(Flow::Continue)
+}
+
+fn step_splitting(
+    handle: &mut Handle<'_, MachineState>,
+    providers: &Providers<'_>,
+    pm: &dyn crate::piece_manager::DeductivePieceManager,
+) -> Result<Flow> {
+    // The function bodies live in the state's slot vector; the fan-out
+    // splits them off it directly, so a mid-fanout save sees everything.
+    let docs: Vec<(FunctionId, String)> = match &mut **handle {
+        MachineState::Splitting { function_docs, .. } => std::mem::take(function_docs).into_iter().collect(),
+        _ => anyhow::bail!("phase mismatch: expected Splitting"),
+    };
+    let root_ctx = ContextId::root();
+    handle.fanout(
+        &|s| match s {
+            MachineState::Splitting { function_bodies, .. } => function_bodies.iter_mut().collect(),
+            _ => Vec::new(),
+        },
+        |mut child: Handle<'_, SplitSlot>| {
+            child.safepoint();
+            child.outcome = Some(split_function(&mut child, providers, pm, root_ctx));
+            child.safepoint();
+        },
+    );
+
+    let results: Vec<_> = match &mut **handle {
+        MachineState::Splitting { function_bodies, .. } => std::mem::take(function_bodies)
+            .into_iter()
+            .map(|slot| slot.outcome.expect("fan-out child stores its outcome"))
+            .collect::<Result<Vec<_>>>()?,
+        _ => anyhow::bail!("phase mismatch: expected Splitting"),
+    };
+
+    for (fid, docs) in docs {
+        pm.store_function_docs(fid, docs);
+    }
+
+    let code_pieces: Vec<(ArcCodePiece, ContextId)> = results.into_iter().flatten().collect();
+
+    let next = match &mut **handle {
+        MachineState::Splitting { project_path, verification_dir, branch_name, accumulated_bugs, .. } => MachineState::Formalizing {
+            project_path: std::mem::take(project_path),
+            verification_dir: std::mem::take(verification_dir),
+            branch_name: std::mem::take(branch_name),
+            pieces: code_pieces
+                .into_iter()
+                .map(|(piece, ctx)| PieceSlot { piece, ctx, outcome: None })
+                .collect(),
+            accumulated_bugs: std::mem::take(accumulated_bugs),
+        },
+        _ => anyhow::bail!("phase mismatch: expected Splitting"),
+    };
+    **handle = next;
+    Ok(Flow::Continue)
+}
+
+/// Distinct function names among the pieces — the result's function total.
+fn functions_count(slots: &[PieceSlot]) -> usize {
+    let mut seen = HashSet::new();
+    for slot in slots {
+        let _new = seen.insert(slot.piece.function_id().name.clone());
+    }
+    seen.len()
+}
+
+fn step_formalizing(
+    handle: &mut Handle<'_, MachineState>,
+    providers: &Providers<'_>,
+    pm: &dyn crate::piece_manager::DeductivePieceManager,
+) -> Result<Flow> {
+    // The pieces live in the state's slot vector; the fan-out splits them
+    // off it directly, so a mid-fanout save sees everything.
+    let verification_dir = match &**handle {
+        MachineState::Formalizing { verification_dir, .. } => verification_dir.clone(),
+        _ => anyhow::bail!("phase mismatch: expected Formalizing"),
+    };
+    let total_pieces = match &**handle {
+        MachineState::Formalizing { pieces, .. } => pieces.len(),
+        _ => anyhow::bail!("phase mismatch: expected Formalizing"),
+    };
+    let ctx_labels: Vec<String> = match &**handle {
+        MachineState::Formalizing { pieces, .. } => pieces.iter().map(|s| s.ctx.to_string()).collect(),
+        _ => anyhow::bail!("phase mismatch: expected Formalizing"),
+    };
+
+    handle.fanout(
+        &|s| match s {
+            MachineState::Formalizing { pieces, .. } => pieces.iter_mut().collect(),
+            _ => Vec::new(),
+        },
+        |mut child: Handle<'_, PieceSlot>| {
+            child.safepoint();
+            child.outcome = Some(process_piece(&mut child, providers, pm, &verification_dir));
+            child.safepoint();
+        },
+    );
+
+    let slots = match &mut **handle {
+        MachineState::Formalizing { pieces, .. } => std::mem::take(pieces),
+        _ => anyhow::bail!("phase mismatch: expected Formalizing"),
+    };
+    let functions_count = functions_count(&slots);
+
+    let mut closed_pieces = Vec::new();
+    let mut unverified_pieces = Vec::new();
+
+    for (i, slot) in slots.into_iter().enumerate() {
+        let piece = slot.piece;
+        match slot.outcome.expect("fan-out child stores its outcome") {
+            Ok(outcome) => {
+                if let Some(cp) = outcome.closed {
+                    closed_pieces.push(cp);
+                }
+                if let Some(up) = outcome.unverified {
+                    unverified_pieces.push(up);
+                }
+            }
+            Err(e) => {
+                warn!(ctx = %ctx_labels[i], error = %e, "Failed to process piece");
+                unverified_pieces.push(unverified_from_piece(
+                    &piece,
+                    Vec::new(),
+                    Vec::new(),
+                    format!("Processing error: {}", e),
+                ));
+            }
+        }
+    }
+
+    if unverified_pieces.is_empty() {
+        let bug_reports = match &mut **handle {
+            MachineState::Formalizing { accumulated_bugs, .. } => std::mem::take(accumulated_bugs),
+            _ => anyhow::bail!("phase mismatch: expected Formalizing"),
+        };
+        return Ok(Flow::Done(VerificationResult {
+            closed_pieces,
+            unverified_pieces,
+            bug_reports,
+            total_functions: functions_count,
+            total_pieces,
+        }));
+    }
+    let next = match &mut **handle {
+        MachineState::Formalizing { project_path, verification_dir, branch_name, accumulated_bugs, .. } => MachineState::AnalyzingProblems {
+            project_path: std::mem::take(project_path),
+            verification_dir: std::mem::take(verification_dir),
+            branch_name: std::mem::take(branch_name),
+            closed: closed_pieces,
+            unverified: unverified_pieces,
+            recheck_files: Vec::new(),
+            base_commit: String::new(),
+            accumulated_bugs: std::mem::take(accumulated_bugs),
+            total_pieces,
+            total_functions: functions_count,
+        },
+        _ => anyhow::bail!("phase mismatch: expected Formalizing"),
+    };
+    **handle = next;
+    Ok(Flow::Continue)
+}
+
+fn step_analyzing_problems(
+    handle: &mut Handle<'_, MachineState>,
+    providers: &Providers<'_>,
+) -> Result<Flow> {
+    let (project_path, unverified) = match &**handle {
+        MachineState::AnalyzingProblems { project_path, unverified, .. } => {
+            (project_path.clone(), unverified.clone())
+        }
+        _ => anyhow::bail!("phase mismatch: expected AnalyzingProblems"),
+    };
+    info!(
+        unverified_count = unverified.len(),
+        "ProblemAnalyzer: processing unverified pieces",
+    );
+
+    let mut bug_reports = Vec::new();
+    let mut remaining_unverified = Vec::new();
+    let mut files_to_recheck = Vec::new();
+
+    let base_commit = match &**handle {
+        MachineState::AnalyzingProblems { base_commit, .. } if !base_commit.is_empty() => base_commit.clone(),
+        _ => {
+            info!("IO: git CurrentCommitHash");
+            let resp = providers.git.invoke(GitRequest::CurrentCommitHash)?;
+            resp.output.trim().to_string()
+        }
+    };
+    info!(%base_commit, "IO response: git CurrentCommitHash");
+
+    for piece in &unverified {
+        info!(
+            file = %piece.file.display(),
+            function = %piece.function_id.display_name(),
+            "ProblemAnalyzer: processing unverified piece",
+        );
+        info!("IO: rust-analyzer GetFileContent");
+        let source = match providers
+            .rust_analyzer
+            .invoke(RustAnalyzerRequest::GetFileContent {
+                path: piece.file.clone(),
+            })
+        {
+            Ok(RustAnalyzerResponse::FileContent(s)) if !s.is_empty() => s,
+            Ok(_) => {
+                warn!(file = %piece.file.display(), "Source file not found in VFS (empty content)");
+                bug_reports.push(BugReport {
+                    file: piece.file.clone(),
+                    function_id: piece.function_id.clone(),
+                    description: format!(
+                        "{} at {}:{}-{}: could not read source file (not in VFS)",
+                        piece.function_id.display_name(),
+                        piece.file.display(),
+                        piece.start_line,
+                        piece.end_line,
+                    ),
+                });
+                continue;
+            }
+            Err(e) => {
+                warn!(file = %piece.file.display(), error = %e, "Failed to get source file from rust-analyzer");
+                bug_reports.push(BugReport {
+                    file: piece.file.clone(),
+                    function_id: piece.function_id.clone(),
+                    description: format!(
+                        "{} at {}:{}-{}: rust-analyzer error: {}",
+                        piece.function_id.display_name(),
+                        piece.file.display(),
+                        piece.start_line,
+                        piece.end_line,
+                        e,
+                    ),
+                });
+                continue;
+            }
+        };
+
+        let sat = if piece.sat_models.is_empty() {
+            "None".to_string()
+        } else {
+            piece.sat_models.iter().map(|m| format!("```\n{}\n```", m)).collect::<Vec<_>>().join("\n\n")
+        };
+        let unknown = if piece.unknown_formulas.is_empty() {
+            "None".to_string()
+        } else {
+            piece.unknown_formulas.iter().map(|f| format!("```\n{}\n```", f)).collect::<Vec<_>>().join("\n\n")
+        };
+
+        let prompt = format!(
+            r#"You are a verification problem analyzer. A verification attempt for a Rust function has failed. Your job is to fix the problem by editing the source code.
+
+## Failed verification
+
+Function: {} at {}:{}
+SAT models (counterexamples): {}
+Unknown formulas: {}
+Previous elaboration: {}
+
+## Source file ({})
+
+```
+{}
+```
+
+## Instructions
+
+Analyze why verification failed and fix the problem. Common patterns:
+- Function f fails because it cannot satisfy the precondition of callee g, but that precondition stems from an overly strict precondition in g's callee h. Fix: relax h's preconditions.
+- A loop invariant is too strong because a helper has unnecessarily strict preconditions. Fix: weaken the helper's preconditions.
+- An assertion fails because a caller passes values violating an undocumented assumption. Fix: add a precondition to the caller.
+- The formula is too complex. Fix: add `/* VERIFICATION HINT: ... */` comments explaining how to simplify.
+
+You may edit ANY function in this file, not just the failing one. After fixing, respond with exactly one of:
+- "RETRY" if you made code changes that should be re-verified
+- A bug description if you found a genuine bug in the code (not just a verification issue)
+
+If you respond RETRY, make sure you commit your changes first."#,
+            piece.function_id.display_name(),
+            piece.file.display(),
+            piece.start_line,
+            sat,
+            unknown,
+            piece.elaboration,
+            piece.file.display(),
+            source,
+        );
+
+        info!("IO: agent problem analysis");
+        let agent_resp = providers
+            .agent
+            .invoke(AgentRequest {
+                prompt,
+                working_directory: project_path.clone(),
+                files_to_read: vec![piece.file.clone()],
+                recoverable: true,
+            })?;
+        info!("IO response: agent responded");
+
+        let response = agent_resp.stdout.trim().to_string();
+        info!(response_preview = %response.chars().take(500).collect::<String>(), success = agent_resp.success, "agent response");
+
+        if response.to_uppercase().starts_with("RETRY") {
+            info!("IO: git AddFiles");
+            let _ = providers
+                .git
+                .invoke(GitRequest::AddFiles {
+                    paths: vec![piece.file.clone()],
+                });
+            info!("IO response: files added");
+            info!("IO: git Commit");
+            let _ = providers
+                .git
+                .invoke(GitRequest::Commit {
+                    message: format!("Agent fix for {} at {}:{}", piece.function_id.display_name(), piece.file.display(), piece.start_line),
+                });
+            info!("IO response: committed");
+
+            remaining_unverified.push(piece.clone());
+            files_to_recheck.push(piece.file.clone());
+        } else {
+            bug_reports.push(BugReport {
+                file: piece.file.clone(),
+                function_id: piece.function_id.clone(),
+                description: format!(
+                    "{} at {}:{}-{}: {}",
+                    piece.function_id.display_name(),
+                    piece.file.display(),
+                    piece.start_line,
+                    piece.end_line,
+                    response
+                ),
+            });
+        }
+    }
+
+    if remaining_unverified.is_empty() {
+        match &mut **handle {
+            MachineState::AnalyzingProblems { closed, total_functions, total_pieces, accumulated_bugs, .. } => {
+                let mut all_bugs = std::mem::take(accumulated_bugs);
+                all_bugs.extend(bug_reports);
+                return Ok(Flow::Done(VerificationResult {
+                    closed_pieces: std::mem::take(closed),
+                    unverified_pieces: Vec::new(),
+                    bug_reports: all_bugs,
+                    total_functions: *total_functions,
+                    total_pieces: *total_pieces,
+                }));
+            }
+            _ => anyhow::bail!("phase mismatch: expected AnalyzingProblems"),
+        }
+    }
+    let next = match &mut **handle {
+        MachineState::AnalyzingProblems { project_path, verification_dir, branch_name, accumulated_bugs, .. } => {
+            let mut all_bugs = std::mem::take(accumulated_bugs);
+            all_bugs.extend(bug_reports);
+            MachineState::Restarting {
+                project_path: std::mem::take(project_path),
+                verification_dir: std::mem::take(verification_dir),
+                branch_name: std::mem::take(branch_name),
+                base_commit,
+                recheck_files: files_to_recheck,
+                accumulated_bugs: all_bugs,
+            }
+        }
+        _ => anyhow::bail!("phase mismatch: expected AnalyzingProblems"),
+    };
+    **handle = next;
+    Ok(Flow::Continue)
+}
+
+fn step_restarting(
+    handle: &mut Handle<'_, MachineState>,
+    providers: &Providers<'_>,
+) -> Result<Flow> {
+    let (base_commit, recheck_files) = match &**handle {
+        MachineState::Restarting { base_commit, recheck_files, .. } => {
+            (base_commit.clone(), recheck_files.clone())
+        }
+        _ => anyhow::bail!("phase mismatch: expected Restarting"),
+    };
+    info!("IO: git FindChangedRustFiles");
+    let resp = providers
+        .git
+        .invoke(GitRequest::FindChangedRustFiles {
+            base_commit: base_commit.clone(),
+        })?;
+
+    let changed_files: Vec<PathBuf> = if resp.success {
+        resp.output
+            .lines()
+            .filter(|l| l.ends_with(".rs"))
+            .map(PathBuf::from)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    info!("IO response: {} changed files", changed_files.len());
+
+    let mut all_files: Vec<PathBuf> = recheck_files
+        .iter()
+        .chain(changed_files.iter())
+        .cloned()
+        .collect();
+    let mut seen = HashSet::new();
+    all_files.retain(|f| seen.insert(f.clone()));
+
+    let next = match &mut **handle {
+        MachineState::Restarting { project_path, verification_dir, branch_name, accumulated_bugs, .. } => MachineState::ListingFunctions {
+                project_path: std::mem::take(project_path),
+                verification_dir: std::mem::take(verification_dir),
+                branch_name: std::mem::take(branch_name),
+                files: all_files,
+                accumulated_bugs: std::mem::take(accumulated_bugs),
+        },
+        _ => anyhow::bail!("phase mismatch: expected Restarting"),
+    };
+    **handle = next;
+    Ok(Flow::Continue)
 }
 
 fn filter_connected_functions(
@@ -372,101 +960,15 @@ fn filter_connected_functions(
         .collect()
 }
 
-pub struct FunctionAnalyzer {
-    project_path: PathBuf,
-    verification_dir: PathBuf,
-    branch_name: String,
-    functions: std::collections::HashMap<PathBuf, Vec<FunctionId>>,
-    function_docs: HashMap<FunctionId, String>,
-    accumulated_bugs: Vec<BugReport>,
-}
-
-impl AlgorithmState for FunctionAnalyzer {
-    fn execute(
-        self: Box<Self>,
-        providers: &Providers<'_>,
-        _pm: &dyn crate::piece_manager::DeductivePieceManager,
-    ) -> Result<Step> {
-        let mut function_bodies = Vec::new();
-        for (file, function_ids) in &self.functions {
-            for fid in function_ids {
-                debug!("IO: rust-analyzer GetFunctionCode");
-                let resp = providers
-                    .rust_analyzer
-                    .invoke(RustAnalyzerRequest::GetFunctionCode {
-                        function_id: fid.clone(),
-                    })?;
-                debug!("IO response: rust-analyzer GetFunctionCode");
-                let body = match resp {
-                    RustAnalyzerResponse::FunctionCode(code) => code,
-                    _ => anyhow::bail!("Expected FunctionCode from rust-analyzer"),
-                };
-                if !body.trim().is_empty() {
-                    function_bodies.push((file.clone(), fid.clone(), body));
-                }
-            }
-        }
-
-        Ok(Step::State(Box::new(Splitter {
-            project_path: self.project_path,
-            verification_dir: self.verification_dir,
-            branch_name: self.branch_name,
-            function_bodies,
-            function_docs: self.function_docs,
-            accumulated_bugs: self.accumulated_bugs,
-        })))
-    }
-}
-
-pub struct Splitter {
-    project_path: PathBuf,
-    verification_dir: PathBuf,
-    branch_name: String,
-    function_bodies: Vec<(PathBuf, FunctionId, String)>,
-    function_docs: HashMap<FunctionId, String>,
-    accumulated_bugs: Vec<BugReport>,
-}
-
-impl AlgorithmState for Splitter {
-    fn execute(
-        self: Box<Self>,
-        providers: &Providers<'_>,
-        pm: &dyn crate::piece_manager::DeductivePieceManager,
-    ) -> Result<Step> {
-        let root_ctx = ContextId::root();
-        let results: Vec<_> = self.function_bodies.iter().map(|(file, fid, body)| {
-            split_function(providers, pm, root_ctx, file, fid, body)
-        }).collect::<Result<Vec<_>>>()?;
-
-        for (_file, fid, _body) in &self.function_bodies {
-            if let Some(docs) = self.function_docs.get(fid) {
-                pm.store_function_docs(fid.clone(), docs.clone());
-            }
-        }
-
-        let code_pieces: Vec<(ArcCodePiece, ContextId)> = results.into_iter().flatten().collect();
-
-        Ok(Step::State(Box::new(FullFormalizer {
-            project_path: self.project_path,
-            verification_dir: self.verification_dir,
-            branch_name: self.branch_name,
-            pieces: code_pieces,
-            iteration: 0,
-            accumulated_bugs: self.accumulated_bugs,
-        })))
-    }
-}
 
 fn split_function(
+    child: &mut Handle<'_, SplitSlot>,
     providers: &Providers<'_>,
     pm: &dyn crate::piece_manager::DeductivePieceManager,
     root_ctx: &ContextId,
-    file: &Path,
-    fid: &FunctionId,
-    body: &str,
 ) -> Result<Vec<(ArcCodePiece, ContextId)>> {
-    if body.trim().is_empty() {
-        warn!(file = %file.display(), function = %fid.display_name(), "skipping function with empty body");
+    if child.body.trim().is_empty() {
+        warn!(file = %child.file.display(), function = %child.fid.display_name(), "skipping function with empty body");
         return Ok(Vec::new());
     }
 
@@ -474,13 +976,14 @@ fn split_function(
 
     let max_attempts = 3;
     for attempt in 0..max_attempts {
+        child.safepoint();
         let messages = vec![
             crate::llm::system_message(&prompts::splitter_system()),
             crate::llm::user_message(&prompts::splitter_user(
-                &file.display().to_string(),
-                &fid.display_name(),
-                body,
-                fid.line,
+                &child.file.display().to_string(),
+                &child.fid.display_name(),
+                &child.body,
+                child.fid.line,
             )),
         ];
 
@@ -496,24 +999,25 @@ fn split_function(
         info!(%func_ctx, "IO response: splitter");
         let response = resp.value;
 
-        let pieces = parse_split_pieces(response, &func_ctx, file, fid, body, pm);
+        let pieces = parse_split_pieces(response, &func_ctx, &child.file, &child.fid, &child.body, pm);
 
         if !pieces.is_empty() {
             return Ok(pieces);
         }
-        warn!(attempt = attempt + 1, %func_ctx, function = %fid.display_name(), "splitter produced no valid pieces, retrying");
+        warn!(attempt = attempt + 1, %func_ctx, function = %child.fid.display_name(), "splitter produced no valid pieces, retrying");
     }
 
     let (piece, ctx) = pm.new_piece(
         &func_ctx,
-        file.to_path_buf(),
-        fid.clone(),
-        fid.line,
-        fid.line + body.lines().count() as u32,
-        body.to_string(),
+        child.file.clone(),
+        child.fid.clone(),
+        child.fid.line,
+        child.fid.line + child.body.lines().count() as u32,
+        child.body.clone(),
     );
     Ok(vec![(Arc::new(piece), ctx)])
 }
+
 
 fn parse_split_pieces(
     response: String,
@@ -555,58 +1059,40 @@ fn parse_split_pieces(
     pieces
 }
 
-pub struct FullFormalizer {
-    project_path: PathBuf,
-    verification_dir: PathBuf,
-    branch_name: String,
-    pieces: Vec<(ArcCodePiece, ContextId)>,
-    #[allow(dead_code)]
-    iteration: usize,
-    accumulated_bugs: Vec<BugReport>,
+
+pub struct PieceOutcome {
+    pub(crate) closed: Option<ClosedPiece>,
+    pub(crate) unverified: Option<UnverifiedPiece>,
 }
 
-impl FullFormalizer {
-    fn functions_count(&self) -> usize {
-        let mut seen = HashSet::new();
-        for (piece, _) in &self.pieces {
-            let _new = seen.insert(piece.function_id().name.clone());
-        }
-        seen.len()
-    }
-}
-
-struct PieceOutcome {
-    closed: Option<ClosedPiece>,
-    unverified: Option<UnverifiedPiece>,
-}
 
 fn gather_context(
-    piece: &ArcCodePiece,
-    ctx: &ContextId,
+    child: &mut Handle<'_, PieceSlot>,
     providers: &Providers<'_>,
 ) -> Result<String> {
-    assert!(piece.type_invariant());
-    info!(%ctx, "IO: rust-analyzer GetCalledFunctions");
+    child.safepoint();
+    info!(ctx = %child.ctx, "IO: rust-analyzer GetCalledFunctions");
     let resp = providers
         .rust_analyzer
         .invoke(RustAnalyzerRequest::GetCalledFunctions {
-            function_id: piece.function_id().clone(),
+            function_id: child.piece.function_id().clone(),
         })?;
 
     let called_functions = match resp {
         RustAnalyzerResponse::CalledFunctionList(fns) => fns,
         _ => Vec::new(),
     };
-    info!(%ctx, "IO response: {} called functions", called_functions.len());
+    info!(ctx = %child.ctx, "IO response: {} called functions", called_functions.len());
 
     let mut context_parts = Vec::new();
     for cf in called_functions {
         let name = cf.name.clone();
-        info!(%ctx, "IO: rust-analyzer GetCalledFunctionCode");
+        child.safepoint();
+        info!(ctx = %child.ctx, "IO: rust-analyzer GetCalledFunctionCode");
         let resp = providers
             .rust_analyzer
             .invoke(RustAnalyzerRequest::GetCalledFunctionCode { called: cf })?;
-        info!(%ctx, "IO response: rust-analyzer GetCalledFunctionCode");
+        info!(ctx = %child.ctx, "IO response: rust-analyzer GetCalledFunctionCode");
         let result = match resp {
             RustAnalyzerResponse::CalledFunctionCode(r) => r,
             _ => continue,
@@ -629,19 +1115,18 @@ fn gather_context(
     }
 }
 
+
 fn formalize_piece(
-    piece: &ArcCodePiece,
-    ctx: ContextId,
+    child: &mut Handle<'_, PieceSlot>,
     context: &str,
     elaboration: &str,
     docs_section: &str,
     providers: &Providers<'_>,
-) -> Result<(String, ContextId)> {
-    assert!(piece.type_invariant());
+) -> Result<String> {
     let messages = vec![
         crate::llm::system_message(&prompts::formalizer_system()),
         crate::llm::user_message(&prompts::formalizer_user(
-            piece.code(),
+            child.piece.code(),
             context,
             None,
             elaboration,
@@ -649,33 +1134,34 @@ fn formalize_piece(
         )),
     ];
 
-    info!(%ctx, "IO: formalizer");
+    child.safepoint();
+    info!(ctx = %child.ctx, "IO: formalizer");
     let resp = providers
         .llm
         .invoke(LlmRequest {
                 role: LlmRole::Formalizer,
                 messages,
-                context_id: Box::new(ctx),
+                context_id: Box::new(child.ctx.new_child()),
             })?;
-    let ctx = *resp.context_id;
-    info!(%ctx, "IO response: formalizer");
+    info!(ctx = %child.ctx, "IO response: formalizer");
 
-    Ok((resp.value, ctx))
+    Ok(resp.value)
 }
+
 
 fn check_formula(
     formula_content: &str,
     formula_source: &FormulaSource,
-    piece_ctx: &ContextId,
     providers: &Providers<'_>,
     pm: &dyn crate::piece_manager::DeductivePieceManager,
     iteration: u32,
+    child: &mut Handle<'_, PieceSlot>,
 ) -> Result<(crate::formula::Formula, ContextId, SolverOutcome, String)> {
-    let (formula, fctx) = pm.new_formula(piece_ctx, formula_content.to_string(), formula_source.clone(), iteration);
+    let (formula, fctx) = pm.new_formula(&child.ctx, formula_content.to_string(), formula_source.clone(), iteration);
 
     pm.advance_formula(&fctx, Some(FormulaPhase::Open), FormulaPhase::Check);
 
-    let smt_content = match translate_formula(formula_content, formula_source, &fctx, providers) {
+    let smt_content = match translate_formula(formula_content, formula_source, &fctx, providers, child) {
         Ok(smt) => smt,
         Err(e) => {
             warn!(%fctx, error = %e, "Formula translation failed; routing to fixer");
@@ -684,6 +1170,7 @@ fn check_formula(
         }
     };
 
+    child.safepoint();
     info!(%fctx, "IO: solver");
     let resp = providers
         .solver
@@ -702,42 +1189,47 @@ fn check_formula(
     Ok((formula, fctx, outcome, smt_content))
 }
 
+
 fn fix_formula(
     formula_content: &str,
     error: &str,
-    fctx: ContextId,
+    fctx: &ContextId,
     context: &str,
     docs_section: &str,
     providers: &Providers<'_>,
-) -> Result<(String, ContextId)> {
+    child: &mut Handle<'_, PieceSlot>,
+) -> Result<String> {
     let messages = vec![
         crate::llm::system_message(&prompts::fixer_system()),
         crate::llm::user_message(&prompts::fixer_user(formula_content, error, context, docs_section)),
     ];
 
+    child.safepoint();
     info!(%fctx, "IO: fixer");
     let resp = providers
         .llm
         .invoke(LlmRequest {
                 role: LlmRole::Fixer,
                 messages,
-                context_id: Box::new(fctx),
+                context_id: Box::new(fctx.new_child()),
             })?;
-    let fctx = *resp.context_id;
     info!(%fctx, "IO response: fixer");
 
-    Ok((resp.value, fctx))
+    Ok(resp.value)
 }
+
 
 fn translate_formula(
     content: &str,
     source: &FormulaSource,
     formula_ctx: &ContextId,
     providers: &Providers<'_>,
+    child: &mut Handle<'_, PieceSlot>,
 ) -> Result<String> {
     match source {
         FormulaSource::SmtLib => Ok(content.to_string()),
         FormulaSource::PyZ3 => {
+            child.safepoint();
             info!(%formula_ctx, "IO: python translate");
             let resp = providers
                 .python
@@ -754,19 +1246,27 @@ fn translate_formula(
     }
 }
 
+/// Knobs of the check-and-fix loop, grouped to keep the call sites flat.
+pub(crate) struct FixLoop {
+    pub(crate) iteration: u32,
+    pub(crate) max_fix_attempts: usize,
+}
+
+
 fn check_and_fix_formula(
     ef: &crate::formula::ExtractedFormula,
-    piece_ctx: &ContextId,
     providers: &Providers<'_>,
     pm: &dyn crate::piece_manager::DeductivePieceManager,
-    iteration: u32,
-    max_fix_attempts: usize,
+    loop_knobs: &FixLoop,
     piece_ctx_info: &PieceContext,
+    child: &mut Handle<'_, PieceSlot>,
 ) -> Result<(crate::formula::Formula, SolverOutcome, ContextId)> {
-    let (mut formula, mut fctx, mut outcome, mut current_smt) = check_formula(
-        &ef.content, &ef.source, piece_ctx, providers, pm, iteration,
-    )?;
+    child.safepoint();
+    let FixLoop { iteration, max_fix_attempts } = *loop_knobs;
 
+    let (mut formula, mut fctx, mut outcome, mut current_smt) = check_formula(
+        &ef.content, &ef.source, providers, pm, iteration, child,
+    )?;
     let mut fix_attempts = 0;
     let mut error_msg = match &outcome {
         SolverOutcome::Error(e) => e.clone(),
@@ -775,8 +1275,7 @@ fn check_and_fix_formula(
     while matches!(outcome, SolverOutcome::Error(_)) && fix_attempts < max_fix_attempts {
         info!(%fctx, fix_attempts, "Attempting to fix formula");
 
-        let (fixed_response, fctx2) = fix_formula(&current_smt, &error_msg, fctx, &piece_ctx_info.called_functions, &piece_ctx_info.docs_section, providers)?;
-        fctx = fctx2;
+        let fixed_response = fix_formula(&current_smt, &error_msg, &fctx, &piece_ctx_info.called_functions, &piece_ctx_info.docs_section, providers, child)?;
         let fixed_extracted = crate::formula::extract_formulas_from_response(&fixed_response);
 
         if fixed_extracted.is_empty() {
@@ -786,7 +1285,7 @@ fn check_and_fix_formula(
 
         let fixed_ef = &fixed_extracted[0];
 
-        let translated = match translate_formula(&fixed_ef.content, &fixed_ef.source, &fctx, providers) {
+        let translated = match translate_formula(&fixed_ef.content, &fixed_ef.source, &fctx, providers, child) {
             Ok(smt) => smt,
             Err(e) => {
                 warn!(%fctx, fix_attempts, error = %e, "Failed to translate fixed formula; feeding error back to fixer");
@@ -835,31 +1334,35 @@ fn check_and_fix_formula(
     Ok((formula, outcome, fctx))
 }
 
+
 fn judge_piece(
-    piece: &ArcCodePiece,
-    ctx: ContextId,
+    child: &mut Handle<'_, PieceSlot>,
     formulas_summary: &str,
     piece_ctx_info: &PieceContext,
     providers: &Providers<'_>,
-) -> Result<(String, ContextId)> {
-    assert!(piece.type_invariant());
+) -> Result<String> {
     let mut messages = vec![
         crate::llm::system_message(&prompts::judge_system()),
-        crate::llm::user_message(&prompts::judge_user(piece.code(), formulas_summary, &piece_ctx_info.called_functions, &piece_ctx_info.docs_section)),
+        crate::llm::user_message(&prompts::judge_user(
+            child.piece.code(),
+            formulas_summary,
+            &piece_ctx_info.called_functions,
+            &piece_ctx_info.docs_section,
+        )),
     ];
 
-    info!(%ctx, "IO: judge");
+    child.safepoint();
+    info!(ctx = %child.ctx, "IO: judge");
     let resp = providers
         .llm
         .invoke(LlmRequest {
                 role: LlmRole::Judge,
                 messages: messages.clone(),
-                context_id: Box::new(ctx),
+                context_id: Box::new(child.ctx.new_child()),
             })?;
+    info!(ctx = %child.ctx, "IO response: judge");
 
     let mut response = resp.value;
-    let mut ctx = *resp.context_id;
-    info!(%ctx, "IO response: judge");
 
     for retry in 0..crate::consts::MAX_JUDGE_CLARIFICATION_RETRIES {
         let trimmed_upper = response.trim().to_uppercase();
@@ -870,43 +1373,44 @@ fn judge_piece(
             break;
         }
 
-        info!(%ctx, retry, "Judge response contained REASONABLE with extra text, retrying for clarification");
+        info!(ctx = %child.ctx, retry, "Judge response contained REASONABLE with extra text, retrying for clarification");
 
         messages.push(crate::llm::assistant_message(&response));
         messages.push(crate::llm::user_message(&prompts::judge_retry(&response)));
 
-        info!(%ctx, "IO: judge retry");
+        child.safepoint();
+        info!(ctx = %child.ctx, "IO: judge retry");
         let resp = providers
             .llm
             .invoke(LlmRequest {
                 role: LlmRole::Judge,
                 messages: messages.clone(),
-                context_id: Box::new(ctx),
+                context_id: Box::new(child.ctx.new_child()),
             })?;
 
         response = resp.value;
-        ctx = *resp.context_id;
-        info!(%ctx, "IO response: judge retry");
+        info!(ctx = %child.ctx, "IO response: judge retry");
     }
 
-    Ok((response, ctx))
+    Ok(response)
 }
 
+
 fn process_piece(
-    piece: &ArcCodePiece,
-    mut ctx: ContextId,
+    child: &mut Handle<'_, PieceSlot>,
     providers: &Providers<'_>,
     pm: &dyn crate::piece_manager::DeductivePieceManager,
     verification_dir: &Path,
 ) -> Result<PieceOutcome> {
-    assert!(piece.type_invariant());
+    assert!(child.piece.type_invariant());
 
-    pm.expect_piece_phase_and_set(&ctx, &[CodePiecePhase::Open], CodePiecePhase::GetContext);
+    child.safepoint();
+    pm.expect_piece_phase_and_set(&child.ctx, &[CodePiecePhase::Open], CodePiecePhase::GetContext);
 
-    let context = gather_context(piece, &ctx, providers)?;
-    info!(%ctx, "Gathered context for piece");
+    let context = gather_context(child, providers)?;
+    info!(ctx = %child.ctx, "Gathered context for piece");
 
-    let own_docs = pm.get_function_docs(piece.function_id());
+    let own_docs = pm.get_function_docs(child.piece.function_id());
     let own_docs_section = if own_docs.is_empty() {
         String::new()
     } else {
@@ -917,21 +1421,20 @@ fn process_piece(
     let max_judge_attempts = crate::consts::MAX_JUDGE_ATTEMPTS;
 
     for judge_attempt in 0..max_judge_attempts {
-        pm.advance_piece(&ctx, Some(CodePiecePhase::GetContext), CodePiecePhase::Formalizer);
+        pm.advance_piece(&child.ctx, Some(CodePiecePhase::GetContext), CodePiecePhase::Formalizer);
 
-        let (formalizer_response, ctx2) = formalize_piece(piece, ctx, &context, &elaboration, &own_docs_section, providers)?;
-        ctx = ctx2;
-        info!(%ctx, judge_attempt, "formalizer step done");
+        let formalizer_response = formalize_piece(child, &context, &elaboration, &own_docs_section, providers)?;
+        info!(ctx = %child.ctx, judge_attempt, "formalizer step done");
 
         let extracted = crate::formula::extract_formulas_from_response(&formalizer_response);
         if extracted.is_empty() {
-            warn!(%ctx, judge_attempt, "No formulas extracted from formalizer response");
+            warn!(ctx = %child.ctx, judge_attempt, "No formulas extracted from formalizer response");
             elaboration = format!("Attempt {}: No formulas were extracted. Please produce SMT-LIB2 formulas in ```smt2 code blocks.\n{}", judge_attempt + 1, elaboration);
-            pm.advance_piece(&ctx, Some(CodePiecePhase::Formalizer), CodePiecePhase::GetContext);
+            pm.advance_piece(&child.ctx, Some(CodePiecePhase::Formalizer), CodePiecePhase::GetContext);
             continue;
         }
 
-        pm.advance_piece(&ctx, Some(CodePiecePhase::Formalizer), CodePiecePhase::Check);
+        pm.advance_piece(&child.ctx, Some(CodePiecePhase::Formalizer), CodePiecePhase::Check);
 
         let max_fix_attempts = crate::consts::MAX_INSIST_ATTEMPTS;
         let iteration = judge_attempt as u32;
@@ -943,9 +1446,9 @@ fn process_piece(
 
         let formula_results: Vec<_> = extracted.iter().map(|ef| {
             check_and_fix_formula(
-                ef, &ctx, providers, pm,
-                iteration, max_fix_attempts,
-                &piece_ctx_info,
+                ef, providers, pm,
+                &FixLoop { iteration, max_fix_attempts },
+                &piece_ctx_info, child,
             )
         }).collect();
 
@@ -985,7 +1488,7 @@ fn process_piece(
                 FormulaSource::PyZ3 => "py",
             };
             let filename = format!("ctx{}_iter{}_attempt{}.{}", fctx, iteration, judge_attempt, ext);
-            info!(%ctx, "IO: filesystem write formula");
+            info!(ctx = %child.ctx, "IO: filesystem write formula");
             let _ = providers
                 .filesystem
                 .invoke(FileSystemRequest {
@@ -994,43 +1497,43 @@ fn process_piece(
                     content: ef.content.clone(),
                 })
                 ;
-            info!(%ctx, "IO response: formula written");
+            info!(ctx = %child.ctx, "IO response: formula written");
         }
 
-        info!(%ctx, "IO: git AddFiles");
+        info!(ctx = %child.ctx, "IO: git AddFiles");
         let _ = providers
             .git
             .invoke(GitRequest::AddFiles {
                 paths: vec![verification_dir.to_path_buf()],
             })
             ;
-        info!(%ctx, "IO response: files added");
-        info!(%ctx, "IO: git Commit");
+        info!(ctx = %child.ctx, "IO response: files added");
+        info!(ctx = %child.ctx, "IO: git Commit");
         let _ = providers
             .git
             .invoke(GitRequest::Commit {
-                message: format!("Add formulas for ctx {} (iteration {})", ctx, judge_attempt),
+                message: format!("Add formulas for ctx {} (iteration {})", child.ctx, judge_attempt),
             })
             ;
-        info!(%ctx, "IO response: committed");
+        info!(ctx = %child.ctx, "IO response: committed");
 
-        pm.advance_piece(&ctx, Some(CodePiecePhase::Check), CodePiecePhase::Judge);
+        pm.advance_piece(&child.ctx, Some(CodePiecePhase::Check), CodePiecePhase::Judge);
 
         let formulas_summary = formula_summaries.join("\n");
-        let (judge_response, ctx2) = judge_piece(piece, ctx, &formulas_summary, &piece_ctx_info, providers)?;
-        ctx = ctx2;
-        info!(%ctx, judge_attempt, "judge step done");
+        let judge_response = judge_piece(child, &formulas_summary, &piece_ctx_info, providers)?;
+        info!(ctx = %child.ctx, judge_attempt, "judge step done");
 
         let trimmed_upper = judge_response.trim().to_uppercase();
         let is_exact = trimmed_upper == crate::consts::JUDGE_REASONABLE;
         let is_reasonable = is_exact || trimmed_upper.contains(crate::consts::JUDGE_REASONABLE);
         if is_reasonable && !is_exact {
-            warn!(%ctx, "Judge response accepted via contains fallback (not exact match)");
+            warn!(ctx = %child.ctx, "Judge response accepted via contains fallback (not exact match)");
         }
 
         if is_reasonable {
             if sat_models.is_empty() && unknown_formulas.is_empty() {
-                pm.advance_piece(&ctx, Some(CodePiecePhase::Judge), CodePiecePhase::Closed);
+                pm.advance_piece(&child.ctx, Some(CodePiecePhase::Judge), CodePiecePhase::Closed);
+                let piece = &child.piece;
                 return Ok(PieceOutcome {
                     closed: Some(ClosedPiece {
                         file: piece.file().clone(),
@@ -1044,11 +1547,11 @@ fn process_piece(
                     unverified: None,
                 });
             }
-            pm.advance_piece(&ctx, Some(CodePiecePhase::Judge), CodePiecePhase::Unverified);
+            pm.advance_piece(&child.ctx, Some(CodePiecePhase::Judge), CodePiecePhase::Unverified);
             return Ok(PieceOutcome {
                 closed: None,
                 unverified: Some(unverified_from_piece(
-                    piece,
+                    &child.piece,
                     sat_models,
                     unknown_formulas,
                     judge_response,
@@ -1063,7 +1566,7 @@ fn process_piece(
             elaboration
         );
         if judge_attempt + 1 < max_judge_attempts {
-            pm.advance_piece(&ctx, Some(CodePiecePhase::Judge), CodePiecePhase::GetContext);
+            pm.advance_piece(&child.ctx, Some(CodePiecePhase::Judge), CodePiecePhase::GetContext);
         } else {
             break;
         }
@@ -1074,14 +1577,14 @@ fn process_piece(
     // last attempt hit the "no formulas extracted" branch (Formalizer ->
     // GetContext -> continue). Accept either.
     pm.expect_piece_phase_and_set(
-        &ctx,
+        &child.ctx,
         &[CodePiecePhase::Judge, CodePiecePhase::GetContext],
         CodePiecePhase::Unverified,
     );
     Ok(PieceOutcome {
         closed: None,
         unverified: Some(unverified_from_piece(
-            piece,
+            &child.piece,
             Vec::new(),
             Vec::new(),
             format!("Exhausted {} judge attempts. Last elaboration: {}", max_judge_attempts, elaboration),
@@ -1089,342 +1592,4 @@ fn process_piece(
     })
 }
 
-impl AlgorithmState for FullFormalizer {
-    fn execute(
-        self: Box<Self>,
-        providers: &Providers<'_>,
-        pm: &dyn crate::piece_manager::DeductivePieceManager,
-    ) -> Result<Step> {
-        let functions_count = self.functions_count();
-        let total_pieces = self.pieces.len();
-        let verification_dir = self.verification_dir;
-        let project_path = self.project_path;
-        let branch_name = self.branch_name;
 
-        let mut pieces_only = Vec::new();
-        let mut ctxs_only = Vec::new();
-        for (piece, ctx) in self.pieces {
-            pieces_only.push(piece);
-            ctxs_only.push(ctx);
-        }
-
-        let ctx_labels: Vec<String> = ctxs_only.iter().map(|c| c.to_string()).collect();
-
-        let results: Vec<_> = pieces_only.iter().zip(ctxs_only).map(|(piece, ctx)| {
-            process_piece(piece, ctx, providers, pm, &verification_dir)
-        }).collect();
-
-        let mut closed_pieces = Vec::new();
-        let mut unverified_pieces = Vec::new();
-
-        for (i, result) in results.into_iter().enumerate() {
-            match result {
-                Ok(outcome) => {
-                    if let Some(cp) = outcome.closed {
-                        closed_pieces.push(cp);
-                    }
-                    if let Some(up) = outcome.unverified {
-                        unverified_pieces.push(up);
-                    }
-                }
-                Err(e) => {
-                    let piece = &pieces_only[i];
-                    warn!(ctx = %ctx_labels[i], error = %e, "Failed to process piece");
-                    unverified_pieces.push(unverified_from_piece(
-                        piece,
-                        Vec::new(),
-                        Vec::new(),
-                        format!("Processing error: {}", e),
-                    ));
-                }
-            }
-        }
-
-        if unverified_pieces.is_empty() {
-            Ok(Step::Result(VerificationResult {
-                closed_pieces,
-                unverified_pieces,
-                bug_reports: self.accumulated_bugs,
-                total_functions: functions_count,
-                total_pieces,
-            }))
-        } else {
-            Ok(Step::State(Box::new(ProblemAnalyzer {
-                project_path,
-                verification_dir,
-                branch_name,
-                closed: closed_pieces,
-                unverified: unverified_pieces,
-                recheck_files: Vec::new(),
-                base_commit: String::new(),
-                accumulated_bugs: self.accumulated_bugs,
-                total_pieces,
-                total_functions: functions_count,
-            })))
-        }
-    }
-}
-
-pub struct ProblemAnalyzer {
-    project_path: PathBuf,
-    verification_dir: PathBuf,
-    branch_name: String,
-    closed: Vec<ClosedPiece>,
-    unverified: Vec<UnverifiedPiece>,
-    recheck_files: Vec<PathBuf>,
-    base_commit: String,
-    accumulated_bugs: Vec<BugReport>,
-    total_pieces: usize,
-    total_functions: usize,
-}
-
-impl AlgorithmState for ProblemAnalyzer {
-    fn execute(
-        self: Box<Self>,
-        providers: &Providers<'_>,
-        _pm: &dyn crate::piece_manager::DeductivePieceManager,
-    ) -> Result<Step> {
-        info!(
-            unverified_count = self.unverified.len(),
-            closed_count = self.closed.len(),
-            "ProblemAnalyzer starting",
-        );
-
-        let mut bug_reports = Vec::new();
-        let mut remaining_unverified = Vec::new();
-        let mut files_to_recheck = self.recheck_files.clone();
-
-        let base_commit = if self.base_commit.is_empty() {
-            info!("IO: git CurrentCommitHash");
-            let resp = providers.git.invoke(GitRequest::CurrentCommitHash)?;
-            resp.output.trim().to_string()
-        } else {
-            self.base_commit.clone()
-        };
-        info!(%base_commit, "IO response: git CurrentCommitHash");
-
-        for (i, piece) in self.unverified.iter().enumerate() {
-            info!(
-                piece_index = i,
-                total = self.unverified.len(),
-                file = %piece.file.display(),
-                function = %piece.function_id.display_name(),
-                "ProblemAnalyzer: processing unverified piece",
-            );
-            info!("IO: rust-analyzer GetFileContent");
-            let source = match providers
-                .rust_analyzer
-                .invoke(RustAnalyzerRequest::GetFileContent {
-                    path: piece.file.clone(),
-                })
-                
-            {
-                Ok(RustAnalyzerResponse::FileContent(s)) if !s.is_empty() => s,
-                Ok(_) => {
-                    warn!(file = %piece.file.display(), "Source file not found in VFS (empty content)");
-                    bug_reports.push(BugReport {
-                        file: piece.file.clone(),
-                        function_id: piece.function_id.clone(),
-                        description: format!(
-                            "{} at {}:{}-{}: could not read source file (not in VFS)",
-                            piece.function_id.display_name(),
-                            piece.file.display(),
-                            piece.start_line,
-                            piece.end_line,
-                        ),
-                    });
-                    continue;
-                }
-                Err(e) => {
-                    warn!(file = %piece.file.display(), error = %e, "Failed to get source file from rust-analyzer");
-                    bug_reports.push(BugReport {
-                        file: piece.file.clone(),
-                        function_id: piece.function_id.clone(),
-                        description: format!(
-                            "{} at {}:{}-{}: rust-analyzer error: {}",
-                            piece.function_id.display_name(),
-                            piece.file.display(),
-                            piece.start_line,
-                            piece.end_line,
-                            e,
-                        ),
-                    });
-                    continue;
-                }
-            };
-
-            let sat = if piece.sat_models.is_empty() {
-                "None".to_string()
-            } else {
-                piece.sat_models.iter().map(|m| format!("```\n{}\n```", m)).collect::<Vec<_>>().join("\n\n")
-            };
-            let unknown = if piece.unknown_formulas.is_empty() {
-                "None".to_string()
-            } else {
-                piece.unknown_formulas.iter().map(|f| format!("```\n{}\n```", f)).collect::<Vec<_>>().join("\n\n")
-            };
-
-            let prompt = format!(
-                r#"You are a verification problem analyzer. A verification attempt for a Rust function has failed. Your job is to fix the problem by editing the source code.
-
-## Failed verification
-
-Function: {} at {}:{}
-SAT models (counterexamples): {}
-Unknown formulas: {}
-Previous elaboration: {}
-
-## Source file ({})
-
-```
-{}
-```
-
-## Instructions
-
-Analyze why verification failed and fix the problem. Common patterns:
-- Function f fails because it cannot satisfy the precondition of callee g, but that precondition stems from an overly strict precondition in g's callee h. Fix: relax h's preconditions.
-- A loop invariant is too strong because a helper has unnecessarily strict preconditions. Fix: weaken the helper's preconditions.
-- An assertion fails because a caller passes values violating an undocumented assumption. Fix: add a precondition to the caller.
-- The formula is too complex. Fix: add `/* VERIFICATION HINT: ... */` comments explaining how to simplify.
-
-You may edit ANY function in this file, not just the failing one. After fixing, respond with exactly one of:
-- "RETRY" if you made code changes that should be re-verified
-- A bug description if you found a genuine bug in the code (not just a verification issue)
-
-If you respond RETRY, make sure to commit your changes first."#,
-                piece.function_id.display_name(),
-                piece.file.display(),
-                piece.start_line,
-                sat,
-                unknown,
-                piece.elaboration,
-                piece.file.display(),
-                source,
-            );
-
-            info!("IO: agent problem analysis");
-            let agent_resp = providers
-                .agent
-                .invoke(AgentRequest {
-                    prompt,
-                    working_directory: self.project_path.clone(),
-                    files_to_read: vec![piece.file.clone()],
-                    recoverable: true,
-                })?;
-            info!("IO response: agent responded");
-
-            let response = agent_resp.stdout.trim().to_string();
-            info!(response_preview = %response.chars().take(500).collect::<String>(), success = agent_resp.success, "agent response");
-
-            if response.to_uppercase().starts_with("RETRY") {
-                info!("IO: git AddFiles");
-                let _ = providers
-                    .git
-                    .invoke(GitRequest::AddFiles {
-                        paths: vec![piece.file.clone()],
-                    })
-                    ;
-                info!("IO response: files added");
-                info!("IO: git Commit");
-                let _ = providers
-                    .git
-                    .invoke(GitRequest::Commit {
-                        message: format!("Agent fix for {} at {}:{}", piece.function_id.display_name(), piece.file.display(), piece.start_line),
-                    })
-                    ;
-                info!("IO response: committed");
-
-                remaining_unverified.push(piece.clone());
-                files_to_recheck.push(piece.file.clone());
-            } else {
-                bug_reports.push(BugReport {
-                    file: piece.file.clone(),
-                    function_id: piece.function_id.clone(),
-                    description: format!(
-                        "{} at {}:{}-{}: {}",
-                        piece.function_id.display_name(),
-                        piece.file.display(),
-                        piece.start_line,
-                        piece.end_line,
-                        response
-                    ),
-                });
-            }
-        }
-
-        let mut all_bugs = self.accumulated_bugs;
-        all_bugs.extend(bug_reports);
-
-        if remaining_unverified.is_empty() {
-            Ok(Step::Result(VerificationResult {
-                closed_pieces: self.closed,
-                unverified_pieces: Vec::new(),
-                bug_reports: all_bugs,
-                total_functions: self.total_functions,
-                total_pieces: self.total_pieces,
-            }))
-        } else {
-            Ok(Step::State(Box::new(Restarter {
-                project_path: self.project_path,
-                verification_dir: self.verification_dir,
-                branch_name: self.branch_name,
-                base_commit,
-                recheck_files: files_to_recheck,
-                accumulated_bugs: all_bugs,
-            })))
-        }
-    }
-}
-
-pub struct Restarter {
-    project_path: PathBuf,
-    verification_dir: PathBuf,
-    branch_name: String,
-    base_commit: String,
-    recheck_files: Vec<PathBuf>,
-    accumulated_bugs: Vec<BugReport>,
-}
-
-impl AlgorithmState for Restarter {
-    fn execute(
-        self: Box<Self>,
-        providers: &Providers<'_>,
-        _pm: &dyn crate::piece_manager::DeductivePieceManager,
-    ) -> Result<Step> {
-        info!("IO: git FindChangedRustFiles");
-        let resp = providers
-            .git
-            .invoke(GitRequest::FindChangedRustFiles {
-                base_commit: self.base_commit.clone(),
-            })?;
-
-        let changed_files: Vec<PathBuf> = if resp.success {
-            resp.output
-                .lines()
-                .filter(|l| l.ends_with(".rs"))
-                .map(PathBuf::from)
-                .collect()
-        } else {
-            Vec::new()
-        };
-        info!("IO response: {} changed files", changed_files.len());
-
-        let mut all_files: Vec<PathBuf> = self
-            .recheck_files
-            .iter()
-            .chain(changed_files.iter())
-            .cloned()
-            .collect();
-        let mut seen = HashSet::new();
-        all_files.retain(|f| seen.insert(f.clone()));
-
-        Ok(Step::State(Box::new(FunctionLister {
-            project_path: self.project_path,
-            verification_dir: self.verification_dir,
-            branch_name: self.branch_name,
-            files: all_files,
-            accumulated_bugs: self.accumulated_bugs,
-        })))
-    }
-}
