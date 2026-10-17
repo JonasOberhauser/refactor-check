@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use refactor_check_core::context_id::ContextId;
+use servyi_states::checkpoint::Handle;
 use tracing::{debug, info, warn};
 
 use crate::code_piece::{ArcCodePiece, FunctionId};
@@ -46,17 +47,48 @@ fn unverified_from_piece(
     }
 }
 
+/// One piece verification: a fan-out child. The piece and its ctx live in
+/// the state for the child's whole life — the child accesses them through
+/// its handle; they are never moved out. `outcome` is written once, at
+/// completion.
+pub struct PieceSlot {
+    pub piece: ArcCodePiece,
+    pub ctx: ContextId,
+    pub verification_dir: PathBuf,
+    pub outcome: Option<Result<PieceOutcome>>,
+}
+
+/// One splitter invocation: a fan-out child. Same rule: data lives in the
+/// state, accessed through the handle.
+pub struct SplitSlot {
+    pub file: PathBuf,
+    pub fid: FunctionId,
+    pub body: String,
+    pub outcome: Option<Result<Vec<(ArcCodePiece, ContextId)>>>,
+}
+
 pub enum Step {
     State(Box<dyn AlgorithmState>),
     Result(VerificationResult),
 }
 
 pub trait AlgorithmState: Send + Sync + 'static {
-    fn execute(
-        self: Box<Self>,
-        providers: &Providers<'_>,
-        pm: &dyn crate::piece_manager::DeductivePieceManager,
-    ) -> Result<Step>;
+    /// The state's transition: run its IO on its own data and compute the
+    /// successor. The machine has already fanned this state's declared
+    /// work out off the node (see [`crate::machine`]); the outcomes are in
+    /// the slots.
+    fn execute(&mut self, providers: &Providers<'_>, pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step>;
+
+    /// The piece work of this state's fan-out, if any. The children of the
+    /// fan-out split directly off the node through the handle.
+    fn piece_work(&mut self) -> Option<&mut Vec<PieceSlot>> {
+        None
+    }
+
+    /// The splitter work of this state's fan-out, if any.
+    fn split_work(&mut self) -> Option<&mut Vec<SplitSlot>> {
+        None
+    }
 }
 
 pub struct Initializer {
@@ -69,10 +101,6 @@ impl Initializer {
     }
 }
 
-/// Preflight: verify all external tools are installed and working before
-/// starting the verification pipeline. Each check is a separate state using
-/// the appropriate IOProvider, so failures are individually recoverable via
-/// the error gate.
 pub struct PreflightGit {
     project_path: PathBuf,
 }
@@ -82,11 +110,12 @@ impl PreflightGit {
     }
 }
 impl AlgorithmState for PreflightGit {
-    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
+    fn execute(&mut self, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking git");
         let _resp = providers.git.invoke(GitRequest::CurrentCommitHash)?;
         info!("preflight: git OK");
-        Ok(Step::State(Box::new(PreflightSolver { project_path: self.project_path })))
+        let next = PreflightSolver { project_path: std::mem::take(&mut self.project_path) };
+        Ok(Step::State(Box::new(next)))
     }
 }
 
@@ -94,7 +123,7 @@ pub struct PreflightSolver {
     project_path: PathBuf,
 }
 impl AlgorithmState for PreflightSolver {
-    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
+    fn execute(&mut self, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking z3 solver");
         let root = ContextId::root();
         let resp = providers.solver.invoke(SolverRequest {
@@ -102,7 +131,8 @@ impl AlgorithmState for PreflightSolver {
             context_id: Box::new(root.new_child()),
         })?;
         info!(ctx = %resp.context_id, "preflight: solver OK");
-        Ok(Step::State(Box::new(PreflightPython { project_path: self.project_path })))
+        let next = PreflightPython { project_path: std::mem::take(&mut self.project_path) };
+        Ok(Step::State(Box::new(next)))
     }
 }
 
@@ -110,13 +140,14 @@ pub struct PreflightPython {
     project_path: PathBuf,
 }
 impl AlgorithmState for PreflightPython {
-    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
+    fn execute(&mut self, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking python3");
         let _resp = providers.python.invoke(PythonRequest {
             script: r#"print("(check-sat)")"#.to_string(),
         })?;
         info!("preflight: python3 OK");
-        Ok(Step::State(Box::new(PreflightAgent { project_path: self.project_path })))
+        let next = PreflightAgent { project_path: std::mem::take(&mut self.project_path) };
+        Ok(Step::State(Box::new(next)))
     }
 }
 
@@ -124,7 +155,7 @@ pub struct PreflightAgent {
     project_path: PathBuf,
 }
 impl AlgorithmState for PreflightAgent {
-    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
+    fn execute(&mut self, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking opencode agent");
         let resp = providers.agent.invoke(AgentRequest {
             prompt: "Say OK".to_string(),
@@ -139,7 +170,8 @@ impl AlgorithmState for PreflightAgent {
             anyhow::bail!("opencode agent check failed: {}", resp.stdout);
         }
         info!("preflight: opencode OK");
-        Ok(Step::State(Box::new(PreflightProject { project_path: self.project_path })))
+        let next = PreflightProject { project_path: std::mem::take(&mut self.project_path) };
+        Ok(Step::State(Box::new(next)))
     }
 }
 
@@ -147,7 +179,7 @@ pub struct PreflightProject {
     project_path: PathBuf,
 }
 impl AlgorithmState for PreflightProject {
-    fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
+    fn execute(&mut self, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking project files");
         let resp = providers.git.invoke(GitRequest::WalkRustFiles {
             path: self.project_path.clone(),
@@ -158,16 +190,13 @@ impl AlgorithmState for PreflightProject {
         }
         info!("preflight: project OK ({count} rust files)");
         info!("preflight: all checks passed");
-        Ok(Step::State(Box::new(Initializer::new(self.project_path))))
+        let next = Initializer::new(std::mem::take(&mut self.project_path));
+        Ok(Step::State(Box::new(next)))
     }
 }
 
 impl AlgorithmState for Initializer {
-    fn execute(
-        self: Box<Self>,
-        providers: &Providers<'_>,
-        _pm: &dyn crate::piece_manager::DeductivePieceManager,
-    ) -> Result<Step> {
+    fn execute(&mut self, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
         let branch_name = format!("verification/{timestamp}");
 
@@ -241,13 +270,16 @@ impl AlgorithmState for Initializer {
         all_rust_files.retain(|f| seen.insert(f.clone()));
         info!("IO response: {} rust files", all_rust_files.len());
 
-        Ok(Step::State(Box::new(FunctionLister {
-            project_path: self.project_path,
+        let next = FunctionLister {
+            project_path: std::mem::take(&mut self.project_path),
             verification_dir,
             branch_name,
             files: all_rust_files,
             accumulated_bugs: Vec::new(),
-        })))
+
+
+        };
+        Ok(Step::State(Box::new(next)))
     }
 }
 
@@ -260,11 +292,7 @@ pub struct FunctionLister {
 }
 
 impl AlgorithmState for FunctionLister {
-    fn execute(
-        self: Box<Self>,
-        providers: &Providers<'_>,
-        _pm: &dyn crate::piece_manager::DeductivePieceManager,
-    ) -> Result<Step> {
+    fn execute(&mut self, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("IO: rust-analyzer ListFunctions");
         let resp = providers
             .rust_analyzer
@@ -304,14 +332,15 @@ impl AlgorithmState for FunctionLister {
             }
         }
 
-        Ok(Step::State(Box::new(FunctionAnalyzer {
-            project_path: self.project_path,
-            verification_dir: self.verification_dir,
-            branch_name: self.branch_name,
+        let next = FunctionAnalyzer {
+            project_path: std::mem::take(&mut self.project_path),
+            verification_dir: std::mem::take(&mut self.verification_dir),
+            branch_name: std::mem::take(&mut self.branch_name),
             functions: function_map,
             function_docs,
-            accumulated_bugs: self.accumulated_bugs,
-        })))
+            accumulated_bugs: std::mem::take(&mut self.accumulated_bugs),
+        };
+        Ok(Step::State(Box::new(next)))
     }
 }
 
@@ -382,11 +411,7 @@ pub struct FunctionAnalyzer {
 }
 
 impl AlgorithmState for FunctionAnalyzer {
-    fn execute(
-        self: Box<Self>,
-        providers: &Providers<'_>,
-        _pm: &dyn crate::piece_manager::DeductivePieceManager,
-    ) -> Result<Step> {
+    fn execute(&mut self, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         let mut function_bodies = Vec::new();
         for (file, function_ids) in &self.functions {
             for fid in function_ids {
@@ -407,14 +432,18 @@ impl AlgorithmState for FunctionAnalyzer {
             }
         }
 
-        Ok(Step::State(Box::new(Splitter {
-            project_path: self.project_path,
-            verification_dir: self.verification_dir,
-            branch_name: self.branch_name,
-            function_bodies,
-            function_docs: self.function_docs,
-            accumulated_bugs: self.accumulated_bugs,
-        })))
+        let next = Splitter {
+            project_path: std::mem::take(&mut self.project_path),
+            verification_dir: std::mem::take(&mut self.verification_dir),
+            branch_name: std::mem::take(&mut self.branch_name),
+            function_bodies: function_bodies
+                .into_iter()
+                .map(|(file, fid, body)| SplitSlot { file, fid, body, outcome: None })
+                .collect(),
+            function_docs: std::mem::take(&mut self.function_docs),
+            accumulated_bugs: std::mem::take(&mut self.accumulated_bugs),
+        };
+        Ok(Step::State(Box::new(next)))
     }
 }
 
@@ -422,51 +451,60 @@ pub struct Splitter {
     project_path: PathBuf,
     verification_dir: PathBuf,
     branch_name: String,
-    function_bodies: Vec<(PathBuf, FunctionId, String)>,
+    function_bodies: Vec<SplitSlot>,
     function_docs: HashMap<FunctionId, String>,
     accumulated_bugs: Vec<BugReport>,
 }
 
 impl AlgorithmState for Splitter {
-    fn execute(
-        self: Box<Self>,
-        providers: &Providers<'_>,
-        pm: &dyn crate::piece_manager::DeductivePieceManager,
-    ) -> Result<Step> {
-        let root_ctx = ContextId::root();
-        let results: Vec<_> = self.function_bodies.iter().map(|(file, fid, body)| {
-            split_function(providers, pm, root_ctx, file, fid, body)
-        }).collect::<Result<Vec<_>>>()?;
+    fn execute(&mut self, _providers: &Providers<'_>, pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
+        let slots = std::mem::take(&mut self.function_bodies);
+        let results: Vec<_> = slots
+            .into_iter()
+            .map(|slot| slot.outcome.expect("fan-out child stores its outcome"))
+            .collect::<Result<Vec<_>>>()?;
 
-        for (_file, fid, _body) in &self.function_bodies {
-            if let Some(docs) = self.function_docs.get(fid) {
-                pm.store_function_docs(fid.clone(), docs.clone());
-            }
+        let docs = std::mem::take(&mut self.function_docs);
+        for (fid, docs) in docs {
+            pm.store_function_docs(fid, docs);
         }
 
-        let code_pieces: Vec<(ArcCodePiece, ContextId)> = results.into_iter().flatten().collect();
+        let verification_dir = self.verification_dir.clone();
+        let pieces: Vec<PieceSlot> = results
+            .into_iter()
+            .flatten()
+            .map(|(piece, ctx)| PieceSlot {
+                piece,
+                ctx,
+                verification_dir: verification_dir.clone(),
+                outcome: None,
+            })
+            .collect();
 
-        Ok(Step::State(Box::new(FullFormalizer {
-            project_path: self.project_path,
-            verification_dir: self.verification_dir,
-            branch_name: self.branch_name,
-            pieces: code_pieces,
+        let next = FullFormalizer {
+            project_path: std::mem::take(&mut self.project_path),
+            verification_dir: std::mem::take(&mut self.verification_dir),
+            branch_name: std::mem::take(&mut self.branch_name),
+            pieces,
             iteration: 0,
-            accumulated_bugs: self.accumulated_bugs,
-        })))
+            accumulated_bugs: std::mem::take(&mut self.accumulated_bugs),
+        };
+        Ok(Step::State(Box::new(next)))
+    }
+
+    fn split_work(&mut self) -> Option<&mut Vec<SplitSlot>> {
+        Some(&mut self.function_bodies)
     }
 }
 
-fn split_function(
+pub(crate) fn split_function(
+    child: &mut Handle<'_, SplitSlot>,
     providers: &Providers<'_>,
     pm: &dyn crate::piece_manager::DeductivePieceManager,
     root_ctx: &ContextId,
-    file: &Path,
-    fid: &FunctionId,
-    body: &str,
 ) -> Result<Vec<(ArcCodePiece, ContextId)>> {
-    if body.trim().is_empty() {
-        warn!(file = %file.display(), function = %fid.display_name(), "skipping function with empty body");
+    if child.body.trim().is_empty() {
+        warn!(file = %child.file.display(), function = %child.fid.display_name(), "skipping function with empty body");
         return Ok(Vec::new());
     }
 
@@ -474,13 +512,14 @@ fn split_function(
 
     let max_attempts = 3;
     for attempt in 0..max_attempts {
+        child.safepoint();
         let messages = vec![
             crate::llm::system_message(&prompts::splitter_system()),
             crate::llm::user_message(&prompts::splitter_user(
-                &file.display().to_string(),
-                &fid.display_name(),
-                body,
-                fid.line,
+                &child.file.display().to_string(),
+                &child.fid.display_name(),
+                &child.body,
+                child.fid.line,
             )),
         ];
 
@@ -496,24 +535,25 @@ fn split_function(
         info!(%func_ctx, "IO response: splitter");
         let response = resp.value;
 
-        let pieces = parse_split_pieces(response, &func_ctx, file, fid, body, pm);
+        let pieces = parse_split_pieces(response, &func_ctx, &child.file, &child.fid, &child.body, pm);
 
         if !pieces.is_empty() {
             return Ok(pieces);
         }
-        warn!(attempt = attempt + 1, %func_ctx, function = %fid.display_name(), "splitter produced no valid pieces, retrying");
+        warn!(attempt = attempt + 1, %func_ctx, function = %child.fid.display_name(), "splitter produced no valid pieces, retrying");
     }
 
     let (piece, ctx) = pm.new_piece(
         &func_ctx,
-        file.to_path_buf(),
-        fid.clone(),
-        fid.line,
-        fid.line + body.lines().count() as u32,
-        body.to_string(),
+        child.file.clone(),
+        child.fid.clone(),
+        child.fid.line,
+        child.fid.line + child.body.lines().count() as u32,
+        child.body.clone(),
     );
     Ok(vec![(Arc::new(piece), ctx)])
 }
+
 
 fn parse_split_pieces(
     response: String,
@@ -559,7 +599,7 @@ pub struct FullFormalizer {
     project_path: PathBuf,
     verification_dir: PathBuf,
     branch_name: String,
-    pieces: Vec<(ArcCodePiece, ContextId)>,
+    pieces: Vec<PieceSlot>,
     #[allow(dead_code)]
     iteration: usize,
     accumulated_bugs: Vec<BugReport>,
@@ -568,45 +608,45 @@ pub struct FullFormalizer {
 impl FullFormalizer {
     fn functions_count(&self) -> usize {
         let mut seen = HashSet::new();
-        for (piece, _) in &self.pieces {
-            let _new = seen.insert(piece.function_id().name.clone());
+        for slot in &self.pieces {
+            let _new = seen.insert(slot.piece.function_id().name.clone());
         }
         seen.len()
     }
 }
 
-struct PieceOutcome {
-    closed: Option<ClosedPiece>,
-    unverified: Option<UnverifiedPiece>,
+pub struct PieceOutcome {
+    pub closed: Option<ClosedPiece>,
+    pub unverified: Option<UnverifiedPiece>,
 }
 
 fn gather_context(
-    piece: &ArcCodePiece,
-    ctx: &ContextId,
+    child: &mut Handle<'_, PieceSlot>,
     providers: &Providers<'_>,
 ) -> Result<String> {
-    assert!(piece.type_invariant());
-    info!(%ctx, "IO: rust-analyzer GetCalledFunctions");
+    child.safepoint();
+    info!(ctx = %child.ctx, "IO: rust-analyzer GetCalledFunctions");
     let resp = providers
         .rust_analyzer
         .invoke(RustAnalyzerRequest::GetCalledFunctions {
-            function_id: piece.function_id().clone(),
+            function_id: child.piece.function_id().clone(),
         })?;
 
     let called_functions = match resp {
         RustAnalyzerResponse::CalledFunctionList(fns) => fns,
         _ => Vec::new(),
     };
-    info!(%ctx, "IO response: {} called functions", called_functions.len());
+    info!(ctx = %child.ctx, "IO response: {} called functions", called_functions.len());
 
     let mut context_parts = Vec::new();
     for cf in called_functions {
         let name = cf.name.clone();
-        info!(%ctx, "IO: rust-analyzer GetCalledFunctionCode");
+        child.safepoint();
+        info!(ctx = %child.ctx, "IO: rust-analyzer GetCalledFunctionCode");
         let resp = providers
             .rust_analyzer
             .invoke(RustAnalyzerRequest::GetCalledFunctionCode { called: cf })?;
-        info!(%ctx, "IO response: rust-analyzer GetCalledFunctionCode");
+        info!(ctx = %child.ctx, "IO response: rust-analyzer GetCalledFunctionCode");
         let result = match resp {
             RustAnalyzerResponse::CalledFunctionCode(r) => r,
             _ => continue,
@@ -617,31 +657,30 @@ fn gather_context(
         let docs_section = if result.docs.is_empty() {
             String::new()
         } else {
-            format!("\nDocumentation:\n{}", result.docs)
+            format!("nDocumentation:n{}", result.docs)
         };
-        context_parts.push(format!("--- {} ---\n{}{}", name, result.code, docs_section));
+        context_parts.push(format!("--- {} ---n{}{}", name, result.code, docs_section));
     }
 
     if context_parts.is_empty() {
         Ok("(no called functions found)".to_string())
     } else {
-        Ok(context_parts.join("\n\n"))
+        Ok(context_parts.join("nn"))
     }
 }
 
+
 fn formalize_piece(
-    piece: &ArcCodePiece,
-    ctx: ContextId,
+    child: &mut Handle<'_, PieceSlot>,
     context: &str,
     elaboration: &str,
     docs_section: &str,
     providers: &Providers<'_>,
-) -> Result<(String, ContextId)> {
-    assert!(piece.type_invariant());
+) -> Result<String> {
     let messages = vec![
         crate::llm::system_message(&prompts::formalizer_system()),
         crate::llm::user_message(&prompts::formalizer_user(
-            piece.code(),
+            child.piece.code(),
             context,
             None,
             elaboration,
@@ -649,33 +688,34 @@ fn formalize_piece(
         )),
     ];
 
-    info!(%ctx, "IO: formalizer");
+    child.safepoint();
+    info!(ctx = %child.ctx, "IO: formalizer");
     let resp = providers
         .llm
         .invoke(LlmRequest {
                 role: LlmRole::Formalizer,
                 messages,
-                context_id: Box::new(ctx),
+                context_id: Box::new(child.ctx.new_child()),
             })?;
-    let ctx = *resp.context_id;
-    info!(%ctx, "IO response: formalizer");
+    info!(ctx = %child.ctx, "IO response: formalizer");
 
-    Ok((resp.value, ctx))
+    Ok(resp.value)
 }
+
 
 fn check_formula(
     formula_content: &str,
     formula_source: &FormulaSource,
-    piece_ctx: &ContextId,
     providers: &Providers<'_>,
     pm: &dyn crate::piece_manager::DeductivePieceManager,
     iteration: u32,
+    child: &mut Handle<'_, PieceSlot>,
 ) -> Result<(crate::formula::Formula, ContextId, SolverOutcome, String)> {
-    let (formula, fctx) = pm.new_formula(piece_ctx, formula_content.to_string(), formula_source.clone(), iteration);
+    let (formula, fctx) = pm.new_formula(&child.ctx, formula_content.to_string(), formula_source.clone(), iteration);
 
     pm.advance_formula(&fctx, Some(FormulaPhase::Open), FormulaPhase::Check);
 
-    let smt_content = match translate_formula(formula_content, formula_source, &fctx, providers) {
+    let smt_content = match translate_formula(formula_content, formula_source, &fctx, providers, child) {
         Ok(smt) => smt,
         Err(e) => {
             warn!(%fctx, error = %e, "Formula translation failed; routing to fixer");
@@ -684,6 +724,7 @@ fn check_formula(
         }
     };
 
+    child.safepoint();
     info!(%fctx, "IO: solver");
     let resp = providers
         .solver
@@ -702,42 +743,47 @@ fn check_formula(
     Ok((formula, fctx, outcome, smt_content))
 }
 
+
 fn fix_formula(
     formula_content: &str,
     error: &str,
-    fctx: ContextId,
+    fctx: &ContextId,
     context: &str,
     docs_section: &str,
     providers: &Providers<'_>,
-) -> Result<(String, ContextId)> {
+    child: &mut Handle<'_, PieceSlot>,
+) -> Result<String> {
     let messages = vec![
         crate::llm::system_message(&prompts::fixer_system()),
         crate::llm::user_message(&prompts::fixer_user(formula_content, error, context, docs_section)),
     ];
 
+    child.safepoint();
     info!(%fctx, "IO: fixer");
     let resp = providers
         .llm
         .invoke(LlmRequest {
                 role: LlmRole::Fixer,
                 messages,
-                context_id: Box::new(fctx),
+                context_id: Box::new(fctx.new_child()),
             })?;
-    let fctx = *resp.context_id;
     info!(%fctx, "IO response: fixer");
 
-    Ok((resp.value, fctx))
+    Ok(resp.value)
 }
+
 
 fn translate_formula(
     content: &str,
     source: &FormulaSource,
     formula_ctx: &ContextId,
     providers: &Providers<'_>,
+    child: &mut Handle<'_, PieceSlot>,
 ) -> Result<String> {
     match source {
         FormulaSource::SmtLib => Ok(content.to_string()),
         FormulaSource::PyZ3 => {
+            child.safepoint();
             info!(%formula_ctx, "IO: python translate");
             let resp = providers
                 .python
@@ -756,17 +802,18 @@ fn translate_formula(
 
 fn check_and_fix_formula(
     ef: &crate::formula::ExtractedFormula,
-    piece_ctx: &ContextId,
     providers: &Providers<'_>,
     pm: &dyn crate::piece_manager::DeductivePieceManager,
     iteration: u32,
     max_fix_attempts: usize,
     piece_ctx_info: &PieceContext,
+    child: &mut Handle<'_, PieceSlot>,
 ) -> Result<(crate::formula::Formula, SolverOutcome, ContextId)> {
-    let (mut formula, mut fctx, mut outcome, mut current_smt) = check_formula(
-        &ef.content, &ef.source, piece_ctx, providers, pm, iteration,
-    )?;
+    child.safepoint();
 
+    let (mut formula, mut fctx, mut outcome, mut current_smt) = check_formula(
+        &ef.content, &ef.source, providers, pm, iteration, child,
+    )?;
     let mut fix_attempts = 0;
     let mut error_msg = match &outcome {
         SolverOutcome::Error(e) => e.clone(),
@@ -775,8 +822,7 @@ fn check_and_fix_formula(
     while matches!(outcome, SolverOutcome::Error(_)) && fix_attempts < max_fix_attempts {
         info!(%fctx, fix_attempts, "Attempting to fix formula");
 
-        let (fixed_response, fctx2) = fix_formula(&current_smt, &error_msg, fctx, &piece_ctx_info.called_functions, &piece_ctx_info.docs_section, providers)?;
-        fctx = fctx2;
+        let fixed_response = fix_formula(&current_smt, &error_msg, &fctx, &piece_ctx_info.called_functions, &piece_ctx_info.docs_section, providers, child)?;
         let fixed_extracted = crate::formula::extract_formulas_from_response(&fixed_response);
 
         if fixed_extracted.is_empty() {
@@ -786,7 +832,7 @@ fn check_and_fix_formula(
 
         let fixed_ef = &fixed_extracted[0];
 
-        let translated = match translate_formula(&fixed_ef.content, &fixed_ef.source, &fctx, providers) {
+        let translated = match translate_formula(&fixed_ef.content, &fixed_ef.source, &fctx, providers, child) {
             Ok(smt) => smt,
             Err(e) => {
                 warn!(%fctx, fix_attempts, error = %e, "Failed to translate fixed formula; feeding error back to fixer");
@@ -835,31 +881,35 @@ fn check_and_fix_formula(
     Ok((formula, outcome, fctx))
 }
 
+
 fn judge_piece(
-    piece: &ArcCodePiece,
-    ctx: ContextId,
+    child: &mut Handle<'_, PieceSlot>,
     formulas_summary: &str,
     piece_ctx_info: &PieceContext,
     providers: &Providers<'_>,
-) -> Result<(String, ContextId)> {
-    assert!(piece.type_invariant());
+) -> Result<String> {
     let mut messages = vec![
         crate::llm::system_message(&prompts::judge_system()),
-        crate::llm::user_message(&prompts::judge_user(piece.code(), formulas_summary, &piece_ctx_info.called_functions, &piece_ctx_info.docs_section)),
+        crate::llm::user_message(&prompts::judge_user(
+            child.piece.code(),
+            formulas_summary,
+            &piece_ctx_info.called_functions,
+            &piece_ctx_info.docs_section,
+        )),
     ];
 
-    info!(%ctx, "IO: judge");
+    child.safepoint();
+    info!(ctx = %child.ctx, "IO: judge");
     let resp = providers
         .llm
         .invoke(LlmRequest {
                 role: LlmRole::Judge,
                 messages: messages.clone(),
-                context_id: Box::new(ctx),
+                context_id: Box::new(child.ctx.new_child()),
             })?;
+    info!(ctx = %child.ctx, "IO response: judge");
 
     let mut response = resp.value;
-    let mut ctx = *resp.context_id;
-    info!(%ctx, "IO response: judge");
 
     for retry in 0..crate::consts::MAX_JUDGE_CLARIFICATION_RETRIES {
         let trimmed_upper = response.trim().to_uppercase();
@@ -870,68 +920,67 @@ fn judge_piece(
             break;
         }
 
-        info!(%ctx, retry, "Judge response contained REASONABLE with extra text, retrying for clarification");
+        info!(ctx = %child.ctx, retry, "Judge response contained REASONABLE with extra text, retrying for clarification");
 
         messages.push(crate::llm::assistant_message(&response));
         messages.push(crate::llm::user_message(&prompts::judge_retry(&response)));
 
-        info!(%ctx, "IO: judge retry");
+        child.safepoint();
+        info!(ctx = %child.ctx, "IO: judge retry");
         let resp = providers
             .llm
             .invoke(LlmRequest {
                 role: LlmRole::Judge,
                 messages: messages.clone(),
-                context_id: Box::new(ctx),
+                context_id: Box::new(child.ctx.new_child()),
             })?;
 
         response = resp.value;
-        ctx = *resp.context_id;
-        info!(%ctx, "IO response: judge retry");
+        info!(ctx = %child.ctx, "IO response: judge retry");
     }
 
-    Ok((response, ctx))
+    Ok(response)
 }
 
-fn process_piece(
-    piece: &ArcCodePiece,
-    mut ctx: ContextId,
+
+pub(crate) fn process_piece(
+    child: &mut Handle<'_, PieceSlot>,
     providers: &Providers<'_>,
     pm: &dyn crate::piece_manager::DeductivePieceManager,
-    verification_dir: &Path,
 ) -> Result<PieceOutcome> {
-    assert!(piece.type_invariant());
+    assert!(child.piece.type_invariant());
 
-    pm.expect_piece_phase_and_set(&ctx, &[CodePiecePhase::Open], CodePiecePhase::GetContext);
+    child.safepoint();
+    pm.expect_piece_phase_and_set(&child.ctx, &[CodePiecePhase::Open], CodePiecePhase::GetContext);
 
-    let context = gather_context(piece, &ctx, providers)?;
-    info!(%ctx, "Gathered context for piece");
+    let context = gather_context(child, providers)?;
+    info!(ctx = %child.ctx, "Gathered context for piece");
 
-    let own_docs = pm.get_function_docs(piece.function_id());
+    let own_docs = pm.get_function_docs(child.piece.function_id());
     let own_docs_section = if own_docs.is_empty() {
         String::new()
     } else {
-        format!("\nFunction documentation:\n{}\nNote: Safety comments describe preconditions that must hold when the function is called. Treat them as verification preconditions.", own_docs)
+        format!("nFunction documentation:n{}nNote: Safety comments describe preconditions that must hold when the function is called. Treat them as verification preconditions.", own_docs)
     };
 
     let mut elaboration = String::new();
     let max_judge_attempts = crate::consts::MAX_JUDGE_ATTEMPTS;
 
     for judge_attempt in 0..max_judge_attempts {
-        pm.advance_piece(&ctx, Some(CodePiecePhase::GetContext), CodePiecePhase::Formalizer);
+        pm.advance_piece(&child.ctx, Some(CodePiecePhase::GetContext), CodePiecePhase::Formalizer);
 
-        let (formalizer_response, ctx2) = formalize_piece(piece, ctx, &context, &elaboration, &own_docs_section, providers)?;
-        ctx = ctx2;
-        info!(%ctx, judge_attempt, "formalizer step done");
+        let formalizer_response = formalize_piece(child, &context, &elaboration, &own_docs_section, providers)?;
+        info!(ctx = %child.ctx, judge_attempt, "formalizer step done");
 
         let extracted = crate::formula::extract_formulas_from_response(&formalizer_response);
         if extracted.is_empty() {
-            warn!(%ctx, judge_attempt, "No formulas extracted from formalizer response");
-            elaboration = format!("Attempt {}: No formulas were extracted. Please produce SMT-LIB2 formulas in ```smt2 code blocks.\n{}", judge_attempt + 1, elaboration);
-            pm.advance_piece(&ctx, Some(CodePiecePhase::Formalizer), CodePiecePhase::GetContext);
+            warn!(ctx = %child.ctx, judge_attempt, "No formulas extracted from formalizer response");
+            elaboration = format!("Attempt {}: No formulas were extracted. Please produce SMT-LIB2 formulas in ```smt2 code blocks.n{}", judge_attempt + 1, elaboration);
+            pm.advance_piece(&child.ctx, Some(CodePiecePhase::Formalizer), CodePiecePhase::GetContext);
             continue;
         }
 
-        pm.advance_piece(&ctx, Some(CodePiecePhase::Formalizer), CodePiecePhase::Check);
+        pm.advance_piece(&child.ctx, Some(CodePiecePhase::Formalizer), CodePiecePhase::Check);
 
         let max_fix_attempts = crate::consts::MAX_INSIST_ATTEMPTS;
         let iteration = judge_attempt as u32;
@@ -943,9 +992,9 @@ fn process_piece(
 
         let formula_results: Vec<_> = extracted.iter().map(|ef| {
             check_and_fix_formula(
-                ef, &ctx, providers, pm,
+                ef, providers, pm,
                 iteration, max_fix_attempts,
-                &piece_ctx_info,
+                &piece_ctx_info, child,
             )
         }).collect();
 
@@ -957,7 +1006,7 @@ fn process_piece(
         for (ef, result) in extracted.iter().zip(formula_results) {
             let (formula, outcome, fctx) = result?;
             let summary = format!(
-                "Formula {} (iteration {}): {:?}\n```\n{}\n```",
+                "Formula {} (iteration {}): {:?}n```n{}n```",
                 fctx,
                 formula.iteration(),
                 outcome,
@@ -985,52 +1034,52 @@ fn process_piece(
                 FormulaSource::PyZ3 => "py",
             };
             let filename = format!("ctx{}_iter{}_attempt{}.{}", fctx, iteration, judge_attempt, ext);
-            info!(%ctx, "IO: filesystem write formula");
+            info!(ctx = %child.ctx, "IO: filesystem write formula");
             let _ = providers
                 .filesystem
                 .invoke(FileSystemRequest {
-                    dir: verification_dir.to_path_buf(),
+                    dir: child.verification_dir.clone(),
                     filename,
                     content: ef.content.clone(),
                 })
                 ;
-            info!(%ctx, "IO response: formula written");
+            info!(ctx = %child.ctx, "IO response: formula written");
         }
 
-        info!(%ctx, "IO: git AddFiles");
+        info!(ctx = %child.ctx, "IO: git AddFiles");
         let _ = providers
             .git
             .invoke(GitRequest::AddFiles {
-                paths: vec![verification_dir.to_path_buf()],
+                paths: vec![child.verification_dir.clone()],
             })
             ;
-        info!(%ctx, "IO response: files added");
-        info!(%ctx, "IO: git Commit");
+        info!(ctx = %child.ctx, "IO response: files added");
+        info!(ctx = %child.ctx, "IO: git Commit");
         let _ = providers
             .git
             .invoke(GitRequest::Commit {
-                message: format!("Add formulas for ctx {} (iteration {})", ctx, judge_attempt),
+                message: format!("Add formulas for ctx {} (iteration {})", child.ctx, judge_attempt),
             })
             ;
-        info!(%ctx, "IO response: committed");
+        info!(ctx = %child.ctx, "IO response: committed");
 
-        pm.advance_piece(&ctx, Some(CodePiecePhase::Check), CodePiecePhase::Judge);
+        pm.advance_piece(&child.ctx, Some(CodePiecePhase::Check), CodePiecePhase::Judge);
 
-        let formulas_summary = formula_summaries.join("\n");
-        let (judge_response, ctx2) = judge_piece(piece, ctx, &formulas_summary, &piece_ctx_info, providers)?;
-        ctx = ctx2;
-        info!(%ctx, judge_attempt, "judge step done");
+        let formulas_summary = formula_summaries.join("n");
+        let judge_response = judge_piece(child, &formulas_summary, &piece_ctx_info, providers)?;
+        info!(ctx = %child.ctx, judge_attempt, "judge step done");
 
         let trimmed_upper = judge_response.trim().to_uppercase();
         let is_exact = trimmed_upper == crate::consts::JUDGE_REASONABLE;
         let is_reasonable = is_exact || trimmed_upper.contains(crate::consts::JUDGE_REASONABLE);
         if is_reasonable && !is_exact {
-            warn!(%ctx, "Judge response accepted via contains fallback (not exact match)");
+            warn!(ctx = %child.ctx, "Judge response accepted via contains fallback (not exact match)");
         }
 
         if is_reasonable {
             if sat_models.is_empty() && unknown_formulas.is_empty() {
-                pm.advance_piece(&ctx, Some(CodePiecePhase::Judge), CodePiecePhase::Closed);
+                pm.advance_piece(&child.ctx, Some(CodePiecePhase::Judge), CodePiecePhase::Closed);
+                let piece = &child.piece;
                 return Ok(PieceOutcome {
                     closed: Some(ClosedPiece {
                         file: piece.file().clone(),
@@ -1044,11 +1093,11 @@ fn process_piece(
                     unverified: None,
                 });
             }
-            pm.advance_piece(&ctx, Some(CodePiecePhase::Judge), CodePiecePhase::Unverified);
+            pm.advance_piece(&child.ctx, Some(CodePiecePhase::Judge), CodePiecePhase::Unverified);
             return Ok(PieceOutcome {
                 closed: None,
                 unverified: Some(unverified_from_piece(
-                    piece,
+                    &child.piece,
                     sat_models,
                     unknown_formulas,
                     judge_response,
@@ -1057,13 +1106,13 @@ fn process_piece(
         }
 
         elaboration = format!(
-            "Judge attempt {} feedback: {}\n\nPrevious problems to avoid when reformalizing:\n{}",
+            "Judge attempt {} feedback: {}nnPrevious problems to avoid when reformalizing:n{}",
             judge_attempt + 1,
             judge_response,
             elaboration
         );
         if judge_attempt + 1 < max_judge_attempts {
-            pm.advance_piece(&ctx, Some(CodePiecePhase::Judge), CodePiecePhase::GetContext);
+            pm.advance_piece(&child.ctx, Some(CodePiecePhase::Judge), CodePiecePhase::GetContext);
         } else {
             break;
         }
@@ -1074,14 +1123,14 @@ fn process_piece(
     // last attempt hit the "no formulas extracted" branch (Formalizer ->
     // GetContext -> continue). Accept either.
     pm.expect_piece_phase_and_set(
-        &ctx,
+        &child.ctx,
         &[CodePiecePhase::Judge, CodePiecePhase::GetContext],
         CodePiecePhase::Unverified,
     );
     Ok(PieceOutcome {
         closed: None,
         unverified: Some(unverified_from_piece(
-            piece,
+            &child.piece,
             Vec::new(),
             Vec::new(),
             format!("Exhausted {} judge attempts. Last elaboration: {}", max_judge_attempts, elaboration),
@@ -1090,35 +1139,25 @@ fn process_piece(
 }
 
 impl AlgorithmState for FullFormalizer {
-    fn execute(
-        self: Box<Self>,
-        providers: &Providers<'_>,
-        pm: &dyn crate::piece_manager::DeductivePieceManager,
-    ) -> Result<Step> {
+    fn execute(&mut self, _providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
+        // The machine fanned this state's piece work out off the node
+        // before this transition; collect the children's outcomes.
         let functions_count = self.functions_count();
         let total_pieces = self.pieces.len();
-        let verification_dir = self.verification_dir;
-        let project_path = self.project_path;
-        let branch_name = self.branch_name;
+        let verification_dir = std::mem::take(&mut self.verification_dir);
+        let project_path = std::mem::take(&mut self.project_path);
+        let branch_name = std::mem::take(&mut self.branch_name);
 
-        let mut pieces_only = Vec::new();
-        let mut ctxs_only = Vec::new();
-        for (piece, ctx) in self.pieces {
-            pieces_only.push(piece);
-            ctxs_only.push(ctx);
-        }
-
-        let ctx_labels: Vec<String> = ctxs_only.iter().map(|c| c.to_string()).collect();
-
-        let results: Vec<_> = pieces_only.iter().zip(ctxs_only).map(|(piece, ctx)| {
-            process_piece(piece, ctx, providers, pm, &verification_dir)
-        }).collect();
+        // The fan-out ran before this step (the machine loop drives it off
+        // this state's declared work); collect the children's outcomes.
+        let slots = std::mem::take(&mut self.pieces);
+        let ctx_labels: Vec<String> = slots.iter().map(|s| s.ctx.to_string()).collect();
 
         let mut closed_pieces = Vec::new();
         let mut unverified_pieces = Vec::new();
 
-        for (i, result) in results.into_iter().enumerate() {
-            match result {
+        for (i, slot) in slots.into_iter().enumerate() {
+            match slot.outcome.expect("fan-out child stores its outcome") {
                 Ok(outcome) => {
                     if let Some(cp) = outcome.closed {
                         closed_pieces.push(cp);
@@ -1128,10 +1167,9 @@ impl AlgorithmState for FullFormalizer {
                     }
                 }
                 Err(e) => {
-                    let piece = &pieces_only[i];
                     warn!(ctx = %ctx_labels[i], error = %e, "Failed to process piece");
                     unverified_pieces.push(unverified_from_piece(
-                        piece,
+                        &slot.piece,
                         Vec::new(),
                         Vec::new(),
                         format!("Processing error: {}", e),
@@ -1144,12 +1182,12 @@ impl AlgorithmState for FullFormalizer {
             Ok(Step::Result(VerificationResult {
                 closed_pieces,
                 unverified_pieces,
-                bug_reports: self.accumulated_bugs,
+                bug_reports: std::mem::take(&mut self.accumulated_bugs),
                 total_functions: functions_count,
                 total_pieces,
             }))
         } else {
-            Ok(Step::State(Box::new(ProblemAnalyzer {
+            let next = ProblemAnalyzer {
                 project_path,
                 verification_dir,
                 branch_name,
@@ -1157,11 +1195,16 @@ impl AlgorithmState for FullFormalizer {
                 unverified: unverified_pieces,
                 recheck_files: Vec::new(),
                 base_commit: String::new(),
-                accumulated_bugs: self.accumulated_bugs,
+                accumulated_bugs: std::mem::take(&mut self.accumulated_bugs),
                 total_pieces,
                 total_functions: functions_count,
-            })))
+        };
+            Ok(Step::State(Box::new(next)))
         }
+    }
+
+    fn piece_work(&mut self) -> Option<&mut Vec<PieceSlot>> {
+        Some(&mut self.pieces)
     }
 }
 
@@ -1179,11 +1222,7 @@ pub struct ProblemAnalyzer {
 }
 
 impl AlgorithmState for ProblemAnalyzer {
-    fn execute(
-        self: Box<Self>,
-        providers: &Providers<'_>,
-        _pm: &dyn crate::piece_manager::DeductivePieceManager,
-    ) -> Result<Step> {
+    fn execute(&mut self, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!(
             unverified_count = self.unverified.len(),
             closed_count = self.closed.len(),
@@ -1256,12 +1295,12 @@ impl AlgorithmState for ProblemAnalyzer {
             let sat = if piece.sat_models.is_empty() {
                 "None".to_string()
             } else {
-                piece.sat_models.iter().map(|m| format!("```\n{}\n```", m)).collect::<Vec<_>>().join("\n\n")
+                piece.sat_models.iter().map(|m| format!("```n{}n```", m)).collect::<Vec<_>>().join("nn")
             };
             let unknown = if piece.unknown_formulas.is_empty() {
                 "None".to_string()
             } else {
-                piece.unknown_formulas.iter().map(|f| format!("```\n{}\n```", f)).collect::<Vec<_>>().join("\n\n")
+                piece.unknown_formulas.iter().map(|f| format!("```n{}n```", f)).collect::<Vec<_>>().join("nn")
             };
 
             let prompt = format!(
@@ -1353,26 +1392,27 @@ If you respond RETRY, make sure to commit your changes first."#,
             }
         }
 
-        let mut all_bugs = self.accumulated_bugs;
+        let mut all_bugs = std::mem::take(&mut self.accumulated_bugs);
         all_bugs.extend(bug_reports);
 
         if remaining_unverified.is_empty() {
             Ok(Step::Result(VerificationResult {
-                closed_pieces: self.closed,
+                closed_pieces: std::mem::take(&mut self.closed),
                 unverified_pieces: Vec::new(),
                 bug_reports: all_bugs,
                 total_functions: self.total_functions,
                 total_pieces: self.total_pieces,
             }))
         } else {
-            Ok(Step::State(Box::new(Restarter {
-                project_path: self.project_path,
-                verification_dir: self.verification_dir,
-                branch_name: self.branch_name,
+            let next = Restarter {
+                project_path: std::mem::take(&mut self.project_path),
+                verification_dir: std::mem::take(&mut self.verification_dir),
+                branch_name: std::mem::take(&mut self.branch_name),
                 base_commit,
                 recheck_files: files_to_recheck,
                 accumulated_bugs: all_bugs,
-            })))
+        };
+            Ok(Step::State(Box::new(next)))
         }
     }
 }
@@ -1387,11 +1427,7 @@ pub struct Restarter {
 }
 
 impl AlgorithmState for Restarter {
-    fn execute(
-        self: Box<Self>,
-        providers: &Providers<'_>,
-        _pm: &dyn crate::piece_manager::DeductivePieceManager,
-    ) -> Result<Step> {
+    fn execute(&mut self, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("IO: git FindChangedRustFiles");
         let resp = providers
             .git
@@ -1419,12 +1455,13 @@ impl AlgorithmState for Restarter {
         let mut seen = HashSet::new();
         all_files.retain(|f| seen.insert(f.clone()));
 
-        Ok(Step::State(Box::new(FunctionLister {
-            project_path: self.project_path,
-            verification_dir: self.verification_dir,
-            branch_name: self.branch_name,
+        let next = FunctionLister {
+            project_path: std::mem::take(&mut self.project_path),
+            verification_dir: std::mem::take(&mut self.verification_dir),
+            branch_name: std::mem::take(&mut self.branch_name),
             files: all_files,
-            accumulated_bugs: self.accumulated_bugs,
-        })))
+            accumulated_bugs: std::mem::take(&mut self.accumulated_bugs),
+        };
+        Ok(Step::State(Box::new(next)))
     }
 }
