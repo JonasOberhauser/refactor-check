@@ -4,8 +4,21 @@ use refactor_check::smt::SolverOutcome;
 use refactor_check_test_helpers::sequence::{FakeSolver, SequenceLlm};
 use refactor_check_test_helpers::test_pm;
 
+/// Description passed to the machine run.
+const RUN_DESC: &str = "max_of_three struct refactoring";
+/// Formula fragment asserted on the extracted formula.
+const EXPECTED_LOGIC_HEADER: &str = "(set-logic ALL)";
+/// Expected formula count.
+const ONE_FORMULA: usize = 1;
+/// Index of the first formula in the results.
+const FIRST_FORMULA: usize = 0;
+
 fn struct_max_formula_response() -> String {
-    r#"```smt2
+    STRUCT_MAX_FORMULA_RESPONSE.to_string()
+}
+
+/// The full SMT-LIB response fixture returned by the formalizer.
+const STRUCT_MAX_FORMULA_RESPONSE: &str = r#"```smt2
 (set-logic ALL)
 
 ;; -----------------------------------------------------------------
@@ -57,11 +70,11 @@ fn struct_max_formula_response() -> String {
 ;; -----------------------------------------------------------------
 (check-sat)
 (get-model)
-```"#.to_string()
-}
+```"#;
 
-fn struct_max_split() -> String {
-    "\
+
+/// The split fixture: a single max_of_three piece.
+const STRUCT_MAX_SPLIT: &str = "
 Piece: max_of_three
 ---- BEFORE ----
 (declare-fun max_of_three_before (Entry Entry Entry) Entry)
@@ -73,8 +86,10 @@ Piece: max_of_three
 (declare-fun max_of_three_after (Entry Entry Entry) Entry)
 (assert (forall ((a Entry) (b Entry) (c Entry))
   (= (max_of_three_after a b c)
-     (max_entry (max_entry a b) c))))"
-        .to_string()
+     (max_entry (max_entry a b) c))))";
+
+fn struct_max_split() -> String {
+    STRUCT_MAX_SPLIT.to_string()
 }
 #[test_log::test]
 fn test_sat_judge_overrules() {
@@ -89,13 +104,13 @@ fn test_sat_judge_overrules() {
     };
 
     let pm = test_pm();
-    let result = machine::run("max_of_three struct refactoring", &llm, &solver, &pm)
+    let result = machine::run(RUN_DESC, &llm, &solver, &pm)
         
         .expect("agent should succeed (bug: judge overruled)");
 
-    assert_eq!(result.formulas.len(), 1);
-    assert_eq!(result.formulas[0].outcome, SolverOutcome::Sat);
-    assert!(result.formulas[0].formula.contains("(set-logic ALL)"));
+    assert_eq!(result.formulas.len(), ONE_FORMULA);
+    assert_eq!(result.formulas[FIRST_FORMULA].outcome, SolverOutcome::Sat);
+    assert!(result.formulas[FIRST_FORMULA].formula.contains(EXPECTED_LOGIC_HEADER));
     assert!(!result.overall_equivalent);
-    assert_eq!(result.reasonable_sat, 1);
+    assert_eq!(result.reasonable_sat, ONE_FORMULA);
 }

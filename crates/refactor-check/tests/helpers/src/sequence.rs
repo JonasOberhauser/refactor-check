@@ -5,6 +5,9 @@ use anyhow::Result;
 use refactor_check::provider::{IOProvider, LlmRequest, LlmRole, SolverRequest, WithContext};
 use refactor_check::smt::{SolverOutcome, SolverResult};
 
+/// The scripted judge verdict.
+const VERDICT_REASONABLE: &str = "REASONABLE";
+
 pub struct SequenceLlm {
     formalizer: Arc<Mutex<Vec<String>>>,
     fixer: Arc<Mutex<Vec<String>>>,
@@ -45,7 +48,7 @@ impl SequenceLlm {
             fixer: Arc::new(Mutex::new(fixer)),
             judge: Arc::new(Mutex::new(judge)),
             splitter: Arc::new(Mutex::new(splitter)),
-            splitting_judge: Arc::new(Mutex::new(vec!["REASONABLE".to_string(); split_count])),
+            splitting_judge: Arc::new(Mutex::new(vec![VERDICT_REASONABLE.to_string(); split_count])),
             analyzer: Arc::new(Mutex::new(Vec::new())),
         }
     }

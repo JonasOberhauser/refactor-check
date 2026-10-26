@@ -6,6 +6,50 @@ use crate::piece_manager::PieceManager;
 use crate::provider::{DynLlmProvider, LlmRequest, LlmRole};
 use crate::states::{CodePiece, WaitForSplit};
 
+/// Splitter retry budget.
+const SPLIT_SYSTEM_PROMPT: &str = "You are an expert in code refactoring analysis. Given a refactoring with BEFORE and AFTER \
+ code, identify the largest matching fragments that can be independently verified for \
+ equivalence by an SMT solver. \
+ \n\nOutput format:\n\
+ Piece: <label>\n\
+ ---- BEFORE ----\n\
+ <before code for this fragment>\n\
+ ---- AFTER ----\n\
+ <matching after code for this fragment>\n\
+ /* relation: <description of how states differ between before and after> */\n\n\
+ Rules:\n\
+ - If the refactoring is simple, output one piece.\n\
+ - For loops, conditionals, or complex restructurings, split into matching fragments.\n\
+ - Each BEFORE must have a matching AFTER.\n\
+ - Labels must be short and descriptive.\n\
+ - Prefer fewer larger pieces over many tiny ones.\n\
+ - If a piece contains code whose equivalence to code in another piece \
+ has already been verified, add a comment like: the code from ... to ... \
+ has already been verified to be equivalent to the code from ... to ..., \
+ so the formalizer can reuse that information.\n\
+ - Do not create separate pieces for library include/import statements \
+ (e.g. use, import, #include) unless they might have side effects \
+ (macros expanding to code, module initialization). Merge import changes \
+ into the first substantive piece that uses them.\n\
+ - When a split point creates a variable/state mapping gap between BEFORE \
+ and AFTER, add a single /* relation: ... */ comment at the end of the \
+ piece. The relation describes how states differ between before and after \
+ at this boundary. Example: /* relation: after.z == before.y - 1 */ means \
+ the variable z in the after version corresponds to y - 1 in the before \
+ version. Do not repeat the same comment in both BEFORE and AFTER — one \
+ comment per piece suffices. Variables/states not mentioned in a relation \
+ comment are assumed to be equivalent between before and after.";
+const RESPLIT_PROMPT_HEADER: &str = "The following pieces timed out during SMT verification. Split each piece \
+ into finer sub-pieces that the SMT solver can handle:\n\n";
+const SPLIT_ATTEMPTS: u32 = 3;
+/// Splitter output grammar.
+const PIECE_PREFIX_COLON: &str = "Piece:";
+const PIECE_PREFIX_SPACE: &str = "Piece ";
+const BEFORE_HEADER: &str = "---- BEFORE ----";
+const AFTER_HEADER: &str = "---- AFTER ----";
+const LABEL_TRIM_COLON: char = ':';
+const PIECE_NEWLINE: char = '\n';
+
 pub fn execute(
     state: &WaitForSplit,
     llm: &DynLlmProvider,
@@ -13,7 +57,7 @@ pub fn execute(
     parent_ctx: &ContextId,
 ) -> Result<Vec<CodePiece>> {
     let mut split_ctx = parent_ctx.new_child();
-    for attempt in 0..3 {
+    for attempt in 0..SPLIT_ATTEMPTS {
         let messages = build_split_messages(state);
         let resp = llm.invoke(LlmRequest { role: LlmRole::Splitter, messages, context_id: Box::new(split_ctx) })?;
         split_ctx = *resp.context_id;
@@ -34,38 +78,7 @@ pub fn execute(
 
 fn build_split_messages(state: &WaitForSplit) -> Vec<crate::llm::Message> {
     let system = crate::llm::system_message(
-        "You are an expert in code refactoring analysis. Given a refactoring with BEFORE and AFTER \
-         code, identify the largest matching fragments that can be independently verified for \
-         equivalence by an SMT solver. \
-         \n\nOutput format:\n\
-         Piece: <label>\n\
-         ---- BEFORE ----\n\
-         <before code for this fragment>\n\
-         ---- AFTER ----\n\
-         <matching after code for this fragment>\n\
-         /* relation: <description of how states differ between before and after> */\n\n\
-         Rules:\n\
-         - If the refactoring is simple, output one piece.\n\
-         - For loops, conditionals, or complex restructurings, split into matching fragments.\n\
-         - Each BEFORE must have a matching AFTER.\n\
-         - Labels must be short and descriptive.\n\
-         - Prefer fewer larger pieces over many tiny ones.\n\
-         - If a piece contains code whose equivalence to code in another piece \
-         has already been verified, add a comment like \
-         \"the code from ... to ... has already been verified to be equivalent \
-         to the code from ... to ...\" so the formalizer can reuse that information.\n\
-         - Do not create separate pieces for library include/import statements \
-         (e.g. use, import, #include) unless they might have side effects \
-         (macros expanding to code, module initialization). Merge import changes \
-         into the first substantive piece that uses them.\n\
-         - When a split point creates a variable/state mapping gap between BEFORE \
-         and AFTER, add a single /* relation: ... */ comment at the end of the \
-         piece. The relation describes how states differ between before and after \
-         at this boundary. Example: /* relation: after.z == before.y - 1 */ means \
-         the variable z in the after version corresponds to y - 1 in the before \
-         version. Do not repeat the same comment in both BEFORE and AFTER — one \
-         comment per piece suffices. Variables/states not mentioned in a relation \
-         comment are assumed to be equivalent between before and after.",
+        SPLIT_SYSTEM_PROMPT
     );
 
     let prompt = if state.pieces_to_resplit.is_empty() {
@@ -84,8 +97,7 @@ fn build_split_messages(state: &WaitForSplit) -> Vec<crate::llm::Message> {
         }
     } else {
         let mut prompt = String::from(
-            "The following pieces timed out during SMT verification. Split each piece \
-             into finer sub-pieces that the SMT solver can handle:\n\n",
+            RESPLIT_PROMPT_HEADER,
         );
         for (i, (piece, reason)) in state.pieces_to_resplit.iter().enumerate() {
             prompt.push_str(&format!(
@@ -113,7 +125,7 @@ fn extract_split_pieces(response: &str, pm: &dyn PieceManager, split_ctx: &Conte
     for line in response.lines() {
         let trimmed = line.trim();
 
-        if trimmed.starts_with("Piece:") || trimmed.starts_with("Piece ") {
+        if trimmed.starts_with(PIECE_PREFIX_COLON) || trimmed.starts_with(PIECE_PREFIX_SPACE) {
             if let Some(label) = current_label.take() {
                 if !before_buf.trim().is_empty() && !after_buf.trim().is_empty() {
                     let p = pm.new_piece(
@@ -129,10 +141,10 @@ fn extract_split_pieces(response: &str, pm: &dyn PieceManager, split_ctx: &Conte
                 after_buf = String::new();
             }
             let label = trimmed
-                .trim_start_matches("Piece:")
-                .trim_start_matches("Piece ")
+                .trim_start_matches(PIECE_PREFIX_COLON)
+                .trim_start_matches(PIECE_PREFIX_SPACE)
                 .trim()
-                .trim_matches(':')
+                .trim_matches(LABEL_TRIM_COLON)
                 .trim()
                 .to_string();
             current_label = Some(label);
@@ -140,18 +152,18 @@ fn extract_split_pieces(response: &str, pm: &dyn PieceManager, split_ctx: &Conte
             continue;
         }
 
-        if trimmed == "---- BEFORE ----" {
+        if trimmed == BEFORE_HEADER {
             current_section = Some(&mut before_buf);
             continue;
         }
-        if trimmed == "---- AFTER ----" {
+        if trimmed == AFTER_HEADER {
             current_section = Some(&mut after_buf);
             continue;
         }
 
         if let Some(ref mut buf) = current_section {
             buf.push_str(line);
-            buf.push('\n');
+            buf.push(PIECE_NEWLINE);
         }
     }
 
@@ -176,26 +188,14 @@ mod tests {
     use super::*;
     use crate::piece_manager::DefaultPieceManager;
 
-    #[test]
-    fn test_extract_single_piece() {
-        let pm = DefaultPieceManager::new();
-        let response = "\
+    /// Fixture responses and expected labels for the extraction tests.
+    const RESPONSE_SINGLE: &str = "
 Piece: main
 ---- BEFORE ----
 fn before() { x + 1 }
 ---- AFTER ----
 fn after() { x + 1 }";
-        let pieces = extract_split_pieces(response, &pm, ContextId::root());
-        assert_eq!(pieces.len(), 1);
-        assert_eq!(pieces[0].label(), "main");
-        assert!(pieces[0].before().contains("fn before"));
-        assert!(pieces[0].after().contains("fn after"));
-    }
-
-    #[test]
-    fn test_extract_multiple_pieces() {
-        let pm = DefaultPieceManager::new();
-        let response = "\
+    const RESPONSE_THREE: &str = "
 Piece: prelude
 ---- BEFORE ----
 let x = init();
@@ -213,35 +213,70 @@ Piece: postlude
 cleanup(x);
 ---- AFTER ----
 cleanup(x);";
-        let pieces = extract_split_pieces(response, &pm, ContextId::root());
-        assert_eq!(pieces.len(), 3);
-        assert_eq!(pieces[0].label(), "prelude");
-        assert_eq!(pieces[1].label(), "loop_body");
-        assert_eq!(pieces[2].label(), "postlude");
-    }
-
-    #[test]
-    fn test_extract_nested_piece_names() {
-        let pm = DefaultPieceManager::new();
-        let response = "\
+    const RESPONSE_ZERO_ASSIGN: &str = "
 Piece: init
 ---- BEFORE ----
 let x = 0;
 ---- AFTER ----
 let x = 0;";
+    const RESPONSE_MISSING_AFTER: &str = "
+Piece: broken
+---- BEFORE ----
+fn before() { x + 1 }
+---- AFTER ----";
+    const RESPONSE_MISSING_BEFORE: &str = "
+Piece: broken
+---- BEFORE ----
+---- AFTER ----
+fn after() { x + 1 }";
+    const LABEL_MAIN: &str = "main";
+    const LABEL_PRELUDE: &str = "prelude";
+    const LABEL_LOOP_BODY: &str = "loop_body";
+    const LABEL_POSTLUDE: &str = "postlude";
+    const BEFORE_FN: &str = "fn before";
+    const AFTER_FN: &str = "fn after";
+    const ZERO_ASSIGN: &str = "let x = 0;";
+    const ONE_PIECE: usize = 1;
+    const THREE_PIECES: usize = 3;
+    const FIRST_PIECE: usize = 0;
+    const SECOND_PIECE: usize = 1;
+    const THIRD_PIECE: usize = 2;
+
+    #[test]
+    fn test_extract_single_piece() {
+        let pm = DefaultPieceManager::new();
+        let response = RESPONSE_SINGLE;
         let pieces = extract_split_pieces(response, &pm, ContextId::root());
-        assert_eq!(pieces.len(), 1);
-        assert_eq!(pieces[0].before(), "let x = 0;");
+        assert_eq!(pieces.len(), ONE_PIECE);
+        assert_eq!(pieces[FIRST_PIECE].label(), LABEL_MAIN);
+        assert!(pieces[FIRST_PIECE].before().contains(BEFORE_FN));
+        assert!(pieces[FIRST_PIECE].after().contains(AFTER_FN));
+    }
+
+    #[test]
+    fn test_extract_multiple_pieces() {
+        let pm = DefaultPieceManager::new();
+        let response = RESPONSE_THREE;
+        let pieces = extract_split_pieces(response, &pm, ContextId::root());
+        assert_eq!(pieces.len(), THREE_PIECES);
+        assert_eq!(pieces[FIRST_PIECE].label(), LABEL_PRELUDE);
+        assert_eq!(pieces[SECOND_PIECE].label(), LABEL_LOOP_BODY);
+        assert_eq!(pieces[THIRD_PIECE].label(), LABEL_POSTLUDE);
+    }
+
+    #[test]
+    fn test_extract_nested_piece_names() {
+        let pm = DefaultPieceManager::new();
+        let response = RESPONSE_ZERO_ASSIGN;
+        let pieces = extract_split_pieces(response, &pm, ContextId::root());
+        assert_eq!(pieces.len(), ONE_PIECE);
+        assert_eq!(pieces[FIRST_PIECE].before(), ZERO_ASSIGN);
     }
 
     #[test]
     fn test_extract_piece_missing_after_is_rejected() {
         let pm = DefaultPieceManager::new();
-        let response = "\
-Piece: broken
----- BEFORE ----
-fn before() { x + 1 }
----- AFTER ----";
+        let response = RESPONSE_MISSING_AFTER;
         let pieces = extract_split_pieces(response, &pm, ContextId::root());
         assert!(pieces.is_empty(), "piece with empty AFTER should be rejected");
     }
@@ -249,11 +284,7 @@ fn before() { x + 1 }
     #[test]
     fn test_extract_piece_missing_before_is_rejected() {
         let pm = DefaultPieceManager::new();
-        let response = "\
-Piece: broken
----- BEFORE ----
----- AFTER ----
-fn after() { x + 1 }";
+        let response = RESPONSE_MISSING_BEFORE;
         let pieces = extract_split_pieces(response, &pm, ContextId::root());
         assert!(pieces.is_empty(), "piece with empty BEFORE should be rejected");
     }

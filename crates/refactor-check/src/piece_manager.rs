@@ -59,6 +59,19 @@ mod tests {
     use super::*;
     use crate::phase::PiecePhase;
 
+    const PIECE_LABEL: &str = "test";
+    const PIECE_BEFORE: &str = "before";
+    const PIECE_AFTER: &str = "after";
+    const FIRST_LABEL: &str = "first";
+    const FIRST_BEFORE: &str = "a";
+    const FIRST_AFTER: &str = "b";
+    const RESPLIT_A_LABEL: &str = "resplit_a";
+    const RESPLIT_A_BEFORE: &str = "c";
+    const RESPLIT_A_AFTER: &str = "d";
+    const RESPLIT_B_LABEL: &str = "resplit_b";
+    const RESPLIT_B_BEFORE: &str = "e";
+    const RESPLIT_B_AFTER: &str = "f";
+
     fn test_pm() -> DefaultPieceManager {
         DefaultPieceManager::new()
     }
@@ -67,7 +80,7 @@ mod tests {
     fn enter_generation_absent_entry_inserts_without_panic() {
         let pm = test_pm();
         let root = ContextId::root();
-        let piece = pm.new_piece(root, "test", "before", "after");
+        let piece = pm.new_piece(root, PIECE_LABEL, PIECE_BEFORE, PIECE_AFTER);
         piece.with_ctx(|ctx| {
             pm.enter_generation(ctx, PiecePhase::Fixing);
             assert_eq!(pm.get_phase(ctx), Some(PiecePhase::Fixing));
@@ -78,7 +91,7 @@ mod tests {
     fn enter_generation_absent_entry_inserts_forming() {
         let pm = test_pm();
         let root = ContextId::root();
-        let piece = pm.new_piece(root, "test", "before", "after");
+        let piece = pm.new_piece(root, PIECE_LABEL, PIECE_BEFORE, PIECE_AFTER);
         piece.with_ctx(|ctx| {
             pm.enter_generation(ctx, PiecePhase::Forming);
             assert_eq!(pm.get_phase(ctx), Some(PiecePhase::Forming));
@@ -89,7 +102,7 @@ mod tests {
     fn enter_generation_transitions_from_open() {
         let pm = test_pm();
         let root = ContextId::root();
-        let piece = pm.new_piece(root, "test", "before", "after");
+        let piece = pm.new_piece(root, PIECE_LABEL, PIECE_BEFORE, PIECE_AFTER);
         piece.with_ctx(|ctx| {
             pm.advance(ctx, None, PiecePhase::Solving);
             pm.advance(ctx, Some(PiecePhase::Solving), PiecePhase::Open);
@@ -102,7 +115,7 @@ mod tests {
     fn enter_generation_transitions_from_forming() {
         let pm = test_pm();
         let root = ContextId::root();
-        let piece = pm.new_piece(root, "test", "before", "after");
+        let piece = pm.new_piece(root, PIECE_LABEL, PIECE_BEFORE, PIECE_AFTER);
         piece.with_ctx(|ctx| {
             pm.enter_generation(ctx, PiecePhase::Forming);
             pm.enter_generation(ctx, PiecePhase::Fixing);
@@ -114,7 +127,7 @@ mod tests {
     fn enter_generation_transitions_from_fixing() {
         let pm = test_pm();
         let root = ContextId::root();
-        let piece = pm.new_piece(root, "test", "before", "after");
+        let piece = pm.new_piece(root, PIECE_LABEL, PIECE_BEFORE, PIECE_AFTER);
         piece.with_ctx(|ctx| {
             pm.enter_generation(ctx, PiecePhase::Fixing);
             pm.enter_generation(ctx, PiecePhase::Forming);
@@ -127,7 +140,7 @@ mod tests {
     fn enter_generation_panics_from_solving() {
         let pm = test_pm();
         let root = ContextId::root();
-        let piece = pm.new_piece(root, "test", "before", "after");
+        let piece = pm.new_piece(root, PIECE_LABEL, PIECE_BEFORE, PIECE_AFTER);
         piece.with_ctx(|ctx| {
             pm.advance(ctx, None, PiecePhase::Solving);
             pm.enter_generation(ctx, PiecePhase::Fixing);
@@ -138,15 +151,15 @@ mod tests {
     fn enter_generation_new_piece_ids_at_nonzero_iteration() {
         let pm = test_pm();
         let root = ContextId::root();
-        let p1 = pm.new_piece(root, "first", "a", "b");
+        let p1 = pm.new_piece(root, FIRST_LABEL, FIRST_BEFORE, FIRST_AFTER);
         p1.with_ctx(|ctx| {
             pm.enter_generation(ctx, PiecePhase::Forming);
             pm.expect_any_and_set(ctx, &[PiecePhase::Forming], PiecePhase::Solving);
             pm.advance(ctx, Some(PiecePhase::Solving), PiecePhase::Open);
         });
 
-        let p2 = pm.new_piece(root, "resplit_a", "c", "d");
-        let p3 = pm.new_piece(root, "resplit_b", "e", "f");
+        let p2 = pm.new_piece(root, RESPLIT_A_LABEL, RESPLIT_A_BEFORE, RESPLIT_A_AFTER);
+        let p3 = pm.new_piece(root, RESPLIT_B_LABEL, RESPLIT_B_BEFORE, RESPLIT_B_AFTER);
 
         assert_ne!(p2.label(), p3.label());
 

@@ -74,13 +74,13 @@ fn find_fenced_smt_blocks(text: &str) -> Vec<String> {
     for line in text.lines() {
         let trimmed = line.trim();
         let bt_count = backtick_count(trimmed);
-        if bt_count >= 3 && !in_fence {
+        if bt_count >= FENCE_BACKTICKS && !in_fence {
             in_fence = true;
             fence_backticks = bt_count;
             fence_buf.clear();
             continue;
         }
-        if in_fence && bt_count >= 3 && bt_count >= fence_backticks {
+        if in_fence && bt_count >= FENCE_BACKTICKS && bt_count >= fence_backticks {
             in_fence = false;
             let candidate = fence_buf.trim().to_string();
             if !candidate.is_empty() {
@@ -90,7 +90,7 @@ fn find_fenced_smt_blocks(text: &str) -> Vec<String> {
         }
         if in_fence {
             fence_buf.push_str(line);
-            fence_buf.push('\n');
+            fence_buf.push(FENCE_NEWLINE);
         }
     }
 
@@ -101,7 +101,7 @@ fn backtick_count(line: &str) -> usize {
     let trimmed = line.trim();
     let mut count = 0;
     for ch in trimmed.chars() {
-        if ch == '`' {
+        if ch == FENCE_BACKTICK_CHAR {
             count += 1;
         } else {
             break;
@@ -123,7 +123,7 @@ fn parse_solver_outcome(exit_code: Option<i32>, stdout: &str, stderr: &str) -> S
         }
     }
 
-    if stdout.lines().any(|l| l.trim().starts_with("(error")) {
+    if stdout.lines().any(|l| l.trim().starts_with(SIG_ERROR_LINE)) {
         return SolverOutcome::Error(stdout.trim().to_string());
     }
 
@@ -133,9 +133,9 @@ fn parse_solver_outcome(exit_code: Option<i32>, stdout: &str, stderr: &str) -> S
         .find(|l| !l.is_empty());
 
     match first_meaningful {
-        Some(line) if line.starts_with("unsat") => SolverOutcome::Unsat,
-        Some(line) if line.starts_with("sat") => SolverOutcome::Sat,
-        Some(line) if line.starts_with("unknown") => SolverOutcome::Unknown,
+        Some(line) if line.starts_with(PREFIX_UNSAT) => SolverOutcome::Unsat,
+        Some(line) if line.starts_with(PREFIX_SAT) => SolverOutcome::Sat,
+        Some(line) if line.starts_with(PREFIX_UNKNOWN) => SolverOutcome::Unknown,
         None | Some(_) => SolverOutcome::Unknown,
     }
 }
@@ -156,8 +156,8 @@ pub struct SolverConfig {
 impl Default for SolverConfig {
     fn default() -> Self {
         Self {
-            solver_path: "z3".to_string(),
-            solver_args: vec!["-in".to_string()],
+            solver_path: DEFAULT_SOLVER_PATH.to_string(),
+            solver_args: vec![SOLVER_STDIN_ARG.to_string()],
             timeout_secs: DEFAULT_SOLVER_TIMEOUT_SECS,
         }
     }
@@ -167,6 +167,34 @@ impl Default for SolverConfig {
 ///
 /// Panics if a pipe-reader thread panicked (structural: the pipe is owned
 /// exclusively by that thread, so a panic there means the runtime is broken).
+/// Backticks that open/close a fenced block.
+const FENCE_BACKTICKS: usize = 3;
+/// Characters of the fence grammar.
+const FENCE_BACKTICK_CHAR: char = '`';
+const FENCE_NEWLINE: char = '\n';
+/// Solver answers, recognized at line starts.
+const SIG_ERROR_LINE: &str = "(error";
+const PREFIX_UNSAT: &str = "unsat";
+const PREFIX_SAT: &str = "sat";
+const PREFIX_UNKNOWN: &str = "unknown";
+/// Default solver binary and its stdin mode argument.
+const DEFAULT_SOLVER_PATH: &str = "z3";
+const SOLVER_STDIN_ARG: &str = "-in";
+/// Poll interval while waiting for the solver to exit.
+const SOLVER_POLL_MS: u64 = 50;
+/// Pipe-failure contexts.
+const CTX_STDIN: &str = "Failed to open stdin";
+const CTX_WRITE_FORMULA: &str = "Failed to write formula to solver stdin";
+const CTX_STDOUT: &str = "Failed to open stdout";
+const CTX_STDERR: &str = "Failed to open stderr";
+const CTX_WAIT: &str = "Failed to wait for solver process";
+
+/// Runs the solver on `formula`, capturing both pipes.
+///
+/// # Panics
+///
+/// Panics if a pipe-reader thread panicked while draining solver output
+/// (the join on the reader threads expects a result).
 #[instrument(skip_all, fields(solver_path, %context_id))]
 pub fn run_solver(
     solver_path: &str,
@@ -187,15 +215,15 @@ pub fn run_solver(
         .with_context(|| format!("Failed to spawn solver: {solver_path}"))?;
 
     {
-        let mut stdin = child.stdin.take().context("Failed to open stdin")?;
+        let mut stdin = child.stdin.take().context(CTX_STDIN)?;
         stdin
             .write_all(formula.as_bytes())
-            .context("Failed to write formula to solver stdin")?;
+            .context(CTX_WRITE_FORMULA)?;
         // stdin dropped here: closes the pipe, signaling EOF to the solver.
     }
 
-    let mut stdout_pipe = child.stdout.take().context("Failed to open stdout")?;
-    let mut stderr_pipe = child.stderr.take().context("Failed to open stderr")?;
+    let mut stdout_pipe = child.stdout.take().context(CTX_STDOUT)?;
+    let mut stderr_pipe = child.stderr.take().context(CTX_STDERR)?;
 
     // Reader threads own the pipes for the whole child lifetime — a pipe
     // buffer filling up can never deadlock the solver.
@@ -213,7 +241,7 @@ pub fn run_solver(
     // Deadline watchdog: try_wait poll, kill on expiry.
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
-        if let Some(status) = child.try_wait().context("Failed to wait for solver process")? {
+        if let Some(status) = child.try_wait().context(CTX_WAIT)? {
             break Some(status);
         }
         if std::time::Instant::now() >= deadline {
@@ -222,7 +250,7 @@ pub fn run_solver(
             let _reaped = child.wait();
             break None;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(SOLVER_POLL_MS));
     };
 
     let elapsed = start.elapsed();
@@ -311,39 +339,18 @@ impl IOProvider<SolverRequest, WithContext<SolverResult>> for Z3Solver {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_extract_formula_with_prose_and_backticks() {
-        let formula = "\
-(set-logic UF)
-
-(declare-sort Emitter 0)
-
-(declare-fun f_version (Emitter) Emitter)
-(declare-fun f_config  (Emitter) Emitter)
-
-(assert (forall ((e Emitter)) (= (h_config e) (f_config e))))
-
-(check-sat)
-(get-model)";
-
-        let response = format!(
-            "Looking at this refactoring, the \"before\" version is a monolithic \
-             `stats_general_print` function.\n\n\
-             ```smt2\n{}\n```\n\n\
-             **Expected result: UNSAT**",
-            formula
-        );
-
-        let result = extract_smt_formula(&response);
-        assert!(result.is_some(), "should find exactly one formula");
-        let extracted = result.unwrap();
-        assert!(extracted.contains("(set-logic UF)"));
-        assert!(extracted.contains("(check-sat)"));
-    }
-
-    #[test]
-    fn test_extract_jemalloc_style_response() {
-        let formula = "\
+    /// Fixture formulas for the extraction tests.
+    const FIXTURE_FORMULA_ASSERT_X: &str = "(set-logic QF_LIA)\n(declare-fun x () Int)\n(assert (= x 0))\n(check-sat)";
+    const FIXTURE_FORMULA_ASSERT_Y: &str = "(set-logic QF_LIA)\n(declare-fun y () Int)\n(assert (> y 5))\n(check-sat)";
+    const FIXTURE_FORMULA_BARE: &str = "(set-logic QF_LIA)\n(check-sat)";
+    const ASSERT_X_LINE: &str = "(assert (= x 0))";
+    const ASSERT_Y_LINE: &str = "(assert (> y 5))";
+    const WHITESPACE_ONLY: &str = "   ";
+    const TWO_FORMULAS: usize = 2;
+    const FIRST_FORMULA: usize = 0;
+    const SECOND_FORMULA: usize = 1;
+    const ONE_FORMULA: usize = 1;
+    const FIXTURE_FORMULA_JEMALLOC_STYLE: &str = "\
 (set-logic UF)
 
 (declare-sort Emitter 0)
@@ -391,6 +398,30 @@ mod tests {
 
 (check-sat)
 (get-model)";
+    const FIXTURE_FORMULA_EQUATIONS: &str = "\n(set-logic UF)\n\n(declare-sort Emitter 0)\n\n(declare-fun f_version (Emitter) Emitter)\n(declare-fun f_config  (Emitter) Emitter)\n\n(assert (forall ((e Emitter)) (= (h_config e) (f_config e))))\n\n(check-sat)\n(get-model)";
+
+    #[test]
+    fn test_extract_formula_with_prose_and_backticks() {
+        let formula = FIXTURE_FORMULA_EQUATIONS;
+
+        let response = format!(
+            "Looking at this refactoring, the \"before\" version is a monolithic \
+             `stats_general_print` function.\n\n\
+             ```smt2\n{}\n```\n\n\
+             **Expected result: UNSAT**",
+            formula
+        );
+
+        let result = extract_smt_formula(&response);
+        assert!(result.is_some(), "should find exactly one formula");
+        let extracted = result.unwrap();
+        assert!(extracted.contains("(set-logic UF)"));
+        assert!(extracted.contains("(check-sat)"));
+    }
+
+    #[test]
+    fn test_extract_jemalloc_style_response() {
+        let formula = FIXTURE_FORMULA_JEMALLOC_STYLE;
 
         let response = format!(
             "Looking at this refactoring, the \"before\" version is a monolithic \
@@ -418,8 +449,8 @@ mod tests {
 
     #[test]
     fn test_extract_single_formula_rejects_multiple_blocks() {
-        let formula_a = "(set-logic QF_LIA)\n(declare-fun x () Int)\n(assert (= x 0))\n(check-sat)";
-        let formula_b = "(set-logic QF_LIA)\n(declare-fun y () Int)\n(assert (> y 5))\n(check-sat)";
+        let formula_a = FIXTURE_FORMULA_ASSERT_X;
+        let formula_b = FIXTURE_FORMULA_ASSERT_Y;
         let response = format!(
             "Here are two formulas:\n\n```smt2\n{a}\n```\n\nAnd the second:\n\n```smt2\n{b}\n```",
             a = formula_a,
@@ -431,30 +462,30 @@ mod tests {
 
     #[test]
     fn test_extract_all_formulas_multiple_blocks() {
-        let formula_a = "(set-logic QF_LIA)\n(declare-fun x () Int)\n(assert (= x 0))\n(check-sat)";
-        let formula_b = "(set-logic QF_LIA)\n(declare-fun y () Int)\n(assert (> y 5))\n(check-sat)";
+        let formula_a = FIXTURE_FORMULA_ASSERT_X;
+        let formula_b = FIXTURE_FORMULA_ASSERT_Y;
         let response = format!(
             "```smt2\n{a}\n```\nSome text\n\n```smt2\n{b}\n```",
             a = formula_a,
             b = formula_b,
         );
         let formulas = extract_all_formulas(&response);
-        assert_eq!(formulas.len(), 2);
-        assert!(formulas[0].contains("(assert (= x 0))"));
-        assert!(formulas[1].contains("(assert (> y 5))"));
+        assert_eq!(formulas.len(), TWO_FORMULAS);
+        assert!(formulas[FIRST_FORMULA].contains(ASSERT_X_LINE));
+        assert!(formulas[SECOND_FORMULA].contains(ASSERT_Y_LINE));
     }
 
     #[test]
     fn test_extract_all_formulas_no_blocks_returns_bare_text() {
-        let bare = "(set-logic QF_LIA)\n(check-sat)";
+        let bare = FIXTURE_FORMULA_BARE;
         let formulas = extract_all_formulas(bare);
-        assert_eq!(formulas.len(), 1);
-        assert_eq!(formulas[0], bare.trim());
+        assert_eq!(formulas.len(), ONE_FORMULA);
+        assert_eq!(formulas[FIRST_FORMULA], bare.trim());
     }
 
     #[test]
     fn test_extract_all_formulas_empty_response() {
-        let formulas = extract_all_formulas("   ");
+        let formulas = extract_all_formulas(WHITESPACE_ONLY);
         assert!(formulas.is_empty());
     }
 }

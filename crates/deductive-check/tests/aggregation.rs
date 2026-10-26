@@ -32,6 +32,44 @@ use refactor_check_core::smt::{SolverOutcome, SolverResult};
 const SPLITTER_OUT: &str =
     "```rust\nfn piece() {\n    let x = 1;\n    assert!(x > 0);\n    return;\n}\n```\n";
 const SMT_OUT: &str = "```smt2\n(set-logic ALL)\n(declare-const x Int)\n(assert (> x 0))\n(check-sat)\n```\n";
+/// The judge verdict that accepts a response.
+const VERDICT_REASONABLE: &str = "REASONABLE";
+/// Fake solver stdout values.
+const STDOUT_UNSAT: &str = "unsat";
+const STDOUT_SAT: &str = "sat";
+const STDOUT_UNKNOWN: &str = "unknown";
+/// Functions the mock RA lists.
+const FIRST_FN_NAME: &str = "f0";
+const SECOND_FN_NAME: &str = "f1";
+/// Line span every mock function claims.
+const MOCK_DEF_LINE: u32 = 1;
+const MOCK_START_LINE: u32 = 1;
+const MOCK_END_LINE: u32 = 5;
+/// Fallback paths and refs the mock git reports.
+const LIB_RS_PATH: &str = "src/lib.rs";
+const WALK_OUTPUT: &str = "src/lib.rs\n";
+const COMMIT_HASH: &str = "deadbeefcafebabe1234567890abcdef12345678";
+/// Minimal SMT-LIB the mock python provider falls back to.
+const MINIMAL_SMT2: &str = "(check-sat)";
+/// Stub file content the mock RA returns.
+const STUB_MAIN_SRC: &str = "fn main() {}";
+/// Scripted agent responses.
+const AGENT_OK: &str = "OK";
+const AGENT_NO_BUG: &str = "No bug found.";
+const BUG_REPORT_F0: &str = "Found a bug: x can be 0.";
+const VERDICT_RETRY: &str = "RETRY";
+const F0_BUG_MESSAGE: &str = "Bug in f0.";
+const F1_BUG_MESSAGE: &str = "Bug in f1.";
+const NO_FORMULA_OUT: &str = "I cannot produce a formula.";
+const NO_FORMULA_BUG: &str = "Bug: no formula could be produced.";
+/// Directory marker that makes the machine treat the tempdir as a repo.
+const GIT_DIR: &str = ".git";
+/// Expected counts and indexes into the results.
+const EXPECTED_BUG_REPORTS: usize = 1;
+const FIRST_BUG_REPORT: usize = 0;
+const EXPECTED_TOTAL_PIECES: usize = 2;
+const EXPECTED_TOTAL_FUNCTIONS: usize = 2;
+const EXPECTED_BUG_COUNT: usize = 2;
 
 // ── LLM: role-fixed responses (judge always REASONABLE) ────────────────────
 
@@ -44,7 +82,7 @@ impl IOProvider<LlmRequest, WithContext<String>> for MockLlm {
         let resp = match input.role {
             LlmRole::Splitter => SPLITTER_OUT.to_string(),
             LlmRole::Formalizer | LlmRole::Fixer => self.formalizer_out.clone(),
-            LlmRole::Judge => "REASONABLE".to_string(),
+            LlmRole::Judge => VERDICT_REASONABLE.to_string(),
             LlmRole::SplittingJudge | LlmRole::Analyzer => String::new(),
         };
         Ok(WithContext { value: resp, context_id: input.context_id })
@@ -66,9 +104,9 @@ impl IOProvider<SolverRequest, WithContext<SolverResult>> for MockSolver {
             .pop_front()
             .unwrap_or(SolverOutcome::Unsat);
         let stdout = match &outcome {
-            SolverOutcome::Unsat => "unsat".to_string(),
-            SolverOutcome::Sat => "sat".to_string(),
-            SolverOutcome::Unknown => "unknown".to_string(),
+            SolverOutcome::Unsat => STDOUT_UNSAT.to_string(),
+            SolverOutcome::Sat => STDOUT_SAT.to_string(),
+            SolverOutcome::Unknown => STDOUT_UNKNOWN.to_string(),
             SolverOutcome::Error(e) => e.clone(),
         };
         Ok(WithContext {
@@ -86,10 +124,10 @@ impl IOProvider<RustAnalyzerRequest, RustAnalyzerResponse> for MockRa {
     fn invoke(&self, input: RustAnalyzerRequest) -> Result<RustAnalyzerResponse> {
         Ok(match input {
             RustAnalyzerRequest::ListFunctions { files, .. } => {
-                let file = files.first().cloned().unwrap_or_else(|| PathBuf::from("src/lib.rs"));
+                let file = files.first().cloned().unwrap_or_else(|| PathBuf::from(LIB_RS_PATH));
                 RustAnalyzerResponse::FunctionList(vec![
-                    function_info(file.clone(), "f0"),
-                    function_info(file, "f1"),
+                    function_info(file.clone(), FIRST_FN_NAME),
+                    function_info(file, SECOND_FN_NAME),
                 ])
             }
             RustAnalyzerRequest::GetFunctionCode { function_id } => RustAnalyzerResponse::FunctionCode(format!(
@@ -109,7 +147,7 @@ impl IOProvider<RustAnalyzerRequest, RustAnalyzerResponse> for MockRa {
                 RustAnalyzerResponse::FunctionDocs(String::new())
             }
             RustAnalyzerRequest::GetFileContent { .. } => {
-                RustAnalyzerResponse::FileContent("fn main() {}".to_string())
+                RustAnalyzerResponse::FileContent(STUB_MAIN_SRC.to_string())
             }
         })
     }
@@ -117,10 +155,10 @@ impl IOProvider<RustAnalyzerRequest, RustAnalyzerResponse> for MockRa {
 
 fn function_info(file: PathBuf, name: &str) -> FunctionInfo {
     FunctionInfo {
-        id: FunctionId::new(file, name, None, 1),
+        id: FunctionId::new(file, name, None, MOCK_DEF_LINE),
         body: String::new(),
-        start_line: 1,
-        end_line: 5,
+        start_line: MOCK_START_LINE,
+        end_line: MOCK_END_LINE,
         docs: String::new(),
         has_guarantees: true,
     }
@@ -133,10 +171,10 @@ impl IOProvider<GitRequest, GitResponse> for MockGit {
     fn invoke(&self, input: GitRequest) -> Result<GitResponse> {
         Ok(match input {
             GitRequest::WalkRustFiles { .. } => {
-                GitResponse { success: true, output: "src/lib.rs\n".to_string() }
+                GitResponse { success: true, output: WALK_OUTPUT.to_string() }
             }
             GitRequest::CurrentCommitHash => {
-                GitResponse { success: true, output: "deadbeefcafebabe1234567890abcdef12345678".to_string() }
+                GitResponse { success: true, output: COMMIT_HASH.to_string() }
             }
             GitRequest::FindChangedRustFiles { .. } => GitResponse { success: true, output: String::new() },
             _ => GitResponse { success: true, output: String::new() },
@@ -155,7 +193,7 @@ struct MockPython;
 impl IOProvider<PythonRequest, PythonResponse> for MockPython {
     fn invoke(&self, input: PythonRequest) -> Result<PythonResponse> {
         let smtlib = if input.script.trim().is_empty() {
-            "(check-sat)".to_string()
+            MINIMAL_SMT2.to_string()
         } else {
             input.script
         };
@@ -176,7 +214,7 @@ impl IOProvider<AgentRequest, AgentResponse> for MockAgent {
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or((true, "No bug found.".to_string()));
+            .unwrap_or((true, AGENT_NO_BUG.to_string()));
         Ok(AgentResponse { success, stdout })
     }
 }
@@ -210,7 +248,7 @@ impl Mocks {
 #[test]
 fn bug_report_survives_restart_cycle() {
     let project = tempfile::tempdir().expect("tempdir");
-    std::fs::create_dir_all(project.path().join(".git")).expect("create .git marker");
+    std::fs::create_dir_all(project.path().join(GIT_DIR)).expect("create .git marker");
 
     let mocks = Mocks {
         llm: MockLlm { formalizer_out: SMT_OUT.to_string() },
@@ -229,9 +267,9 @@ fn bug_report_survives_restart_cycle() {
         python: MockPython,
         agent: MockAgent {
             responses: Mutex::new(VecDeque::from([
-                (true, "OK".to_string()),                       // preflight
-                (true, "Found a bug: x can be 0.".to_string()),  // cycle 1 f0 -> bug report
-                (true, "RETRY".to_string()),                     // cycle 1 f1 -> restart
+                (true, AGENT_OK.to_string()),               // preflight
+                (true, BUG_REPORT_F0.to_string()),          // cycle 1 f0 -> bug report
+                (true, VERDICT_RETRY.to_string()),          // cycle 1 f1 -> restart
             ])),
         },
     };
@@ -247,7 +285,7 @@ fn bug_report_survives_restart_cycle() {
 
     assert_eq!(
         result.bug_reports.len(),
-        1,
+        EXPECTED_BUG_REPORTS,
         "the f0 bug report from cycle 1 must survive the restart into the final result; \
          got bug_reports={:?} (closed={}, unverified={})",
         result.bug_reports,
@@ -255,9 +293,9 @@ fn bug_report_survives_restart_cycle() {
         result.unverified_pieces.len(),
     );
     assert!(
-        result.bug_reports[0].description.contains("x can be 0"),
+        result.bug_reports[FIRST_BUG_REPORT].description.contains("x can be 0"),
         "preserved bug report should be f0's: {:?}",
-        result.bug_reports[0]
+        result.bug_reports[FIRST_BUG_REPORT]
     );
 }
 
@@ -268,7 +306,7 @@ fn totals_reported_when_terminating_via_problem_analyzer() {
     // VerificationResult must report the real totals. Previously
     // ProblemAnalyzer hardcoded total_functions: 0 / total_pieces: 0.
     let project = tempfile::tempdir().expect("tempdir");
-    std::fs::create_dir_all(project.path().join(".git")).expect("create .git marker");
+    std::fs::create_dir_all(project.path().join(GIT_DIR)).expect("create .git marker");
 
     let mocks = Mocks {
         llm: MockLlm { formalizer_out: SMT_OUT.to_string() },
@@ -285,9 +323,9 @@ fn totals_reported_when_terminating_via_problem_analyzer() {
         python: MockPython,
         agent: MockAgent {
             responses: Mutex::new(VecDeque::from([
-                (true, "OK".to_string()),             // preflight
-                (true, "Bug in f0.".to_string()),     // f0 -> bug report (no RETRY)
-                (true, "Bug in f1.".to_string()),     // f1 -> bug report (no RETRY)
+                (true, AGENT_OK.to_string()),       // preflight
+                (true, F0_BUG_MESSAGE.to_string()), // f0 -> bug report (no RETRY)
+                (true, F1_BUG_MESSAGE.to_string()), // f1 -> bug report (no RETRY)
             ])),
         },
     };
@@ -302,14 +340,14 @@ fn totals_reported_when_terminating_via_problem_analyzer() {
     .expect("machine ran");
 
     assert_eq!(
-        result.total_pieces, 2,
+        result.total_pieces, EXPECTED_TOTAL_PIECES,
         "total_pieces must reflect the pieces processed (2), not 0"
     );
     assert_eq!(
-        result.total_functions, 2,
+        result.total_functions, EXPECTED_TOTAL_FUNCTIONS,
         "total_functions must reflect the functions verified (2), not 0"
     );
-    assert_eq!(result.bug_reports.len(), 2, "both pieces should be bug reports");
+    assert_eq!(result.bug_reports.len(), EXPECTED_BUG_COUNT, "both pieces should be bug reports");
 }
 
 #[test]
@@ -319,10 +357,10 @@ fn no_formula_on_last_judge_attempt_does_not_panic() {
     // leaving the piece in GetContext. The post-loop transition must not
     // assume the piece is in Judge (it used to -> phase-tracker panic).
     let project = tempfile::tempdir().expect("tempdir");
-    std::fs::create_dir_all(project.path().join(".git")).expect("create .git marker");
+    std::fs::create_dir_all(project.path().join(GIT_DIR)).expect("create .git marker");
 
     let mocks = Mocks {
-        llm: MockLlm { formalizer_out: "I cannot produce a formula.".to_string() },
+        llm: MockLlm { formalizer_out: NO_FORMULA_OUT.to_string() },
         solver: MockSolver {
             outcomes: Mutex::new(VecDeque::from([
                 SolverOutcome::Unsat, // preflight only (0 formulas -> no solver checks)
@@ -334,8 +372,8 @@ fn no_formula_on_last_judge_attempt_does_not_panic() {
         python: MockPython,
         agent: MockAgent {
             responses: Mutex::new(VecDeque::from([
-                (true, "OK".to_string()),                                  // preflight
-                (true, "Bug: no formula could be produced.".to_string()),  // ProblemAnalyzer
+                (true, AGENT_OK.to_string()),                   // preflight
+                (true, NO_FORMULA_BUG.to_string()),             // ProblemAnalyzer
             ])),
         },
     };

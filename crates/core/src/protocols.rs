@@ -6,6 +6,39 @@ use serde::{Deserialize, Serialize};
 use servyi_servatui::{BufferConsole, NoInput, Plugin, Protocol, ShellAction, SocketConnection, TypedConnection};
 use crate::message_log::{MessageLog, LogEntry, ancestors, is_valid_ctx_id};
 
+/// Shell command names and their help texts.
+const CMD_WATCH: &str = "watch";
+const CMD_PIECES: &str = "pieces";
+const CMD_SHOW: &str = "show";
+const CMD_CONTINUE: &str = "continue";
+const CMD_STATUS: &str = "status";
+const CMD_EXIT: &str = "exit";
+const HELP_PIECES: &str = "List all piece ids";
+const HELP_CONTINUE: &str = "Resume blocked tasks after error";
+const HELP_SHOW: &str = "Show message history for a piece id (e.g. 'show 1.2.3'), or list all with no args";
+const HELP_WATCH: &str = "Read-only status (does not drain pending errors)";
+const HELP_STATUS: &str = "Show work status and pending errors";
+const HELP_EXIT: &str = "Quit the server";
+/// Status banner lines.
+const BANNER_WORK_RUNNING: &str = "[work running]";
+const BANNER_WORK_FINISHED: &str = "[work finished]";
+const BANNER_SHUTTING_DOWN: &str = "[shutting down]";
+/// Message-log renderer: level labels, separators, indents.
+const LEVEL_ERROR: &str = "ERROR";
+const LEVEL_WARN: &str = "WARN ";
+const LEVEL_INFO: &str = "INFO ";
+const LEVEL_DEBUG: &str = "DEBUG";
+const LEVEL_TRACE: &str = "TRACE";
+const LEVEL_GAP: char = ' ';
+const LINE_NEWLINE: char = '\n';
+const STATUS_INDENT: &str = "  ";
+const STATUS_COL_GAP: usize = 2;
+const NO_STATUS: &str = "-";
+const EMPTY_PIECES: &str = "No pieces recorded yet";
+/// Dotted-id segment separator and reply read timeout.
+const ID_SEPARATOR: &str = ".";
+const REPLY_TIMEOUT_MS: u64 = 1000;
+
 /// Shared server state passed to all server_ctx steps.
 pub struct ServerState {
     pub message_log: Arc<MessageLog>,
@@ -97,8 +130,8 @@ const MAX_SUGGESTIONS: usize = 50;
 
 /// Compare dotted piece ids numerically ("1.2" < "1.10" < "2").
 fn cmp_dotted(a: &str, b: &str) -> std::cmp::Ordering {
-    let sa: Vec<u64> = a.split('.').filter_map(|s| s.parse().ok()).collect();
-    let sb: Vec<u64> = b.split('.').filter_map(|s| s.parse().ok()).collect();
+    let sa: Vec<u64> = a.split(ID_SEPARATOR).filter_map(|s| s.parse().ok()).collect();
+    let sb: Vec<u64> = b.split(ID_SEPARATOR).filter_map(|s| s.parse().ok()).collect();
     sa.cmp(&sb)
 }
 
@@ -124,7 +157,7 @@ pub fn query_status(socket: &Path) -> Option<StatusSnapshot> {
     let Ok(mut conn) = SocketConnection::connect(socket) else {
         return None;
     };
-    if conn.send_typed(&"watch".to_string()).is_err() {
+    if conn.send_typed(&CMD_WATCH.to_string()).is_err() {
         return None;
     }
     let mut console = BufferConsole::new();
@@ -160,8 +193,8 @@ pub fn server_matches(socket: &Path) -> bool {
     // setting cannot affect later connections.
     let _ = conn
         .stream
-        .set_read_timeout(Some(std::time::Duration::from_millis(1000)));
-    if conn.send_typed(&"pieces".to_string()).is_err() {
+        .set_read_timeout(Some(std::time::Duration::from_millis(REPLY_TIMEOUT_MS)));
+    if conn.send_typed(&CMD_PIECES.to_string()).is_err() {
         return false;
     }
     pieces_protocol()
@@ -206,7 +239,7 @@ fn query_piece_ids(socket: &Path) -> Vec<String> {
     let Ok(mut conn) = SocketConnection::connect(socket) else {
         return Vec::new();
     };
-    if conn.send_typed(&"pieces".to_string()).is_err() {
+    if conn.send_typed(&CMD_PIECES.to_string()).is_err() {
         return Vec::new();
     }
     let mut console = BufferConsole::new();
@@ -220,7 +253,7 @@ fn query_piece_ids(socket: &Path) -> Vec<String> {
 /// Full-line `show <id>` suggestions for the confirmed input, filtered by
 /// the typed prefix and capped at [`MAX_SUGGESTIONS`].
 fn piece_id_suggestions(input: &str, ids: &[String]) -> Vec<String> {
-    let Some(rest) = input.strip_prefix("show") else {
+    let Some(rest) = input.strip_prefix(CMD_SHOW) else {
         return Vec::new();
     };
     let arg = rest.trim_start();
@@ -241,7 +274,7 @@ fn show_completions(socket: &Path, input: &str) -> Vec<String> {
 /// Used by `show`'s tab completion (which polls the server) and available
 /// as a plain command.
 pub fn pieces_protocol() -> Protocol {
-    Plugin::new("pieces", "List all piece ids")
+    Plugin::new(CMD_PIECES, HELP_PIECES)
         .parse(|_args: &str| Ok(()))
         .client(|req: (), _out, _input| Ok(req))
         .server_ctx(|_req: (), ctx: &ServerState| {
@@ -259,7 +292,7 @@ pub fn pieces_protocol() -> Protocol {
 }
 
 pub fn continue_protocol() -> Protocol {
-    Plugin::new("continue", "Resume blocked tasks after error")
+    Plugin::new(CMD_CONTINUE, HELP_CONTINUE)
         .parse(|_args: &str| Ok(ContinueRequest {}))
         .client(|req: ContinueRequest, _out, _input| Ok(req))
         .server_ctx(|_req: ContinueRequest, ctx: &ServerState| {
@@ -283,7 +316,7 @@ pub fn continue_protocol() -> Protocol {
 
 pub fn show_protocol(socket: impl AsRef<Path>) -> Protocol {
     let socket: PathBuf = socket.as_ref().to_path_buf();
-    Plugin::new("show", "Show message history for a piece id (e.g. 'show 1.2.3'), or list all with no args")
+    Plugin::new(CMD_SHOW, HELP_SHOW)
         .parse(|args: &str| Ok(ShowRequest { piece_id: args.trim().to_string() }))
         .client(|req: ShowRequest, _out, _input| Ok(req))
         .server_ctx(|req: ShowRequest, ctx: &ServerState| {
@@ -315,7 +348,7 @@ pub fn show_protocol(socket: impl AsRef<Path>) -> Protocol {
 /// Panics if a server-state lock is poisoned — only pure ops run under
 /// them, so poisoning would mean a lock discipline was broken elsewhere.
 pub fn watch_protocol() -> Protocol {
-    Plugin::new("watch", "Read-only status (does not drain pending errors)")
+    Plugin::new(CMD_WATCH, HELP_WATCH)
         .parse(|_args: &str| Ok(StatusRequest {}))
         .client(|req: StatusRequest, _out, _input| Ok(req))
         .server_ctx(|_req: StatusRequest, ctx: &ServerState| {
@@ -330,11 +363,11 @@ pub fn watch_protocol() -> Protocol {
         })
         .client(|resp: StatusResponse, out, _input| {
             if resp.running {
-                out.print_line("[work running]");
+                out.print_line(BANNER_WORK_RUNNING);
             } else {
                 match &resp.result {
                     Some(msg) => out.print_line(&format!("[work finished: {msg}]")),
-                    None => out.print_line("[work finished]"),
+                    None => out.print_line(BANNER_WORK_FINISHED),
                 }
             }
             for err in &resp.pending_errors {
@@ -352,7 +385,7 @@ pub fn watch_protocol() -> Protocol {
 /// Panics if a server-state lock is poisoned — only pure ops run under
 /// them, so poisoning would mean a lock discipline was broken elsewhere.
 pub fn status_protocol() -> Protocol {
-    Plugin::new("status", "Show work status and pending errors")
+    Plugin::new(CMD_STATUS, HELP_STATUS)
         .parse(|_args: &str| Ok(StatusRequest {}))
         .client(|req: StatusRequest, _out, _input| Ok(req))
         .server_ctx(|_req: StatusRequest, ctx: &ServerState| {
@@ -369,11 +402,11 @@ pub fn status_protocol() -> Protocol {
         })
         .client(|resp: StatusResponse, out, _input| {
             if resp.running {
-                out.print_line("[work running]");
+                out.print_line(BANNER_WORK_RUNNING);
             } else {
                 match &resp.result {
                     Some(msg) => out.print_line(&format!("[work finished: {msg}]")),
-                    None => out.print_line("[work finished]"),
+                    None => out.print_line(BANNER_WORK_FINISHED),
                 }
             }
             for err in &resp.parked {
@@ -388,7 +421,7 @@ pub fn status_protocol() -> Protocol {
 }
 
 pub fn exit_protocol() -> Protocol {
-    Plugin::new("exit", "Quit the server")
+    Plugin::new(CMD_EXIT, HELP_EXIT)
         .parse(|_args: &str| Ok(()))
         .client(|req: (), _out, _input| Ok(req))
         .server_ctx(|_req: (), ctx: &ServerState| {
@@ -397,7 +430,7 @@ pub fn exit_protocol() -> Protocol {
             Ok(())
         })
         .client(|_: (), out, _input| {
-            out.print_line("[shutting down]");
+            out.print_line(BANNER_SHUTTING_DOWN);
             Ok(())
         })
         .finalize(|| Ok(ShellAction::Exit))
@@ -419,31 +452,31 @@ pub fn all_protocols(socket: impl AsRef<Path>) -> Vec<Protocol> {
 fn show_tree(log: &MessageLog) -> String {
     let keys = log.keys();
     if keys.is_empty() {
-        return "No pieces recorded yet".to_string();
+        return EMPTY_PIECES.to_string();
     }
     let mut sorted = keys;
     sort_piece_ids(&mut sorted);
     let max_id_len = sorted
         .iter()
-        .map(|k| k.len() + k.matches('.').count() * 2)
+        .map(|k| k.len() + k.matches(ID_SEPARATOR).count() * 2)
         .max()
         .unwrap_or(0);
     let mut out = String::new();
     for key in &sorted {
-        let depth = key.matches('.').count();
+        let depth = key.matches(ID_SEPARATOR).count();
         let indent = depth * 2;
-        let status = log.get_status(key).unwrap_or("-".to_string());
+        let status = log.get_status(key).unwrap_or_else(|| NO_STATUS.to_string());
         let visual_len = key.len() + indent;
-        let padding = max_id_len.saturating_sub(visual_len) + 2;
+        let padding = max_id_len.saturating_sub(visual_len) + STATUS_COL_GAP;
         for _ in 0..indent {
-            out.push_str("  ");
+            out.push_str(STATUS_INDENT);
         }
         out.push_str(key);
         for _ in 0..padding {
-            out.push(' ');
+            out.push(LEVEL_GAP);
         }
         out.push_str(&status);
-        out.push('\n');
+        out.push(LINE_NEWLINE);
     }
     out
 }
@@ -472,25 +505,25 @@ fn show_piece(log: &MessageLog, ctx_id: &str) -> String {
     for (ancestor, entry) in &all_entries {
         if ancestor != prev_ancestor {
             if !out.is_empty() {
-                out.push('\n');
+                out.push(LINE_NEWLINE);
             }
             out.push_str(&format!("--- {} ---\n", ancestor));
             prev_ancestor = ancestor;
         }
         let level_str = match entry.level {
-            tracing::Level::ERROR => "ERROR",
-            tracing::Level::WARN => "WARN ",
-            tracing::Level::INFO => "INFO ",
-            tracing::Level::DEBUG => "DEBUG",
-            tracing::Level::TRACE => "TRACE",
+            tracing::Level::ERROR => LEVEL_ERROR,
+            tracing::Level::WARN => LEVEL_WARN,
+            tracing::Level::INFO => LEVEL_INFO,
+            tracing::Level::DEBUG => LEVEL_DEBUG,
+            tracing::Level::TRACE => LEVEL_TRACE,
         };
         out.push_str(level_str);
-        out.push(' ');
+        out.push(LEVEL_GAP);
         out.push_str(&entry.message);
         for (name, value) in &entry.fields {
             out.push_str(&format!(" {name}={value}"));
         }
-        out.push('\n');
+        out.push(LINE_NEWLINE);
     }
 
     if out.is_empty() {
@@ -504,47 +537,68 @@ fn show_piece(log: &MessageLog, ctx_id: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Completer fixtures: piece ids and expected suggestion prefixes.
+    const ID_POOL: &[&str] = &["2", "1.2", "1", "10", "1.10"];
+    const PREFIX_SHOW: &str = "show ";
+    const PREFIX_SHOW_1: &str = "show 1";
+    const PREFIX_SHOW_1_DOT: &str = "show 1.";
+    const PREFIX_SHOW_2: &str = "show 2";
+    const PREFIX_SHOW_3: &str = "show 3";
+    const PREFIX_STATUS: &str = "status ";
+    const EXPECT_ALL: &[&str] = &["show 1", "show 1.2", "show 1.10", "show 2", "show 10"];
+    const EXPECT_1: &[&str] = &["show 1", "show 1.2", "show 1.10", "show 10"];
+    const EXPECT_1_DOT: &[&str] = &["show 1.2", "show 1.10"];
+    const EXPECT_2: &[&str] = &["show 2"];
+    /// Cap headroom above MAX_SUGGESTIONS in the capped test.
+    const CAP_HEADROOM: u64 = 10;
+    /// Watch/status integration knobs.
+    const SOCK_WATCH_TEST: &str = "watch.sock";
+    const SOCK_COMPLETION_TEST: &str = "comp.sock";
+    const ERR_BOOM: &str = "boom";
+    const CONNECT_ROUNDS: u32 = 100;
+    const CONNECT_POLL_MS: u64 = 10;
+    /// Message-log fixtures.
+    const LOG_IDS: &[(&str, u64)] = &[("2", 3), ("1.2", 2), ("1", 1)];
+    const LOG_TARGET: &str = "test";
+    const LOG_MESSAGE: &str = "m";
+
     #[test]
     fn suggestions_filter_by_prefix_and_sort_numerically() {
-        let ids: Vec<String> = ["2", "1.2", "1", "10", "1.10"]
-            .iter().map(|s| s.to_string()).collect();
+        let ids: Vec<String> = ID_POOL.iter().map(|s| s.to_string()).collect();
         // Dotted-numeric order: 1 < 1.2 < 1.10 < 2 < 10
-        assert_eq!(
-            piece_id_suggestions("show ", &ids),
-            ["show 1", "show 1.2", "show 1.10", "show 2", "show 10"]
-        );
-        assert_eq!(piece_id_suggestions("show 1", &ids), ["show 1", "show 1.2", "show 1.10", "show 10"]);
-        assert_eq!(piece_id_suggestions("show 1.", &ids), ["show 1.2", "show 1.10"]);
-        assert_eq!(piece_id_suggestions("show 2", &ids), ["show 2"]);
-        assert!(piece_id_suggestions("show 3", &ids).is_empty());
+        assert_eq!(piece_id_suggestions(PREFIX_SHOW, &ids), EXPECT_ALL);
+        assert_eq!(piece_id_suggestions(PREFIX_SHOW_1, &ids), EXPECT_1);
+        assert_eq!(piece_id_suggestions(PREFIX_SHOW_1_DOT, &ids), EXPECT_1_DOT);
+        assert_eq!(piece_id_suggestions(PREFIX_SHOW_2, &ids), EXPECT_2);
+        assert!(piece_id_suggestions(PREFIX_SHOW_3, &ids).is_empty());
         // Only our own command ever reaches this completer.
-        assert!(piece_id_suggestions("status ", &ids).is_empty());
+        assert!(piece_id_suggestions(PREFIX_STATUS, &ids).is_empty());
     }
 
     #[test]
     fn suggestions_are_capped() {
-        let ids: Vec<String> = (0..(MAX_SUGGESTIONS as u64 + 10)).map(|i| i.to_string()).collect();
-        assert_eq!(piece_id_suggestions("show ", &ids).len(), MAX_SUGGESTIONS);
+        let ids: Vec<String> = (0..(MAX_SUGGESTIONS as u64 + CAP_HEADROOM)).map(|i| i.to_string()).collect();
+        assert_eq!(piece_id_suggestions(PREFIX_SHOW, &ids).len(), MAX_SUGGESTIONS);
     }
 
     #[test]
     fn watch_queries_status_without_draining_pending_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("watch.sock");
+        let socket = dir.path().join(SOCK_WATCH_TEST);
 
         let state = Arc::new(ServerState::new(Arc::new(MessageLog::new())));
-        state.push_error("boom".to_string());
+        state.push_error(ERR_BOOM.to_string());
         let handle = servyi_servatui::ServerHandle {
             socket: socket.clone(),
             protocols: all_protocols(&socket),
         };
         std::thread::spawn(move || handle.run(state).ok());
 
-        for _ in 0..100 {
+        for _ in 0..CONNECT_ROUNDS {
             if SocketConnection::server_exists(&socket) {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(CONNECT_POLL_MS));
         }
 
         // The read-only watch sees the pending error …
@@ -559,7 +613,7 @@ mod tests {
         let mut console = BufferConsole::new();
         let mut input = NoInput;
         let mut conn = SocketConnection::connect(&socket).unwrap();
-        conn.send_typed(&"status".to_string()).unwrap();
+        conn.send_typed(&CMD_STATUS.to_string()).unwrap();
         status_protocol().run_client("", &mut conn, &mut console, &mut input).unwrap();
         assert!(
             console.lines.iter().any(|l| l.contains("boom")),
@@ -573,17 +627,17 @@ mod tests {
     #[test]
     fn pieces_completion_queries_live_server() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("comp.sock");
+        let socket = dir.path().join(SOCK_COMPLETION_TEST);
 
         let log = Arc::new(MessageLog::new());
-        for (id, seq) in [("2", 3), ("1.2", 2), ("1", 1)] {
+        for (id, seq) in LOG_IDS {
             log.push(
                 id.to_string(),
                 LogEntry {
-                    seq,
+                    seq: *seq,
                     level: tracing::Level::INFO,
-                    target: "test".to_string(),
-                    message: "m".to_string(),
+                    target: LOG_TARGET.to_string(),
+                    message: LOG_MESSAGE.to_string(),
                     fields: vec![],
                 },
             );
@@ -595,11 +649,11 @@ mod tests {
         };
         std::thread::spawn(move || handle.run(state).ok());
 
-        for _ in 0..100 {
+        for _ in 0..CONNECT_ROUNDS {
             if SocketConnection::server_exists(&socket) {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(CONNECT_POLL_MS));
         }
 
         assert_eq!(query_piece_ids(&socket), ["1", "1.2", "2"]);
@@ -615,12 +669,26 @@ mod tests {
 mod resolve_tests {
     use super::*;
 
+    /// Resolve-test knobs and fixture socket names.
+    const WAIT_ONLINE_ROUNDS: u32 = 200;
+    const RESOLVE_POLL_MS: u64 = 10;
+    const DEDUCT_DISCOVERY_POLL_MS: u64 = 20;
+    const SOCK_OURS: &str = "ours.sock";
+    const SOCK_FOREIGN: &str = "foreign.sock";
+    const SOCK_OURS_PID1: &str = "deductive-check-1.sock";
+    const SOCK_OTHER_APP: &str = "something-else.sock";
+    const SOCK_LONELY: &str = "lonely.sock";
+    const SOCK_DIRECT: &str = "direct.sock";
+    /// Foreign-server plugin identity.
+    const FOREIGN_PLUGIN_CMD: &str = "echo";
+    const FOREIGN_PLUGIN_HELP: &str = "foreign server";
+
     fn wait_online(socket: &Path) {
-        for _ in 0..200 {
+        for _ in 0..WAIT_ONLINE_ROUNDS {
             if SocketConnection::server_exists(socket) {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(RESOLVE_POLL_MS));
         }
         panic!("server never came online: {}", socket.display());
     }
@@ -637,7 +705,7 @@ mod resolve_tests {
 
     fn foreign_protocol() -> Protocol {
         // A perfectly valid servatui server — just not OURS (no `pieces`).
-        Plugin::new("echo", "foreign server")
+        Plugin::new(FOREIGN_PLUGIN_CMD, FOREIGN_PLUGIN_HELP)
             .parse(|_args: &str| Ok(()))
             .client(|req: (), _out, _input| Ok(req))
             .server(|_: ()| Ok(()))
@@ -649,11 +717,11 @@ mod resolve_tests {
     fn handshake_distinguishes_our_servers_from_foreign_ones() {
         let dir = tempfile::tempdir().unwrap();
 
-        let ours = dir.path().join("ours.sock");
+        let ours = dir.path().join(SOCK_OURS);
         spawn_server(&ours, all_protocols(&ours));
         assert!(server_matches(&ours), "our server must handshake");
 
-        let foreign = dir.path().join("foreign.sock");
+        let foreign = dir.path().join(SOCK_FOREIGN);
         spawn_server(&foreign, vec![foreign_protocol()]);
         assert!(!server_matches(&foreign), "foreign server must not match");
 
@@ -668,10 +736,10 @@ mod resolve_tests {
         // Ours first (older mtime), the foreign one second (newer, tried
         // first by the resolver) — proving the handshake decides, not the
         // ordering.
-        let ours = dir.path().join("deductive-check-1.sock");
+        let ours = dir.path().join(SOCK_OURS_PID1);
         spawn_server(&ours, all_protocols(&ours));
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let foreign = dir.path().join("something-else.sock");
+        std::thread::sleep(std::time::Duration::from_millis(DEDUCT_DISCOVERY_POLL_MS));
+        let foreign = dir.path().join(SOCK_OTHER_APP);
         spawn_server(&foreign, vec![foreign_protocol()]);
 
         let resolved = resolve_active_server(dir.path());
@@ -680,7 +748,7 @@ mod resolve_tests {
         // A folder with only foreign sockets, an empty folder, and a
         // nonexistent path all resolve to nothing.
         let other = tempfile::tempdir().unwrap();
-        let lonely = other.path().join("lonely.sock");
+        let lonely = other.path().join(SOCK_LONELY);
         spawn_server(&lonely, vec![foreign_protocol()]);
         assert_eq!(resolve_active_server(other.path()), None);
         let empty = tempfile::tempdir().unwrap();
@@ -694,7 +762,7 @@ mod resolve_tests {
     #[test]
     fn resolve_accepts_a_direct_socket_path() {
         let dir = tempfile::tempdir().unwrap();
-        let ours = dir.path().join("direct.sock");
+        let ours = dir.path().join(SOCK_DIRECT);
         spawn_server(&ours, all_protocols(&ours));
         assert_eq!(resolve_active_server(&ours).as_deref(), Some(ours.as_path()));
         let _ = std::fs::remove_file(&ours);
@@ -705,25 +773,34 @@ mod resolve_tests {
 mod parked_tests {
     use super::*;
 
+    /// Parked-status knobs.
+    const WAIT_ONLINE_ROUNDS_SUPER: u32 = 200;
+    const CONNECT_POLL_MS: u64 = 10;
+
+    /// Fixture error strings and the parked-status socket name.
+    const ERR_BOOM: &str = "boom";
+    const ERR_Z3: &str = "z3 exploded";
+    const SOCK_PARKED_TEST: &str = "parked.sock";
+
     #[test]
     fn watch_and_status_report_error_gate_parked_state() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("parked.sock");
+        let socket = dir.path().join(SOCK_PARKED_TEST);
 
         let state = Arc::new(ServerState::new(Arc::new(MessageLog::new())));
-        state.push_error("boom".to_string());
-        state.error_gate_parked.lock().expect("server state lock: pure ops only").push("z3 exploded".to_string());
+        state.push_error(ERR_BOOM.to_string());
+        state.error_gate_parked.lock().expect("server state lock: pure ops only").push(ERR_Z3.to_string());
         let handle = servyi_servatui::ServerHandle {
             socket: socket.clone(),
             protocols: all_protocols(&socket),
         };
         let state_for_thread = state.clone();
         std::thread::spawn(move || handle.run(state_for_thread).ok());
-        for _ in 0..200 {
+        for _ in 0..WAIT_ONLINE_ROUNDS_SUPER {
             if SocketConnection::server_exists(&socket) {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(CONNECT_POLL_MS));
         }
 
         let snap = query_status(&socket).expect("watch");
@@ -734,7 +811,7 @@ mod parked_tests {
         let mut console = BufferConsole::new();
         let mut input = NoInput;
         let mut conn = SocketConnection::connect(&socket).unwrap();
-        conn.send_typed(&"status".to_string()).unwrap();
+        conn.send_typed(&CMD_STATUS.to_string()).unwrap();
         status_protocol().run_client("", &mut conn, &mut console, &mut input).unwrap();
         assert!(
             console.lines.iter().any(|l| l.contains("z3 exploded")),

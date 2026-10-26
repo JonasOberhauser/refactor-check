@@ -7,6 +7,13 @@ use crate::provider::{DynLlmProvider, LlmRequest, LlmRole};
 use crate::smt::SolverResult;
 use crate::states::{CodePiece, JudgeVerdict};
 
+/// The relation-comment marker and the judge guidance for it.
+const RELATION_MARKER: &str = "/* relation:";
+const RELATION_JUDGE_NOTE: &str = "\n\nIf the piece contains /* relation: ... */ comments, verify that the \
+             formula correctly encodes the specified relation between before and after \
+             states. Variables/states not mentioned in the relation are assumed equivalent \
+             and should be encoded as such.";
+
 /// # Panics
 ///
 /// Panics via [`CodePiece::with_ctx`] if the piece's context was already
@@ -71,15 +78,8 @@ pub fn execute(
             )
         };
 
-        let has_relation = piece.before().contains("/* relation:") || piece.after().contains("/* relation:");
-        let relation_note = if has_relation {
-            "\n\nIf the piece contains /* relation: ... */ comments, verify that the \
-             formula correctly encodes the specified relation between before and after \
-             states. Variables/states not mentioned in the relation are assumed equivalent \
-             and should be encoded as such."
-        } else {
-            ""
-        };
+        let has_relation = piece.before().contains(RELATION_MARKER) || piece.after().contains(RELATION_MARKER);
+        let relation_note = if has_relation { RELATION_JUDGE_NOTE } else { "" };
 
         let messages = vec![
             llm::system_message(&format!(

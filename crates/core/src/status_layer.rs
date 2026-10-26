@@ -21,6 +21,28 @@ use servyi_servatui::{BufferConsole, NoInput, SocketConnection, WidgetEntry};
 
 use crate::protocols::{continue_protocol, exit_protocol, query_status, StatusSnapshot};
 
+/// Error-gate popup layout: buttons, preview counts, chrome.
+const GATE_BUTTON_COUNT: usize = 3;
+const GATE_PREVIEW_ERRORS: usize = 3;
+const GATE_PARKED_PREVIEW: usize = 2;
+const GATE_BUTTON_GAP: u16 = 2;
+const GATE_POPUP_MARGIN: u16 = 2;
+const GATE_POPUP_PAD: u16 = 3;
+const GATE_BORDER_ROW_HEIGHT: u16 = 1;
+const GATE_SHUTDOWN_PAUSE_SECS: u64 = 2;
+/// Gate commands (shell protocol names).
+const GATE_CMD_CONTINUE: &str = "continue";
+const GATE_CMD_EXIT: &str = "exit";
+/// Notice popup layout.
+const NOTICE_WIDTH: u16 = 48;
+const NOTICE_MARGIN: u16 = 2;
+const NOTICE_PAD: u16 = 2;
+const NOTICE_TAB_LABEL: char = '!';
+/// Widget name for the banner layer, and its line join.
+const BANNER_WIDGET: &str = "shell.status.banner";
+const BANNER_LINE_JOIN: &str = "\r\n";
+const BANNER_SPAN_GAP: &str = "  ";
+
 /// Shared slot the poller publishes into and the layer reads from.
 pub type StatusSlot = Arc<Mutex<Option<StatusSnapshot>>>;
 
@@ -44,7 +66,7 @@ pub fn spawn_status_poller(socket: PathBuf, slot: StatusSlot, log_sink: LogSink)
     let _poller = std::thread::spawn(move || {
         let mut seen_errors: Vec<String> = Vec::new();
         loop {
-            std::thread::sleep(Duration::from_secs(2));
+            std::thread::sleep(Duration::from_secs(GATE_SHUTDOWN_PAUSE_SECS));
             let Some(snap) = query_status(&socket) else {
                 continue;
             };
@@ -69,17 +91,17 @@ pub fn spawn_status_poller(socket: PathBuf, slot: StatusSlot, log_sink: LogSink)
 }
 
 /// Button labels on the error-gate popup's last inner row (order matters).
-const GATE_BUTTONS: [&str; 3] = ["[ RETRY NOW ]", "[ WAIT FOR CONTINUE ]", "[ ABORT VERIFICATION ]"];
+const GATE_BUTTONS: [&str; GATE_BUTTON_COUNT] = ["[ RETRY NOW ]", "[ WAIT FOR CONTINUE ]", "[ ABORT VERIFICATION ]"];
 const GATE_WIDTH: u16 = 60;
 
 /// Run the `continue` protocol (bump the epoch: parked threads retry).
 fn send_retry(socket: &Path) -> bool {
-    send_simple(socket, "continue", continue_protocol)
+    send_simple(socket, GATE_CMD_CONTINUE, continue_protocol)
 }
 
 /// Run the `exit` protocol (shutdown: parked threads abort).
 fn send_abort(socket: &Path) -> bool {
-    send_simple(socket, "exit", exit_protocol)
+    send_simple(socket, GATE_CMD_EXIT, exit_protocol)
 }
 
 fn send_simple(socket: &Path, name: &str, proto: impl Fn() -> servyi_servatui::Protocol) -> bool {
@@ -102,13 +124,13 @@ fn plain_banner_lines(snap: &StatusSnapshot) -> Option<Vec<String>> {
             snap.pending_errors.len(),
             if snap.pending_errors.len() == 1 { "" } else { "s" },
         )];
-        for err in snap.pending_errors.iter().take(3) {
+        for err in snap.pending_errors.iter().take(GATE_PREVIEW_ERRORS) {
             for line in err.lines() {
                 lines.push(line.to_string());
             }
         }
-        if snap.pending_errors.len() > 3 {
-            lines.push(format!(" … and {} more", snap.pending_errors.len() - 3));
+        if snap.pending_errors.len() > GATE_PREVIEW_ERRORS {
+            lines.push(format!(" … and {} more", snap.pending_errors.len() - GATE_PREVIEW_ERRORS));
         }
         Some(lines)
     } else {
@@ -122,14 +144,14 @@ fn in_rect(a: &Rect, col: u16, row: u16) -> bool {
 
 /// Screen rects of the three gate buttons on the popup's last inner row.
 /// Must match what the button row renders.
-fn gate_button_rects(popup: Rect) -> [Rect; 3] {
-    let row = popup.y + popup.height.saturating_sub(2);
+fn gate_button_rects(popup: Rect) -> [Rect; GATE_BUTTON_COUNT] {
+    let row = popup.y + popup.height.saturating_sub(GATE_BUTTON_GAP);
     let mut x = popup.x + 1;
-    let mut rects = [Rect::default(); 3];
+    let mut rects = [Rect::default(); GATE_BUTTON_COUNT];
     for (i, label) in GATE_BUTTONS.iter().enumerate() {
         let w = label.chars().count() as u16;
-        rects[i] = Rect::new(x, row, w, 1);
-        x += w + 2;
+        rects[i] = Rect::new(x, row, w, GATE_BORDER_ROW_HEIGHT);
+        x += w + GATE_BUTTON_GAP;
     }
     rects
 }
@@ -191,7 +213,7 @@ impl StatusLayer {
                 snap.parked.len(),
                 if snap.parked.len() == 1 { "" } else { "s" },
             )];
-            for err in snap.parked.iter().take(2) {
+            for err in snap.parked.iter().take(GATE_PARKED_PREVIEW) {
                 for line in err.lines() {
                     lines.push(line.to_string());
                 }
@@ -206,8 +228,8 @@ impl StatusLayer {
     }
 
     fn gate_banner_area(&self, terminal: Rect, lines: usize) -> Rect {
-        let w = GATE_WIDTH.min(terminal.width.saturating_sub(2));
-        let h = (lines as u16 + 3).min(terminal.height);
+        let w = GATE_WIDTH.min(terminal.width.saturating_sub(GATE_POPUP_MARGIN));
+        let h = (lines as u16 + GATE_POPUP_PAD).min(terminal.height);
         Rect::new(
             terminal.x + terminal.width.saturating_sub(w),
             terminal.y,
@@ -219,7 +241,7 @@ impl StatusLayer {
 
 impl DisplayLayer for StatusLayer {
     fn tab_label(&self) -> char {
-        '!'
+        NOTICE_TAB_LABEL
     }
 
     /// No taskbar button (and nothing clickable) while there is no banner —
@@ -233,8 +255,8 @@ impl DisplayLayer for StatusLayer {
         match self.current_banner() {
             Banner::None => {}
             Banner::Plain(lines) => {
-                let w = 48.min(ctx.terminal_area.width.saturating_sub(2));
-                let h = (lines.len() as u16 + 2).min(ctx.terminal_area.height);
+                let w = NOTICE_WIDTH.min(ctx.terminal_area.width.saturating_sub(NOTICE_MARGIN));
+                let h = (lines.len() as u16 + NOTICE_PAD).min(ctx.terminal_area.height);
                 let area = Rect::new(
                     ctx.terminal_area.x + ctx.terminal_area.width.saturating_sub(w),
                     ctx.terminal_area.y,
@@ -242,9 +264,9 @@ impl DisplayLayer for StatusLayer {
                     h,
                 );
                 widgets.push(WidgetEntry {
-                    name: "shell.status.banner",
+                    name: BANNER_WIDGET,
                     widget: Box::new(
-                        Paragraph::new(lines.join("\r\n"))
+                        Paragraph::new(lines.join(BANNER_LINE_JOIN))
                             .block(Block::default().borders(Borders::ALL)),
                     ),
                     area,
@@ -268,12 +290,12 @@ impl DisplayLayer for StatusLayer {
                                     Style::default()
                                 },
                             );
-                            [span, Span::raw("  ")]
+                            [span, Span::raw(BANNER_SPAN_GAP)]
                         })
                         .collect::<Vec<_>>(),
                 ));
                 widgets.push(WidgetEntry {
-                    name: "shell.status.banner",
+                    name: BANNER_WIDGET,
                     widget: Box::new(
                         Paragraph::new(text).block(Block::default().borders(Borders::ALL)),
                     ),
@@ -321,7 +343,7 @@ impl DisplayLayer for StatusLayer {
                 },
                 Event::Mouse(m) if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) => {
                     let Some((_, popup)) =
-                        ctx.my_widgets.iter().find(|(n, _)| *n == "shell.status.banner")
+                        ctx.my_widgets.iter().find(|(n, _)| *n == BANNER_WIDGET)
                     else {
                         return EventResult::Pass;
                     };
@@ -366,6 +388,37 @@ impl StatusLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test-terminal geometry: width, log/input rows.
+    pub(super) const TERM_WIDTH: u16 = 80;
+    pub(super) const TERM_HEIGHT: u16 = 24;
+    pub(super) const LOG_ROW_Y: u16 = 0;
+    pub(super) const LOG_ROW_H: u16 = 21;
+    pub(super) const INPUT_ROW_Y: u16 = 21;
+    pub(super) const INPUT_ROW_H: u16 = 3;
+    /// Placeholder widget text and the taskbar widget name.
+    pub(super) const WIDGET_FILLER: &str = "x";
+    pub(super) const TASKBAR_WIDGET: &str = "display.taskbar";
+    /// The dead socket the layer must tolerate, and gate-test knobs.
+    pub(super) const DEAD_STATUS_SOCK: &str = "/nonexistent-status-test.sock";
+    pub(super) const GATE_TEST_SOCK: &str = "gate.sock";
+    pub(super) const GATE_WAIT_ROUNDS: u32 = 200;
+    pub(super) const GATE_TEST_POLL_MS: u64 = 10;
+    /// Fixture errors and finished-state messages.
+    pub(super) const ERR_BOOM: &str = "boom";
+    pub(super) const ERR_BANG: &str = "bang";
+    pub(super) const ERR_Z3: &str = "z3 exploded";
+    pub(super) const ERR_AGAIN: &str = "again";
+    pub(super) const ERR_THIRD: &str = "third";
+    pub(super) const FINISH_OK: &str = "ok";
+    /// The parked-gate popup fixture message.
+    pub(super) const PARKED_API_KEY_MSG: &str = "opencode failed (exit 1): Invalid API key.\nFixes: set --api-key";
+    pub(super) const DEAD_STATUS_SOCK_FALLBACK: &str = "/nonexistent";
+    /// Taskbar button counts.
+    pub(super) const ONE_BUTTON: usize = 1;
+    pub(super) const ERRORS_AFTER_RETRY: usize = 1;
+    pub(super) const TWO_BUTTONS: usize = 2;
+
     use servatui_display::Display;
 
     pub(super) fn snap(running: bool, result: Option<&str>, errors: &[&str]) -> StatusSnapshot {
@@ -381,12 +434,12 @@ mod tests {
     pub(super) fn frame() -> Vec<WidgetEntry> {
         let w = |name: &'static str, area: Rect| WidgetEntry {
             name,
-            widget: Box::new(Paragraph::new("x")),
+            widget: Box::new(Paragraph::new(WIDGET_FILLER)),
             area,
         };
         vec![
-            w(servyi_servatui::WIDGET_LOG, Rect::new(0, 0, 80, 21)),
-            w(servyi_servatui::WIDGET_INPUT, Rect::new(0, 21, 80, 3)),
+            w(servyi_servatui::WIDGET_LOG, Rect::new(LOG_ROW_Y, LOG_ROW_Y, TERM_WIDTH, LOG_ROW_H)),
+            w(servyi_servatui::WIDGET_INPUT, Rect::new(LOG_ROW_Y, INPUT_ROW_Y, TERM_WIDTH, INPUT_ROW_H)),
         ]
     }
 
@@ -395,14 +448,14 @@ mod tests {
     }
 
     fn banner_name() -> &'static str {
-        "shell.status.banner"
+        BANNER_WIDGET
     }
 
     #[test]
     fn banner_appears_for_pending_errors_and_work_finished() {
         let slot: StatusSlot = Arc::new(Mutex::new(None));
         let mut display = Display::with_palette(vec![ratatui::style::Color::Blue]);
-        display.add_layer(Box::new(StatusLayer::new("/nonexistent-status-test.sock", slot.clone())));
+        display.add_layer(Box::new(StatusLayer::new(DEAD_STATUS_SOCK, slot.clone())));
 
         // Clean running state: no banner.
         *slot.lock().unwrap() = Some(snap(true, None, &[]));
@@ -411,15 +464,15 @@ mod tests {
         assert!(!f.iter().any(|w| w.name == banner_name()));
 
         // Pending errors: banner in the top-right corner.
-        *slot.lock().unwrap() = Some(snap(true, None, &["boom"]));
+        *slot.lock().unwrap() = Some(snap(true, None, &[ERR_BOOM]));
         let mut f = frame();
         display.frame(&mut f);
         let banner = f.iter().find(|w| w.name == banner_name()).expect("banner shown");
-        assert_eq!(banner.area.x + banner.area.width, 80);
-        assert_eq!(banner.area.y, 0);
+        assert_eq!(banner.area.x + banner.area.width, TERM_WIDTH);
+        assert_eq!(banner.area.y, LOG_ROW_Y);
 
         // Work finished: banner too.
-        *slot.lock().unwrap() = Some(snap(false, Some("ok"), &[]));
+        *slot.lock().unwrap() = Some(snap(false, Some(FINISH_OK), &[]));
         let mut f = frame();
         display.frame(&mut f);
         assert!(f.iter().any(|w| w.name == banner_name()));
@@ -429,9 +482,9 @@ mod tests {
     fn esc_and_click_dismiss_and_new_errors_reopen() {
         use crossterm::event::{KeyCode, KeyModifiers, MouseEvent};
 
-        let slot: StatusSlot = Arc::new(Mutex::new(Some(snap(true, None, &["boom"]))));
+        let slot: StatusSlot = Arc::new(Mutex::new(Some(snap(true, None, &[ERR_BOOM]))));
         let mut display = Display::with_palette(vec![ratatui::style::Color::Blue]);
-        display.add_layer(Box::new(StatusLayer::new("/nonexistent-status-test.sock", slot.clone())));
+        display.add_layer(Box::new(StatusLayer::new(DEAD_STATUS_SOCK, slot.clone())));
 
         let mut f = frame();
         display.frame(&mut f);
@@ -450,7 +503,7 @@ mod tests {
         assert!(!f.iter().any(|w| w.name == banner_name()));
 
         // A changed snapshot re-opens the banner; a click inside dismisses.
-        *slot.lock().unwrap() = Some(snap(true, None, &["boom", "bang"]));
+        *slot.lock().unwrap() = Some(snap(true, None, &[ERR_BOOM, ERR_BANG]));
         let mut f = frame();
         display.frame(&mut f);
         assert!(f.iter().any(|w| w.name == banner_name()), "new errors re-open");
@@ -470,30 +523,30 @@ mod tests {
 
 #[cfg(test)]
 mod taskbar_tests {
-    use super::tests::{frame, snap};
+    use super::tests::{frame, snap, DEAD_STATUS_SOCK, ERR_BANG, ERR_BOOM, ONE_BUTTON, TASKBAR_WIDGET, TWO_BUTTONS};
     use super::*;
     use servatui_display::Display;
 
     fn taskbar_buttons(display: &mut Display<'_>) -> usize {
         let mut f = frame();
         display.frame(&mut f);
-        f.iter().filter(|w| w.name == "display.taskbar").count()
+        f.iter().filter(|w| w.name == TASKBAR_WIDGET).count()
     }
 
     #[test]
     fn status_button_appears_only_while_the_banner_is_shown() {
         let slot: StatusSlot = Arc::new(Mutex::new(None));
         let mut display = Display::with_palette(vec![ratatui::style::Color::Blue]);
-        display.add_layer(Box::new(StatusLayer::new("/nonexistent-status-test.sock", slot.clone())));
+        display.add_layer(Box::new(StatusLayer::new(DEAD_STATUS_SOCK, slot.clone())));
 
         // Idle (running, no errors, no result): no banner, taskbar shows
         // only the builtin button.
         *slot.lock().unwrap() = Some(snap(true, None, &[]));
-        assert_eq!(taskbar_buttons(&mut display), 1);
+        assert_eq!(taskbar_buttons(&mut display), ONE_BUTTON);
 
         // Pending errors: banner and the status button appear.
-        *slot.lock().unwrap() = Some(snap(true, None, &["boom"]));
-        assert_eq!(taskbar_buttons(&mut display), 2);
+        *slot.lock().unwrap() = Some(snap(true, None, &[ERR_BOOM]));
+        assert_eq!(taskbar_buttons(&mut display), TWO_BUTTONS);
 
         // Dismissed: banner gone, button gone again (slot stays reserved).
         let esc = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
@@ -501,17 +554,20 @@ mod taskbar_tests {
             crossterm::event::KeyModifiers::NONE,
         ));
         assert!(display.route_event(&esc));
-        assert_eq!(taskbar_buttons(&mut display), 1);
+        assert_eq!(taskbar_buttons(&mut display), ONE_BUTTON);
 
         // New errors: the button is back at its reserved slot.
-        *slot.lock().unwrap() = Some(snap(true, None, &["boom", "bang"]));
-        assert_eq!(taskbar_buttons(&mut display), 2);
+        *slot.lock().unwrap() = Some(snap(true, None, &[ERR_BOOM, ERR_BANG]));
+        assert_eq!(taskbar_buttons(&mut display), TWO_BUTTONS);
     }
 }
 
 #[cfg(test)]
 mod gate_tests {
-    use super::tests::{frame as builtin_frame, has_banner};
+    use super::tests::{
+        frame as builtin_frame, has_banner, ERRORS_AFTER_RETRY, ERR_AGAIN, ERR_BOOM, ERR_THIRD,
+        ERR_Z3, GATE_TEST_POLL_MS, GATE_TEST_SOCK, GATE_WAIT_ROUNDS,
+    };
     use super::*;
     use crate::protocols::ServerState;
     use servatui_display::Display;
@@ -527,7 +583,7 @@ mod gate_tests {
     #[test]
     fn gate_popup_buttons_retry_wait_and_abort() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("gate.sock");
+        let socket = dir.path().join(GATE_TEST_SOCK);
 
         let state = Arc::new(ServerState::new(Arc::new(crate::message_log::MessageLog::new())));
         let handle = servyi_servatui::ServerHandle {
@@ -536,11 +592,11 @@ mod gate_tests {
         };
         let state2 = state.clone();
         std::thread::spawn(move || handle.run(state2).ok());
-        for _ in 0..200 {
+        for _ in 0..GATE_WAIT_ROUNDS {
             if SocketConnection::server_exists(&socket) {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(GATE_TEST_POLL_MS));
         }
 
         let slot: StatusSlot = Arc::new(Mutex::new(None));
@@ -557,8 +613,8 @@ mod gate_tests {
         };
 
         // Parked: the recovery popup appears.
-        state.push_error("boom".to_string());
-        state.error_gate_parked.lock().unwrap().push("z3 exploded".to_string());
+        state.push_error(ERR_BOOM.to_string());
+        state.error_gate_parked.lock().unwrap().push(ERR_Z3.to_string());
         refresh(&slot);
         let f = frame(&mut display);
         assert!(has_banner(&f).is_some(), "gate popup shown");
@@ -574,21 +630,21 @@ mod gate_tests {
         assert!(!state.shutdown.load(std::sync::atomic::Ordering::Acquire));
 
         // Park again; WAIT (focus 1) does neither.
-        state.push_error("again".to_string());
-        state.error_gate_parked.lock().unwrap().push("z3 exploded".to_string());
+        state.push_error(ERR_AGAIN.to_string());
+        state.error_gate_parked.lock().unwrap().push(ERR_Z3.to_string());
         refresh(&slot);
         assert!(display.route_event(&key(KeyCode::Right))); // focus -> WAIT
         assert!(display.route_event(&enter()));
         assert_eq!(
             state.pending_errors.lock().unwrap().len(),
-            1,
+            ERRORS_AFTER_RETRY,
             "wait must not run 'continue'"
         );
         assert!(!state.shutdown.load(std::sync::atomic::Ordering::Acquire));
 
         // WAIT dismissed the popup; a state change re-opens it (focus is
         // preserved). ABORT (one more Right) runs the exit protocol.
-        state.push_error("third".to_string());
+        state.push_error(ERR_THIRD.to_string());
         refresh(&slot);
         assert!(display.route_event(&key(KeyCode::Right))); // focus -> ABORT
         assert!(display.route_event(&enter()));
@@ -603,7 +659,10 @@ mod gate_tests {
 
 #[cfg(test)]
 mod multiline_tests {
-    use super::tests::{frame, has_banner};
+    use super::tests::{
+        frame, has_banner, DEAD_STATUS_SOCK_FALLBACK, LOG_ROW_Y, PARKED_API_KEY_MSG, TERM_HEIGHT,
+        TERM_WIDTH,
+    };
     use super::*;
     use servatui_display::Display;
 
@@ -617,17 +676,17 @@ mod multiline_tests {
             running: true,
             result: None,
             pending_errors: vec![],
-            parked: vec!["opencode failed (exit 1): Invalid API key.\nFixes: set --api-key".to_string()],
+            parked: vec![PARKED_API_KEY_MSG.to_string()],
         });
         let mut display = Display::with_palette(vec![ratatui::style::Color::Blue]);
-        display.add_layer(Box::new(StatusLayer::new("/nonexistent", slot)));
+        display.add_layer(Box::new(StatusLayer::new(DEAD_STATUS_SOCK_FALLBACK, slot)));
 
         let mut f = frame();
         display.frame(&mut f);
         let _ = has_banner(&f).expect("gate banner shown");
         // Rendering the banner must not produce control glyphs: split lines
         // render as ordinary text.
-        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 24));
+        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(LOG_ROW_Y, LOG_ROW_Y, TERM_WIDTH, TERM_HEIGHT));
         for e in &f {
             e.widget.render_ref(e.area, &mut buf);
         }
@@ -635,6 +694,6 @@ mod multiline_tests {
             .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
             .filter(|&(x, y)| buf[(x, y)].symbol().chars().any(|c| c.is_control()))
             .count();
-        assert_eq!(bad, 0, "banner must not contain control characters");
+        assert_eq!(bad, LOG_ROW_Y as usize, "banner must not contain control characters");
     }
 }

@@ -32,6 +32,9 @@ pub struct ErrorGate {
     parked: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
+/// Poll interval while the gate waits for epoch/shutdown.
+const GATE_POLL_MS: u64 = 200;
+
 impl ErrorGate {
     pub fn new(
         epoch: Arc<AtomicU64>,
@@ -65,7 +68,7 @@ impl ErrorGate {
             if self.epoch.load(Ordering::Acquire) != my_epoch {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(GATE_POLL_MS));
         }
         self.unregister(error);
         eprintln!("[error gate] resuming (continue received)");
@@ -84,12 +87,21 @@ impl ErrorGate {
 mod tests {
     use super::*;
 
+    /// Gate test knobs: parking poll rounds, interval, epoch bump, index.
+    const PARK_ROUNDS: u32 = 200;
+    const PARK_POLL_MS: u64 = 10;
+    const EPOCH_BUMP: u64 = 1;
+    const FIRST_PARKED: usize = 0;
+    /// Gate test fixture errors.
+    const ERR_Z3: &str = "z3 exploded";
+    const ERR_AUTH: &str = "opencode auth failed";
+
     fn eventually(what: impl Fn() -> bool) {
-        for _ in 0..200 {
+        for _ in 0..PARK_ROUNDS {
             if what() {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(PARK_POLL_MS));
         }
         panic!("condition never became true");
     }
@@ -108,14 +120,14 @@ mod tests {
         ));
 
         let g = gate.clone();
-        let handle = std::thread::spawn(move || g.report_and_wait("z3 exploded"));
+        let handle = std::thread::spawn(move || g.report_and_wait(ERR_Z3));
 
         eventually(|| parked.lock().unwrap().len() == 1);
-        assert_eq!(parked.lock().unwrap()[0], "z3 exploded");
+        assert_eq!(&parked.lock().unwrap()[FIRST_PARKED], ERR_Z3);
 
         // 'continue' bumps the epoch -> the parked thread resumes and
         // unregisters itself.
-        epoch.store(1, Ordering::Release);
+        epoch.store(EPOCH_BUMP, Ordering::Release);
         handle.join().unwrap().unwrap();
         assert!(parked.lock().unwrap().is_empty(), "release must clear the parked list");
     }
@@ -134,7 +146,7 @@ mod tests {
         ));
 
         let g = gate.clone();
-        let handle = std::thread::spawn(move || g.report_and_wait("opencode auth failed"));
+        let handle = std::thread::spawn(move || g.report_and_wait(ERR_AUTH));
         eventually(|| parked.lock().unwrap().len() == 1);
 
         shutdown.store(true, Ordering::Release);

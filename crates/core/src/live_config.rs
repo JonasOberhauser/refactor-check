@@ -50,47 +50,61 @@ impl<T> LiveConfig<T> {
 
 #[cfg(test)]
 mod tests {
+    /// Version-counter fixtures.
+    const INITIAL_VERSION: u64 = 0;
+    const FIRST_UPDATE_VERSION: u64 = 1;
+    const SECOND_UPDATE_VERSION: u64 = 2;
+    /// Value fixtures.
+    const SEED_VALUE: u64 = 42;
+    const FIRST_VALUE: u64 = 10;
+    const SECOND_VALUE: u64 = 20;
+    const SHARED_SEED: u64 = 100;
+    const SHARED_UPDATED: u64 = 200;
+    /// String-update fixture pieces.
+    const GREETING: &str = "hello";
+    const GREETING_SUFFIX: &str = " world";
+
     use super::*;
 
     #[test]
     fn test_initial_snapshot() {
-        let lc = LiveConfig::new(42u64);
+        let lc = LiveConfig::new(SEED_VALUE);
         let (version, value) = lc.snapshot();
-        assert_eq!(version, 0);
-        assert_eq!(value, 42);
+        assert_eq!(version, INITIAL_VERSION);
+        assert_eq!(value, SEED_VALUE);
     }
 
     #[test]
     fn test_update_bumps_version() {
         let lc = LiveConfig::new(0u64);
-        let v1 = lc.update(|v| *v = 10);
-        assert_eq!(v1, 1);
+        let v1 = lc.update(|v| *v = FIRST_VALUE);
+        assert_eq!(v1, FIRST_UPDATE_VERSION);
         let (version, value) = lc.snapshot();
-        assert_eq!(version, 1);
-        assert_eq!(value, 10);
+        assert_eq!(version, FIRST_UPDATE_VERSION);
+        assert_eq!(value, FIRST_VALUE);
 
-        let v2 = lc.update(|v| *v = 20);
-        assert_eq!(v2, 2);
+        let v2 = lc.update(|v| *v = SECOND_VALUE);
+        assert_eq!(v2, SECOND_UPDATE_VERSION);
         let (version, value) = lc.snapshot();
-        assert_eq!(version, 2);
-        assert_eq!(value, 20);
+        assert_eq!(version, SECOND_UPDATE_VERSION);
+        assert_eq!(value, SECOND_VALUE);
     }
 
     #[test]
     fn test_version_method() {
-        let lc = LiveConfig::new(String::from("hello"));
-        assert_eq!(lc.version(), 0);
-        lc.update(|v| v.push_str(" world"));
-        assert_eq!(lc.version(), 1);
+        let lc = LiveConfig::new(String::from(GREETING));
+        assert_eq!(lc.version(), INITIAL_VERSION);
+        lc.update(|v| v.push_str(GREETING_SUFFIX));
+        assert_eq!(lc.version(), FIRST_UPDATE_VERSION);
     }
 
     #[test]
     fn test_shared_works_across_clone() {
-        let lc = LiveConfig::shared(100u64);
+        let lc = LiveConfig::shared(SHARED_SEED);
         let clone = Arc::clone(&lc);
-        lc.update(|v| *v = 200);
+        lc.update(|v| *v = SHARED_UPDATED);
         let (version, value) = clone.snapshot();
-        assert_eq!(version, 1);
-        assert_eq!(value, 200);
+        assert_eq!(version, FIRST_UPDATE_VERSION);
+        assert_eq!(value, SHARED_UPDATED);
     }
 }

@@ -7,6 +7,22 @@ use crate::llm;
 use crate::provider::{DynLlmProvider, LlmRequest, LlmRole};
 use crate::states::WaitForSplittingJudge;
 
+/// Line join for judge summaries.
+const JUDGE_SYSTEM_PROMPT: &str = "You are a judge evaluating code decompositions for SMT-based equivalence \
+                 verification. Your job is to verify that the decomposition is sound: \
+                 each piece should be independently verifiable (with any deviations from \
+                 equivalence explicitly captured in a /* relation: ... */ comment), \
+                 not so large that an SMT solver would time out, and each BEFORE must \
+                 have a matching AFTER. Check that /* relation: ... */ comments are \
+                 consistent across adjacent pieces: relations must compose so that the \
+                 conjunction of all piece relations implies overall equivalence. \
+                 Variables/states not mentioned in a relation comment are assumed equivalent. \
+                 \n\nIf the decomposition is good, answer ONLY with the single word REASONABLE. \
+                 \n\nIf the decomposition has problems (pieces too large, missing code, \
+                 mismatched BEFORE/AFTER, overlapping pieces, inconsistent relations), \
+                 explain what is wrong concisely.";
+const LINE_JOIN: &str = "\n";
+
 pub enum SplittingJudgeVerdict {
     Accept,
     Retry(String),
@@ -34,7 +50,7 @@ pub fn execute(
             )
         })
         .collect::<Vec<_>>()
-        .join("\n");
+        .join(LINE_JOIN);
 
     loop {
         attempts += 1;
@@ -75,19 +91,7 @@ pub fn execute(
 
         let messages = vec![
             llm::system_message(
-                "You are a judge evaluating code decompositions for SMT-based equivalence \
-                 verification. Your job is to verify that the decomposition is sound: \
-                 each piece should be independently verifiable (with any deviations from \
-                 equivalence explicitly captured in a /* relation: ... */ comment), \
-                 not so large that an SMT solver would time out, and each BEFORE must \
-                 have a matching AFTER. Check that /* relation: ... */ comments are \
-                 consistent across adjacent pieces: relations must compose so that the \
-                 conjunction of all piece relations implies overall equivalence. \
-                 Variables/states not mentioned in a relation comment are assumed equivalent. \
-                 \n\nIf the decomposition is good, answer ONLY with the single word REASONABLE. \
-                 \n\nIf the decomposition has problems (pieces too large, missing code, \
-                 mismatched BEFORE/AFTER, overlapping pieces, inconsistent relations), \
-                 explain what is wrong concisely.",
+                JUDGE_SYSTEM_PROMPT,
             ),
             llm::user_message(&prompt),
         ];
