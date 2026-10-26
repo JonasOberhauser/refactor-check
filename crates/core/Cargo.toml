@@ -13,7 +13,7 @@ dashmap = "6"
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = "0.3"
 servyi-ioprovider = { git = "https://github.com/servyi/ioprovider.git", branch = "main" }
-servyi-states = { git = "https://github.com/servyi/states.git", branch = "main" }
+servyi-states = { git = "https://github.com/servyi/states.git", branch = "ctx-execute" }
 servyi-servatui = { git = "https://github.com/servyi/servatui.git", branch = "main" }
 servatui-display = { git = "https://github.com/servyi/servatui.git", branch = "main" }
 ratatui = { version = "0.28", features = ["unstable-widget-ref"] }
