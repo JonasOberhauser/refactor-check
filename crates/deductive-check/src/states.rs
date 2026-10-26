@@ -15,6 +15,26 @@ use crate::result::{BugReport, ClosedPiece, UnverifiedPiece, VerificationResult}
 use refactor_check_core::provider::{LlmRequest, LlmRole, SolverRequest};
 use refactor_check_core::smt::SolverOutcome;
 
+const PREFLIGHT_SMT_PROBE: &str = "(check-sat)";
+const PREFLIGHT_PYTHON_SCRIPT: &str = r#"print('(check-sat)')"#;
+const PREFLIGHT_AGENT_PROMPT: &str = "Say OK";
+const TIMESTAMP_FORMAT: &str = "%Y%m%d_%H%M%S";
+const INITIAL_COMMIT_MESSAGE: &str = "Initial commit";
+const VERIFICATION_DIR_NAME: &str = "verification";
+const MAX_SPLIT_ATTEMPTS: usize = 3;
+const MISSING_FUNCTION_MARKER: &str = "// Could not find";
+const NO_CALLED_FUNCTIONS_PLACEHOLDER: &str = "(no called functions found)";
+const CONTEXT_PARTS_SEPARATOR: &str = "\n\n";
+const FIRST_FIXED_FORMULA: usize = 0;
+const SMT_LIB_FILE_EXT: &str = "smt2";
+const PYTHON_FILE_EXT: &str = "py";
+const FORMULA_SUMMARY_SEPARATOR: &str = "\n";
+const NONE_PLACEHOLDER: &str = "None";
+const MODEL_BLOCK_SEPARATOR: &str = "\n\n";
+const AGENT_RESPONSE_PREVIEW_CHARS: usize = 500;
+const AGENT_RETRY_MARKER: &str = "RETRY";
+const RUST_FILE_EXT: &str = ".rs";
+
 struct PieceContext {
     called_functions: String,
     docs_section: String,
@@ -98,7 +118,7 @@ impl AlgorithmState for PreflightSolver {
         info!("preflight: checking z3 solver");
         let root = ContextId::root();
         let resp = providers.solver.invoke(SolverRequest {
-            formula: "(check-sat)".to_string(),
+            formula: PREFLIGHT_SMT_PROBE.to_string(),
             context_id: Box::new(root.new_child()),
         })?;
         info!(ctx = %resp.context_id, "preflight: solver OK");
@@ -113,7 +133,7 @@ impl AlgorithmState for PreflightPython {
     fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking python3");
         let _resp = providers.python.invoke(PythonRequest {
-            script: r#"print("(check-sat)")"#.to_string(),
+            script: PREFLIGHT_PYTHON_SCRIPT.to_string(),
         })?;
         info!("preflight: python3 OK");
         Ok(Step::State(Box::new(PreflightAgent { project_path: self.project_path })))
@@ -127,7 +147,7 @@ impl AlgorithmState for PreflightAgent {
     fn execute(self: Box<Self>, providers: &Providers<'_>, _pm: &dyn crate::piece_manager::DeductivePieceManager) -> Result<Step> {
         info!("preflight: checking opencode agent");
         let resp = providers.agent.invoke(AgentRequest {
-            prompt: "Say OK".to_string(),
+            prompt: PREFLIGHT_AGENT_PROMPT.to_string(),
             working_directory: self.project_path.clone(),
             files_to_read: vec![],
             // Recoverable: a bad key or missing binary parks in the error
@@ -168,7 +188,7 @@ impl AlgorithmState for Initializer {
         providers: &Providers<'_>,
         _pm: &dyn crate::piece_manager::DeductivePieceManager,
     ) -> Result<Step> {
-        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+        let timestamp = chrono::Local::now().format(TIMESTAMP_FORMAT).to_string();
         let branch_name = format!("verification/{timestamp}");
 
         // Ensure the project is inside a git work tree. Ask git itself — a
@@ -193,7 +213,7 @@ impl AlgorithmState for Initializer {
             }
             let resp = providers
                 .git
-                .invoke(GitRequest::Commit { message: "Initial commit".to_string() })?;
+                .invoke(GitRequest::Commit { message: INITIAL_COMMIT_MESSAGE.to_string() })?;
             if !resp.success {
                 anyhow::bail!("Failed to create initial commit: {}", resp.output);
             }
@@ -213,7 +233,7 @@ impl AlgorithmState for Initializer {
             anyhow::bail!("Failed to create verification branch: {}", resp.output);
         }
 
-        let verification_dir = self.project_path.join("verification").join(&timestamp);
+        let verification_dir = self.project_path.join(VERIFICATION_DIR_NAME).join(&timestamp);
         info!("IO: git CreateDirectory");
         let resp = providers
             .git
@@ -472,7 +492,7 @@ fn split_function(
 
     let mut func_ctx = root_ctx.new_child();
 
-    let max_attempts = 3;
+    let max_attempts = MAX_SPLIT_ATTEMPTS;
     for attempt in 0..max_attempts {
         let messages = vec![
             crate::llm::system_message(&prompts::splitter_system()),
@@ -611,7 +631,7 @@ fn gather_context(
             RustAnalyzerResponse::CalledFunctionCode(r) => r,
             _ => continue,
         };
-        if result.code.starts_with("// Could not find") {
+        if result.code.starts_with(MISSING_FUNCTION_MARKER) {
             continue;
         }
         let docs_section = if result.docs.is_empty() {
@@ -623,9 +643,9 @@ fn gather_context(
     }
 
     if context_parts.is_empty() {
-        Ok("(no called functions found)".to_string())
+        Ok(NO_CALLED_FUNCTIONS_PLACEHOLDER.to_string())
     } else {
-        Ok(context_parts.join("\n\n"))
+        Ok(context_parts.join(CONTEXT_PARTS_SEPARATOR))
     }
 }
 
@@ -784,7 +804,7 @@ fn check_and_fix_formula(
             continue;
         }
 
-        let fixed_ef = &fixed_extracted[0];
+        let fixed_ef = &fixed_extracted[FIRST_FIXED_FORMULA];
 
         let translated = match translate_formula(&fixed_ef.content, &fixed_ef.source, &fctx, providers) {
             Ok(smt) => smt,
@@ -981,8 +1001,8 @@ fn process_piece(
             }
 
             let ext = match ef.source {
-                FormulaSource::SmtLib => "smt2",
-                FormulaSource::PyZ3 => "py",
+                FormulaSource::SmtLib => SMT_LIB_FILE_EXT,
+                FormulaSource::PyZ3 => PYTHON_FILE_EXT,
             };
             let filename = format!("ctx{}_iter{}_attempt{}.{}", fctx, iteration, judge_attempt, ext);
             info!(%ctx, "IO: filesystem write formula");
@@ -1016,7 +1036,7 @@ fn process_piece(
 
         pm.advance_piece(&ctx, Some(CodePiecePhase::Check), CodePiecePhase::Judge);
 
-        let formulas_summary = formula_summaries.join("\n");
+        let formulas_summary = formula_summaries.join(FORMULA_SUMMARY_SEPARATOR);
         let (judge_response, ctx2) = judge_piece(piece, ctx, &formulas_summary, &piece_ctx_info, providers)?;
         ctx = ctx2;
         info!(%ctx, judge_attempt, "judge step done");
@@ -1254,14 +1274,14 @@ impl AlgorithmState for ProblemAnalyzer {
             };
 
             let sat = if piece.sat_models.is_empty() {
-                "None".to_string()
+                NONE_PLACEHOLDER.to_string()
             } else {
-                piece.sat_models.iter().map(|m| format!("```\n{}\n```", m)).collect::<Vec<_>>().join("\n\n")
+                piece.sat_models.iter().map(|m| format!("```\n{}\n```", m)).collect::<Vec<_>>().join(MODEL_BLOCK_SEPARATOR)
             };
             let unknown = if piece.unknown_formulas.is_empty() {
-                "None".to_string()
+                NONE_PLACEHOLDER.to_string()
             } else {
-                piece.unknown_formulas.iter().map(|f| format!("```\n{}\n```", f)).collect::<Vec<_>>().join("\n\n")
+                piece.unknown_formulas.iter().map(|f| format!("```\n{}\n```", f)).collect::<Vec<_>>().join(MODEL_BLOCK_SEPARATOR)
             };
 
             let prompt = format!(
@@ -1315,9 +1335,9 @@ If you respond RETRY, make sure to commit your changes first."#,
             info!("IO response: agent responded");
 
             let response = agent_resp.stdout.trim().to_string();
-            info!(response_preview = %response.chars().take(500).collect::<String>(), success = agent_resp.success, "agent response");
+            info!(response_preview = %response.chars().take(AGENT_RESPONSE_PREVIEW_CHARS).collect::<String>(), success = agent_resp.success, "agent response");
 
-            if response.to_uppercase().starts_with("RETRY") {
+            if response.to_uppercase().starts_with(AGENT_RETRY_MARKER) {
                 info!("IO: git AddFiles");
                 let _ = providers
                     .git
@@ -1402,7 +1422,7 @@ impl AlgorithmState for Restarter {
         let changed_files: Vec<PathBuf> = if resp.success {
             resp.output
                 .lines()
-                .filter(|l| l.ends_with(".rs"))
+                .filter(|l| l.ends_with(RUST_FILE_EXT))
                 .map(PathBuf::from)
                 .collect()
         } else {

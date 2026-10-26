@@ -1,3 +1,10 @@
+//! `#![allow(inline_literal)]`: this file's clap attribute literals
+//! (flag names, defaults, env vars in `#[command(...)]`/`#[arg(...)]`)
+//! accept neither named constants nor item-level allows — the sanctioned
+//! necessity escape. Literals outside clap attributes are named consts
+//! or sanctioned message strings.
+#![allow(unknown_lints)]
+#![allow(inline_literal)]
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -15,6 +22,28 @@ use refactor_check_core::llm::LlmConfig;
 use refactor_check_core::message_log::{MessageLog, MessageLogLayer};
 use refactor_check_core::smt::{SolverConfig, Z3Solver};
 use servyi_servatui::App;
+
+const PATH_SEPARATOR: char = '/';
+const HOME_DIR_PREFIX: char = '~';
+const RELATIVE_PATH_PREFIX: char = '.';
+const PATH_ENV_VAR: &str = "PATH";
+const PATH_LIST_SEPARATOR: char = ':';
+const OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
+const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
+const ANTHROPIC_URL_MARKER: &str = "anthropic";
+const OPENAI_URL_MARKER: &str = "openai";
+const ANSI_LOG_SPEC_PREFIX: &str = "ansi:";
+const DEFAULT_LOG_FILTER: &str = "deductive_check=info";
+const DEFAULT_RESULT_FILE: &str = "result.json";
+const VERIFICATION_THREAD_NAME: &str = "verification";
+const RETRY_POLL_INTERVAL_MS: u64 = 200;
+const AGENT_SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
+const AGENT_MODEL_FLAG: &str = "-m";
+const BANNER_WIDTH: usize = 60;
+const EXIT_FAILURE: i32 = 1;
+const SERVER_VERSION: &str = "0.1.0";
+const SHUTDOWN_JOIN_TIMEOUT_SECS: u64 = 2;
 
 #[derive(Parser)]
 #[command(name = "deductive-check", about = "Deductive verification of code correctness")]
@@ -99,7 +128,7 @@ struct Cli {
 }
 
 fn looks_like_path(s: &str) -> bool {
-    s.contains('/') || s.starts_with('~') || s.starts_with('.')
+    s.contains(PATH_SEPARATOR) || s.starts_with(HOME_DIR_PREFIX) || s.starts_with(RELATIVE_PATH_PREFIX)
 }
 
 fn resolve_api_key(key: Option<&str>) -> Result<String> {
@@ -121,7 +150,7 @@ fn resolve_api_key(key: Option<&str>) -> Result<String> {
             }
         }
         Some(s) => Ok(s.to_string()),
-        None => Ok(std::env::var("OPENROUTER_API_KEY").unwrap_or_default()),
+        None => Ok(std::env::var(OPENROUTER_API_KEY_ENV).unwrap_or_default()),
     }
 }
 
@@ -129,21 +158,21 @@ fn resolve_api_key(key: Option<&str>) -> Result<String> {
 /// LLM api base (default: OpenRouter).
 fn api_key_env_var(api_base: &str) -> &'static str {
     let base = api_base.to_ascii_lowercase();
-    if base.contains("anthropic") {
-        "ANTHROPIC_API_KEY"
-    } else if base.contains("openai") {
-        "OPENAI_API_KEY"
+    if base.contains(ANTHROPIC_URL_MARKER) {
+        ANTHROPIC_API_KEY_ENV
+    } else if base.contains(OPENAI_URL_MARKER) {
+        OPENAI_API_KEY_ENV
     } else {
-        "OPENROUTER_API_KEY"
+        OPENROUTER_API_KEY_ENV
     }
 }
 
 fn resolve_binary(name: &str) -> String {
-    if name.contains('/') {
+    if name.contains(PATH_SEPARATOR) {
         return name.to_string();
     }
-    let Ok(path) = std::env::var("PATH") else { return name.to_string(); };
-    for dir in path.split(':') {
+    let Ok(path) = std::env::var(PATH_ENV_VAR) else { return name.to_string(); };
+    for dir in path.split(PATH_LIST_SEPARATOR) {
         if dir.is_empty() {
             continue;
         }
@@ -201,7 +230,7 @@ impl From<&Cli> for AppConfig {
 }
 
 fn parse_log_spec(spec: &str) -> (String, bool) {
-    if let Some(path) = spec.strip_prefix("ansi:") {
+    if let Some(path) = spec.strip_prefix(ANSI_LOG_SPEC_PREFIX) {
         (path.to_string(), true)
     } else {
         (spec.to_string(), false)
@@ -214,7 +243,7 @@ fn main() -> Result<()> {
     let log = Arc::new(MessageLog::new());
 
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("deductive_check=info"));
+        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
 
     if let Some(log_spec) = &cli.log {
         let (path, force_ansi) = parse_log_spec(log_spec);
@@ -244,7 +273,7 @@ fn main() -> Result<()> {
     let agent_subcommand = cli.agent_subcommand.clone();
     let agent_model = cli.agent_model.clone();
     let agent_skip_permissions = cli.agent_skip_permissions;
-    let result_file = cli.result_file.clone().unwrap_or_else(|| "result.json".to_string());
+    let result_file = cli.result_file.clone().unwrap_or_else(|| DEFAULT_RESULT_FILE.to_string());
     let api_key_raw = cli.api_key.clone();
 
     // Server state shared with all protocol handlers
@@ -261,7 +290,7 @@ fn main() -> Result<()> {
     let (err_tx, err_rx) = std::sync::mpsc::channel::<String>();
 
     let bg_handle = std::thread::Builder::new()
-        .name("verification".to_string())
+        .name(VERIFICATION_THREAD_NAME.to_string())
         .spawn(move || {
             // Create error gate for recoverable errors in LLM/SMT/Agent
             let (gate_tx, gate_rx) = std::sync::mpsc::channel();
@@ -304,7 +333,7 @@ fn main() -> Result<()> {
                                 if bg_epoch.load(Ordering::Acquire) != my_epoch {
                                     break;
                                 }
-                                std::thread::sleep(std::time::Duration::from_millis(200));
+                                std::thread::sleep(std::time::Duration::from_millis(RETRY_POLL_INTERVAL_MS));
                             }
                         }
                     }
@@ -329,10 +358,10 @@ fn main() -> Result<()> {
 
                 let mut agent_args = vec![agent_subcommand];
                 if agent_skip_permissions {
-                    agent_args.push("--dangerously-skip-permissions".to_string());
+                    agent_args.push(AGENT_SKIP_PERMISSIONS_FLAG.to_string());
                 }
                 if !agent_model.is_empty() {
-                    agent_args.push("-m".to_string());
+                    agent_args.push(AGENT_MODEL_FLAG.to_string());
                     agent_args.push(agent_model);
                 }
                 let key_env = api_key_env_var(&api_base_for_agent);
@@ -365,13 +394,13 @@ fn main() -> Result<()> {
                     println!("Result saved to {}", result_path.display());
                 }
 
-                println!("\n{}", "=".repeat(60));
+                println!("\n{}", "=".repeat(BANNER_WIDTH));
                 println!("Deductive verification complete");
                 println!("  Total pieces:  {}", result.total_pieces);
                 println!("  Closed:       {}", result.closed_pieces.len());
                 println!("  Unverified:   {}", result.unverified_pieces.len());
                 println!("  Bug reports:  {}", result.bug_reports.len());
-                println!("{}", "=".repeat(60));
+                println!("{}", "=".repeat(BANNER_WIDTH));
 
                 Ok(())
             })();
@@ -385,7 +414,7 @@ fn main() -> Result<()> {
                     let msg = format!("{e:#}");
                     *bg_state.work_result.lock().expect("work result lock: single op") = Some(msg.clone());
                     bg_state.push_error(msg.clone());
-                    println!("\n{}", "=".repeat(60));
+                    println!("\n{}", "=".repeat(BANNER_WIDTH));
                     if e.downcast_ref::<refactor_check_core::error_gate::ShutdownRequested>()
                         .is_some()
                     {
@@ -396,8 +425,8 @@ fn main() -> Result<()> {
                         println!("deductive-check failed:");
                         println!("{msg}");
                     }
-                    println!("{}", "=".repeat(60));
-                    std::process::exit(1);
+                    println!("{}", "=".repeat(BANNER_WIDTH));
+                    std::process::exit(EXIT_FAILURE);
                 }
             }
         })?;
@@ -417,7 +446,7 @@ fn main() -> Result<()> {
     println!("Connect with: deductive-shell {socket_path}");
 
     let app = App::builder(&socket_path)
-        .version("0.1.0")
+        .version(SERVER_VERSION)
         .protocol_all(all_protocols(&socket_path))
         .build();
 
@@ -433,7 +462,7 @@ fn main() -> Result<()> {
     let _awaiter = std::thread::spawn(move || {
         let _ = done_tx.send(bg_handle.join());
     });
-    match done_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+    match done_rx.recv_timeout(std::time::Duration::from_secs(SHUTDOWN_JOIN_TIMEOUT_SECS)) {
         Ok(Ok(())) => {
             if let Some(err) = server_state.work_result.lock().expect("work result lock: single op").take() {
                 println!("[background work error: {err}]");

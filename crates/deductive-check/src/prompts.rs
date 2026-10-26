@@ -1,5 +1,9 @@
-fn splitter_notation_section() -> &'static str {
-    r#"
+const DEFAULT_START_CONDITION: &str = "(the function's precondition)";
+const EMPTY_LIST_PLACEHOLDER: &str = "None";
+const FENCED_BLOCK_SEPARATOR: &str = "\n\n";
+const LINE_SEPARATOR: &str = "\n";
+
+const PROMPT_SPLITTER_NOTATION_SECTION: &str = r#"
 
 ## Splitter Notation Reference
 
@@ -13,11 +17,9 @@ Code pieces from the splitter use special notation to make control flow explicit
 - `/* <loop header> */` before `// Start point:` — indicates which loop this piece starts at
 
 When analyzing code pieces, treat each `if exit`/`else` pair as covering all possible exits from the loop body. The `if exit` block handles normal loop exit and break (via goto). The `else` block represents the back edge where execution returns to the loop header.
-"#
-}
+"#;
 
-fn splitter_rules_and_examples() -> &'static str {
-    r#"
+const PROMPT_SPLITTER_RULES_AND_EXAMPLES: &str = r#"
 
 ## Splitter Rules (for understanding code piece structure)
 
@@ -192,11 +194,9 @@ Piece 3 (for loop body):
             } */
         }
 ```
-"#
-}
+"#;
 
-pub fn formalizer_system() -> String {
-    r#"You are a formal verification expert specializing in Rust code. Your task is to analyze Rust code pieces and produce SMT-LIB2 formulas that verify the code's correctness.
+const PROMPT_FORMALIZER_SYSTEM: &str = r#"You are a formal verification expert specializing in Rust code. Your task is to analyze Rust code pieces and produce SMT-LIB2 formulas that verify the code's correctness.
 
 For each code piece, produce one or more verification formulas that, if UNSAT (unsatisfiable), prove the code is correct.
 
@@ -211,127 +211,17 @@ Rules:
 - Do NOT include panics due to running out of memory (OOM) or allocation failures in the verification. These are environment-dependent and cannot be meaningfully verified.
 - Parameters passed as &T to functions should be assumed not to be modified by the function.
 - If a formula is too complex, you may split it into subproblems with a side-condition.
-- Python/Z3 scripts must output an SMT-LIB2 formula + explanation on stdout, not call the solver directly."#.to_string() + splitter_rules_and_examples() + splitter_notation_section()
-}
+- Python/Z3 scripts must output an SMT-LIB2 formula + explanation on stdout, not call the solver directly."#;
 
-pub fn formalizer_user(code: &str, context: &str, start_condition: Option<&str>, elaboration: &str, docs_section: &str) -> String {
-    let cond = start_condition.unwrap_or("(the function's precondition)");
-    let elab = if elaboration.is_empty() {
-        String::new()
-    } else {
-        format!("\n\nPrevious problems to avoid:\n{}", elaboration)
-    };
-    format!(
-        r#"Analyze the following Rust code piece and produce verification formulas.
-
-Code:
-```
-{}
-```
-
-Context (called functions and their specifications):
-{}
-
-Starting condition: {}
-{}
-{}
-
-Produce SMT-LIB2 formulas in ```smt2 code blocks or Python/Z3 scripts in ```py code blocks. Each formula should be UNSAT if the code is correct."#,
-        code, context, cond, elab, docs_section
-    )
-}
-
-pub fn fixer_system() -> String {
-    r#"You are an SMT formula fixer. Given an SMT-LIB2 formula that caused a solver error, fix the formula so it can be checked by the solver.
+const PROMPT_FIXER_SYSTEM: &str = r#"You are an SMT formula fixer. Given an SMT-LIB2 formula that caused a solver error, fix the formula so it can be checked by the solver.
 
 Rules:
 - Produce the fixed formula in a ```smt2 code block for SMT-LIB2, or ```py code block for Python/Z3.
 - Keep the same verification intent as the original formula.
 - Do NOT include panics due to running out of memory (OOM) or allocation failures in the verification scope.
-- If the formula cannot be fixed, explain why."#.to_string() + splitter_rules_and_examples() + splitter_notation_section()
-}
+- If the formula cannot be fixed, explain why."#;
 
-pub fn fixer_user(formula: &str, error: &str, context: &str, docs_section: &str) -> String {
-    format!(
-        r#"The following SMT formula caused an error when checked:
-
-```
-{}
-```
-
-Error output:
-```
-{}
-```
-
-Context (called functions and their specifications):
-{}
-{}
-Please fix the formula."#,
-        formula, error, context, docs_section
-    )
-}
-
-pub fn judge_system() -> String {
-    format!(
-        r##"You are a verification judge. Given a Rust code piece, its verification formulas, and the solver results, determine if the verification is reasonable.
-
-You must check two things:
-1. The formulas correctly represent the code and its correctness conditions — including that preconditions of unsafe operations are satisfied, and that the code cannot panic or fail runtime assertions. Panics due to running out of memory (OOM) or allocation failures should NOT be considered — these are out of scope.
-2. Any SAT or UNSAT result is due to the actual code behavior, not due to imprecision or over-approximation in the formula. If the formula is too imprecise (e.g., uses uninterpreted functions where concrete semantics are needed, or abstracts away relevant state), it is NOT reasonable even if the solver says UNSAT.
-
-OUTPUT FORMAT (CRITICAL — violating this wastes resources):
-- If the verification IS reasonable, your ENTIRE response must be the single word: {JUDGE_REASONABLE}
-  Do NOT add any explanation, analysis, preamble, or trailing text.
-  Do NOT write any heading before the word.
-  The word {JUDGE_REASONABLE} must be the ONLY text in your response.
-- If the verification is NOT reasonable, write your explanation of the problems.
-  Do NOT include the word {JUDGE_REASONABLE} anywhere in your explanation."##,
-        JUDGE_REASONABLE = refactor_check_core::consts::JUDGE_REASONABLE,
-    ) + splitter_rules_and_examples() + splitter_notation_section()
-}
-
-pub fn judge_user(code: &str, formulas_and_results: &str, context: &str, docs_section: &str) -> String {
-    format!(
-        r#"Determine if the following verification is REASONABLE.
-
-Code:
-```
-{}
-```
-
-Context (called functions and their specifications):
-{}
-{}
-
-Formulas and results:
-{}
-
-Check:
-1. Do the formulas correctly encode the code and its correctness conditions?
-2. Are the SAT/UNSAT results due to the actual code, not formula imprecision?
-
-If both checks pass, your ENTIRE response must be the single word REASONABLE — nothing else, no explanation, no preamble.
-If not reasonable, explain the problems but do NOT use the word REASONABLE anywhere."#,
-        code, context, docs_section, formulas_and_results
-    )
-}
-
-pub fn judge_retry(previous_response: &str) -> String {
-    format!(
-        r#"Your previous response was:
-
-{prev}
-
-Your response contained the word 'REASONABLE' but also other text. Please either:
-- Reply ONLY with the word REASONABLE (nothing else), or
-- Reply with an explanation that does NOT contain the word 'REASONABLE' at all, in case the code is not reasonable."#,
-        prev = previous_response,
-    )
-}
-
-pub fn analyzer_system() -> String {
-    r#"You are a verification problem analyzer. When verification of a code piece fails, you must determine the root cause by analyzing the entire call chain, not just the failing function in isolation.
+const PROMPT_ANALYZER_SYSTEM: &str = r#"You are a verification problem analyzer. When verification of a code piece fails, you must determine the root cause by analyzing the entire call chain, not just the failing function in isolation.
 
 Common patterns where the root cause is elsewhere:
 - Function f fails verification because it cannot satisfy the precondition of its callee g. But that precondition may actually stem from an overly strict precondition in g's callee h (which f does not even call directly). In this case, the fix is to relax the preconditions of h, not to change f or g.
@@ -340,49 +230,9 @@ Common patterns where the root cause is elsewhere:
 
 Always trace the root cause through the full dependency chain before proposing a fix.
 
-Reply RETRY if conditions anywhere in the project need to be adjusted (including functions not directly involved in the failing verification), or describe the bug if one is found."#.to_string() + splitter_rules_and_examples() + splitter_notation_section()
-}
+Reply RETRY if conditions anywhere in the project need to be adjusted (including functions not directly involved in the failing verification), or describe the bug if one is found."#;
 
-pub fn analyzer_user(code: &str, sat_models: &[String], unknown_formulas: &[String], elaboration: &str, docs_section: &str) -> String {
-    let sat = if sat_models.is_empty() {
-        "None".to_string()
-    } else {
-        sat_models.iter().map(|m| format!("```\n{}\n```", m)).collect::<Vec<_>>().join("\n\n")
-    };
-    let unknown = if unknown_formulas.is_empty() {
-        "None".to_string()
-    } else {
-        unknown_formulas.iter().map(|f| format!("```\n{}\n```", f)).collect::<Vec<_>>().join("\n\n")
-    };
-    format!(
-        r#"Analyze the following unverified code piece and trace the root cause through the full call chain:
-
-Code:
-```
-{}
-```
-
-SAT models (counterexamples):
-{}
-
-Unknown formulas:
-{}
-
-Previous elaboration:
-{}
-{}
-
-Do NOT fix only the failing function in isolation. Trace the dependency chain to find where conditions should actually be changed. For example:
-- If f cannot satisfy g's precondition, check whether g's precondition is too strict because of g's callee h.
-- If an assertion fails, check whether the caller should have a precondition that was never documented.
-
-Reply RETRY if conditions anywhere in the project need to be adjusted, or describe the bug."#,
-        code, sat, unknown, elaboration, docs_section
-    )
-}
-
-pub fn splitter_system() -> String {
-    r#"You are a code splitter for formal verification. Given a Rust function with line numbers, split it into code pieces at key lines.
+const PROMPT_SPLITTER_SYSTEM: &str = r#"You are a code splitter for formal verification. Given a Rust function with line numbers, split it into code pieces at key lines.
 
 ## Key Lines
 
@@ -596,7 +446,174 @@ Piece 3 (for loop body):
         }
 ```
 
-Output each piece in a separate ```code block. Do not add any extra explanation."#.to_string()
+Output each piece in a separate ```code block. Do not add any extra explanation."#;
+
+fn splitter_notation_section() -> &'static str {
+    PROMPT_SPLITTER_NOTATION_SECTION
+}
+
+fn splitter_rules_and_examples() -> &'static str {
+    PROMPT_SPLITTER_RULES_AND_EXAMPLES
+}
+
+pub fn formalizer_system() -> String {
+    PROMPT_FORMALIZER_SYSTEM.to_string() + splitter_rules_and_examples() + splitter_notation_section()
+}
+
+pub fn formalizer_user(code: &str, context: &str, start_condition: Option<&str>, elaboration: &str, docs_section: &str) -> String {
+    let cond = start_condition.unwrap_or(DEFAULT_START_CONDITION);
+    let elab = if elaboration.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nPrevious problems to avoid:\n{}", elaboration)
+    };
+    format!(
+        r#"Analyze the following Rust code piece and produce verification formulas.
+
+Code:
+```
+{}
+```
+
+Context (called functions and their specifications):
+{}
+
+Starting condition: {}
+{}
+{}
+
+Produce SMT-LIB2 formulas in ```smt2 code blocks or Python/Z3 scripts in ```py code blocks. Each formula should be UNSAT if the code is correct."#,
+        code, context, cond, elab, docs_section
+    )
+}
+
+pub fn fixer_system() -> String {
+    PROMPT_FIXER_SYSTEM.to_string() + splitter_rules_and_examples() + splitter_notation_section()
+}
+
+pub fn fixer_user(formula: &str, error: &str, context: &str, docs_section: &str) -> String {
+    format!(
+        r#"The following SMT formula caused an error when checked:
+
+```
+{}
+```
+
+Error output:
+```
+{}
+```
+
+Context (called functions and their specifications):
+{}
+{}
+Please fix the formula."#,
+        formula, error, context, docs_section
+    )
+}
+
+pub fn judge_system() -> String {
+    format!(
+        r##"You are a verification judge. Given a Rust code piece, its verification formulas, and the solver results, determine if the verification is reasonable.
+
+You must check two things:
+1. The formulas correctly represent the code and its correctness conditions — including that preconditions of unsafe operations are satisfied, and that the code cannot panic or fail runtime assertions. Panics due to running out of memory (OOM) or allocation failures should NOT be considered — these are out of scope.
+2. Any SAT or UNSAT result is due to the actual code behavior, not due to imprecision or over-approximation in the formula. If the formula is too imprecise (e.g., uses uninterpreted functions where concrete semantics are needed, or abstracts away relevant state), it is NOT reasonable even if the solver says UNSAT.
+
+OUTPUT FORMAT (CRITICAL — violating this wastes resources):
+- If the verification IS reasonable, your ENTIRE response must be the single word: {JUDGE_REASONABLE}
+  Do NOT add any explanation, analysis, preamble, or trailing text.
+  Do NOT write any heading before the word.
+  The word {JUDGE_REASONABLE} must be the ONLY text in your response.
+- If the verification is NOT reasonable, write your explanation of the problems.
+  Do NOT include the word {JUDGE_REASONABLE} anywhere in your explanation."##,
+        JUDGE_REASONABLE = refactor_check_core::consts::JUDGE_REASONABLE,
+    ) + splitter_rules_and_examples() + splitter_notation_section()
+}
+
+pub fn judge_user(code: &str, formulas_and_results: &str, context: &str, docs_section: &str) -> String {
+    format!(
+        r#"Determine if the following verification is REASONABLE.
+
+Code:
+```
+{}
+```
+
+Context (called functions and their specifications):
+{}
+{}
+
+Formulas and results:
+{}
+
+Check:
+1. Do the formulas correctly encode the code and its correctness conditions?
+2. Are the SAT/UNSAT results due to the actual code, not formula imprecision?
+
+If both checks pass, your ENTIRE response must be the single word REASONABLE — nothing else, no explanation, no preamble.
+If not reasonable, explain the problems but do NOT use the word REASONABLE anywhere."#,
+        code, context, docs_section, formulas_and_results
+    )
+}
+
+pub fn judge_retry(previous_response: &str) -> String {
+    format!(
+        r#"Your previous response was:
+
+{prev}
+
+Your response contained the word 'REASONABLE' but also other text. Please either:
+- Reply ONLY with the word REASONABLE (nothing else), or
+- Reply with an explanation that does NOT contain the word 'REASONABLE' at all, in case the code is not reasonable."#,
+        prev = previous_response,
+    )
+}
+
+pub fn analyzer_system() -> String {
+    PROMPT_ANALYZER_SYSTEM.to_string() + splitter_rules_and_examples() + splitter_notation_section()
+}
+
+pub fn analyzer_user(code: &str, sat_models: &[String], unknown_formulas: &[String], elaboration: &str, docs_section: &str) -> String {
+    let sat = if sat_models.is_empty() {
+        EMPTY_LIST_PLACEHOLDER.to_string()
+    } else {
+        sat_models.iter().map(|m| format!("```\n{}\n```", m)).collect::<Vec<_>>().join(FENCED_BLOCK_SEPARATOR)
+    };
+    let unknown = if unknown_formulas.is_empty() {
+        EMPTY_LIST_PLACEHOLDER.to_string()
+    } else {
+        unknown_formulas.iter().map(|f| format!("```\n{}\n```", f)).collect::<Vec<_>>().join(FENCED_BLOCK_SEPARATOR)
+    };
+    format!(
+        r#"Analyze the following unverified code piece and trace the root cause through the full call chain:
+
+Code:
+```
+{}
+```
+
+SAT models (counterexamples):
+{}
+
+Unknown formulas:
+{}
+
+Previous elaboration:
+{}
+{}
+
+Do NOT fix only the failing function in isolation. Trace the dependency chain to find where conditions should actually be changed. For example:
+- If f cannot satisfy g's precondition, check whether g's precondition is too strict because of g's callee h.
+- If an assertion fails, check whether the caller should have a precondition that was never documented.
+
+Reply RETRY if conditions anywhere in the project need to be adjusted, or describe the bug."#,
+        code, sat, unknown, elaboration, docs_section
+    )
+}
+
+pub fn splitter_system() -> String {
+    PROMPT_SPLITTER_SYSTEM.to_string()
 }
 
 pub fn splitter_user(file: &str, function_name: &str, code: &str, start_line: u32) -> String {
@@ -605,7 +622,7 @@ pub fn splitter_user(file: &str, function_name: &str, code: &str, start_line: u3
         .enumerate()
         .map(|(i, line)| format!("{:>4}: {}", start_line + i as u32, line))
         .collect::<Vec<_>>()
-        .join("\n");
+        .join(LINE_SEPARATOR);
 
     format!(
         r#"Split the following Rust function into code pieces at key lines.

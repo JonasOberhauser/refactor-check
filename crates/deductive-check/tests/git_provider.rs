@@ -5,8 +5,26 @@
 use deductive_check::provider::{CliGitProvider, GitRequest, GitResponse};
 use servyi_ioprovider::IOProvider;
 
+/// Git binary and the inspection subcommands used below.
+const GIT_BIN: &str = "git";
+const INIT_ARGS: &[&str] = &["init"];
+const STAGED_FILES_ARGS: &[&str] = &["diff", "--cached", "--name-only"];
+/// Files created for the AddAll flow and their contents.
+const MAIN_RS_PATH: &str = "src/main.rs";
+const MAIN_RS_CONTENT: &str = "fn main() {}";
+const NESTED_SRC_DIR: &str = "src/nested";
+const NESTED_LIB_RS_PATH: &str = "src/nested/lib.rs";
+const LIB_RS_CONTENT: &str = "pub fn f() {}";
+const NON_RUST_FILE: &str = "notes.md";
+const NON_RUST_CONTENT: &str = "hi";
+/// Files AddAll is expected to stage.
+const EXPECTED_STAGED_COUNT: usize = 2;
+/// Subcrate path inside an existing work tree.
+const CRATES_DIR: &str = "crates";
+const SUBCRATE_NAME: &str = "subcrate";
+
 fn git(dir: &std::path::Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
+    let out = std::process::Command::new(GIT_BIN)
         .args(args)
         .current_dir(dir)
         .output()
@@ -24,10 +42,10 @@ fn add_all_tolerates_unmatched_globs() {
     // literal `git add '*.rs' '*.toml' '*.lock'` died on the unmatched
     // pathspec ('fatal: pathspec '*.lock' did not match any files').
     let dir = tempfile::tempdir().unwrap();
-    git(dir.path(), &["init"]);
-    std::fs::create_dir_all(dir.path().join("src/nested")).unwrap();
-    std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
-    std::fs::write(dir.path().join("src/nested/lib.rs"), "pub fn f() {}").unwrap();
+    git(dir.path(), INIT_ARGS);
+    std::fs::create_dir_all(dir.path().join(NESTED_SRC_DIR)).unwrap();
+    std::fs::write(dir.path().join(MAIN_RS_PATH), MAIN_RS_CONTENT).unwrap();
+    std::fs::write(dir.path().join(NESTED_LIB_RS_PATH), LIB_RS_CONTENT).unwrap();
 
     let provider = CliGitProvider::new(dir.path().to_path_buf());
     let resp: GitResponse = provider
@@ -37,17 +55,17 @@ fn add_all_tolerates_unmatched_globs() {
     assert!(resp.success, "AddAll must not fail on unmatched globs: {}", resp.output);
 
     // Everything matching was staged — at any depth.
-    let staged = git(dir.path(), &["diff", "--cached", "--name-only"]);
-    assert!(staged.contains("src/main.rs"), "staged: {staged}");
-    assert!(staged.contains("src/nested/lib.rs"), "staged: {staged}");
-    assert_eq!(staged.lines().count(), 2, "only matching files: {staged}");
+    let staged = git(dir.path(), STAGED_FILES_ARGS);
+    assert!(staged.contains(MAIN_RS_PATH), "staged: {staged}");
+    assert!(staged.contains(NESTED_LIB_RS_PATH), "staged: {staged}");
+    assert_eq!(staged.lines().count(), EXPECTED_STAGED_COUNT, "only matching files: {staged}");
 }
 
 #[test]
 fn add_all_with_no_matches_is_a_noop_success() {
     let dir = tempfile::tempdir().unwrap();
-    git(dir.path(), &["init"]);
-    std::fs::write(dir.path().join("notes.md"), "hi").unwrap();
+    git(dir.path(), INIT_ARGS);
+    std::fs::write(dir.path().join(NON_RUST_FILE), NON_RUST_CONTENT).unwrap();
 
     let provider = CliGitProvider::new(dir.path().to_path_buf());
     let resp: GitResponse = provider
@@ -63,8 +81,8 @@ fn repo_root_detects_enclosing_worktree_from_subdirectory() {
     // inside the work tree — the Initializer must not `git init` a new
     // nested repo there.
     let dir = tempfile::tempdir().unwrap();
-    git(dir.path(), &["init"]);
-    let sub = dir.path().join("crates").join("subcrate");
+    git(dir.path(), INIT_ARGS);
+    let sub = dir.path().join(CRATES_DIR).join(SUBCRATE_NAME);
     std::fs::create_dir_all(&sub).unwrap();
 
     let provider = CliGitProvider::new(sub.clone());

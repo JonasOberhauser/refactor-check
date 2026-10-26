@@ -3,8 +3,27 @@ use deductive_check::core_provider::IOProvider;
 use deductive_check::provider::{CliRustAnalyzerProvider, RustAnalyzerRequest, RustAnalyzerResponse};
 use std::path::PathBuf;
 
+/// Root of the duv_demo fixture project and its layout.
+const DUV_DEMO_ROOT: &str = "/workspace/duv_demo";
+const MANIFEST_FILE: &str = "Cargo.toml";
+const SRC_DIR: &str = "src";
+/// Fixture source files.
+const COUNTER_RS_FILE: &str = "counter.rs";
+const RUNNER_RS_FILE: &str = "runner.rs";
+/// Functions expected in the fixture.
+const INC_FN_NAME: &str = "inc";
+const VALUE_INC_FN_NAME: &str = "Value::inc";
+const NEW_FN_NAME: &str = "new";
+const NESTED_LOOPS_2_FN_NAME: &str = "nested_loops_2";
+const NESTED_LOOPS_4_FN_NAME: &str = "nested_loops_4";
+const NESTED_LOOPS_5_FN_NAME: &str = "nested_loops_5";
+/// Prefix of rust-analyzer's missing-code marker comment.
+const RA_NOT_FOUND_PREFIX: &str = "// Could not find";
+/// Prefix of #[test] function names, which must be excluded.
+const TEST_FN_PREFIX: &str = "test_";
+
 fn duv_demo_path() -> PathBuf {
-    PathBuf::from("/workspace/duv_demo")
+    PathBuf::from(DUV_DEMO_ROOT)
 }
 
 /// The tests need the duv_demo fixture project, which lives on the
@@ -12,7 +31,7 @@ fn duv_demo_path() -> PathBuf {
 /// failing (the fuse_e2e pattern: skip yourself when the environment
 /// is not there).
 fn duv_demo_available() -> bool {
-    duv_demo_path().join("Cargo.toml").exists()
+    duv_demo_path().join(MANIFEST_FILE).exists()
 }
 
 macro_rules! require_duv_demo {
@@ -25,7 +44,7 @@ macro_rules! require_duv_demo {
 }
 
 fn duv_demo_src_path(file: &str) -> PathBuf {
-    duv_demo_path().join("src").join(file)
+    duv_demo_path().join(SRC_DIR).join(file)
 }
 
 fn create_provider() -> CliRustAnalyzerProvider {
@@ -53,16 +72,16 @@ fn list_functions(provider: &CliRustAnalyzerProvider, file: &str) -> Vec<deducti
 fn test_duv_demo_lists_invariant_impl_methods() {
     require_duv_demo!();
     let provider = create_provider();
-    let functions = list_functions(&provider, "counter.rs");
+    let functions = list_functions(&provider, COUNTER_RS_FILE);
 
-    let inc = functions.iter().find(|f| f.id.name == "inc");
+    let inc = functions.iter().find(|f| f.id.name == INC_FN_NAME);
     assert!(inc.is_some(), "inc() should be listed, got: {:?}", functions.iter().map(|f| &f.id.name).collect::<Vec<_>>());
 
     let inc_fn = inc.unwrap();
     assert!(inc_fn.has_guarantees, "inc() in #[invariant] impl should have guarantees");
     assert!(inc_fn.id.impl_for.is_some(), "inc() should have impl_for");
 
-    let new_fn = functions.iter().find(|f| f.id.name == "new");
+    let new_fn = functions.iter().find(|f| f.id.name == NEW_FN_NAME);
     assert!(new_fn.is_some(), "new() should be listed");
     assert!(new_fn.unwrap().has_guarantees, "new() in #[invariant] impl should have guarantees");
 }
@@ -71,9 +90,9 @@ fn test_duv_demo_lists_invariant_impl_methods() {
 fn test_duv_demo_nested_loops_calls_precondition_fn() {
     require_duv_demo!();
     let provider = create_provider();
-    let functions = list_functions(&provider, "counter.rs");
+    let functions = list_functions(&provider, COUNTER_RS_FILE);
 
-    let nested = functions.iter().find(|f| f.id.name == "nested_loops_5");
+    let nested = functions.iter().find(|f| f.id.name == NESTED_LOOPS_5_FN_NAME);
     assert!(nested.is_some(), "nested_loops_5 should be listed");
 
     let nested_fn = nested.unwrap();
@@ -84,14 +103,14 @@ fn test_duv_demo_nested_loops_calls_precondition_fn() {
 fn test_duv_demo_runner_functions() {
     require_duv_demo!();
     let provider = create_provider();
-    let functions = list_functions(&provider, "runner.rs");
+    let functions = list_functions(&provider, RUNNER_RS_FILE);
 
     let names: Vec<String> = functions.iter().map(|f| f.id.name.clone()).collect();
     assert!(names.contains(&"nested_loops_4".to_string()), "nested_loops_4 should be listed, got: {:?}", names);
     assert!(names.contains(&"nested_loops_2".to_string()), "nested_loops_2 should be listed, got: {:?}", names);
 
     for f in &functions {
-        if f.id.name == "nested_loops_4" || f.id.name == "nested_loops_2" {
+        if f.id.name == NESTED_LOOPS_4_FN_NAME || f.id.name == NESTED_LOOPS_2_FN_NAME {
             assert!(f.has_guarantees, "{} should have guarantees (calls inc with preconditions)", f.id.name);
         }
     }
@@ -101,9 +120,9 @@ fn test_duv_demo_runner_functions() {
 fn test_duv_demo_get_function_code() {
     require_duv_demo!();
     let provider = create_provider();
-    let functions = list_functions(&provider, "counter.rs");
+    let functions = list_functions(&provider, COUNTER_RS_FILE);
 
-    let inc = functions.iter().find(|f| f.id.name == "inc").expect("inc not found");
+    let inc = functions.iter().find(|f| f.id.name == INC_FN_NAME).expect("inc not found");
 
     let resp = provider
         .invoke(RustAnalyzerRequest::GetFunctionCode {
@@ -124,9 +143,9 @@ fn test_duv_demo_get_function_code() {
 fn test_duv_demo_called_functions() {
     require_duv_demo!();
     let provider = create_provider();
-    let functions = list_functions(&provider, "counter.rs");
+    let functions = list_functions(&provider, COUNTER_RS_FILE);
 
-    let nested = functions.iter().find(|f| f.id.name == "nested_loops_5").expect("nested_loops_5 not found");
+    let nested = functions.iter().find(|f| f.id.name == NESTED_LOOPS_5_FN_NAME).expect("nested_loops_5 not found");
 
     let resp = provider
         .invoke(RustAnalyzerRequest::GetCalledFunctions {
@@ -152,9 +171,9 @@ fn test_duv_demo_called_functions() {
 fn test_duv_demo_called_function_code() {
     require_duv_demo!();
     let provider = create_provider();
-    let functions = list_functions(&provider, "counter.rs");
+    let functions = list_functions(&provider, COUNTER_RS_FILE);
 
-    let nested = functions.iter().find(|f| f.id.name == "nested_loops_5").expect("nested_loops_5 not found");
+    let nested = functions.iter().find(|f| f.id.name == NESTED_LOOPS_5_FN_NAME).expect("nested_loops_5 not found");
 
     let resp = provider
         .invoke(RustAnalyzerRequest::GetCalledFunctions {
@@ -168,7 +187,7 @@ fn test_duv_demo_called_function_code() {
         _ => panic!("Expected CalledFunctionList"),
     };
 
-    let inc_call = called.iter().find(|c| c.name == "inc" || c.name == "Value::inc");
+    let inc_call = called.iter().find(|c| c.name == INC_FN_NAME || c.name == VALUE_INC_FN_NAME);
     if let Some(inc_called) = inc_call {
         let resp = provider
             .invoke(RustAnalyzerRequest::GetCalledFunctionCode {
@@ -183,7 +202,7 @@ fn test_duv_demo_called_function_code() {
         };
 
         assert!(
-            !result.code.starts_with("// Could not find"),
+            !result.code.starts_with(RA_NOT_FOUND_PREFIX),
             "inc() code should be found, got: {}",
             result.code
         );
@@ -199,9 +218,9 @@ fn test_duv_demo_called_function_code() {
 fn test_duv_demo_function_docs_api() {
     require_duv_demo!();
     let provider = create_provider();
-    let functions = list_functions(&provider, "counter.rs");
+    let functions = list_functions(&provider, COUNTER_RS_FILE);
 
-    let inc = functions.iter().find(|f| f.id.name == "inc").expect("inc not found");
+    let inc = functions.iter().find(|f| f.id.name == INC_FN_NAME).expect("inc not found");
 
     let resp = provider
         .invoke(RustAnalyzerRequest::GetFunctionDocs {
@@ -220,11 +239,11 @@ fn test_duv_demo_function_docs_api() {
 fn test_duv_demo_no_test_functions() {
     require_duv_demo!();
     let provider = create_provider();
-    let functions = list_functions(&provider, "counter.rs");
+    let functions = list_functions(&provider, COUNTER_RS_FILE);
 
     for f in &functions {
         assert!(
-            !f.id.name.starts_with("test_"),
+            !f.id.name.starts_with(TEST_FN_PREFIX),
             "Test functions should be excluded, found: {}",
             f.id.name
         );
@@ -235,7 +254,7 @@ fn test_duv_demo_no_test_functions() {
 fn test_duv_demo_impl_for_set_for_methods() {
     require_duv_demo!();
     let provider = create_provider();
-    let functions = list_functions(&provider, "counter.rs");
+    let functions = list_functions(&provider, COUNTER_RS_FILE);
 
     let impl_methods: Vec<_> = functions.iter().filter(|f| f.id.impl_for.is_some()).collect();
     assert!(!impl_methods.is_empty(), "Should find impl methods (inc, new) with impl_for");

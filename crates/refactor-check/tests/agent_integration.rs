@@ -8,32 +8,40 @@ use refactor_check::smt::{SolverOutcome, SolverResult};
 use refactor_check_test_helpers::sequence::{FakeSolver, SequenceLlm};
 use refactor_check_test_helpers::test_pm;
 
-fn smt_formula_single() -> String {
-    "\
+/// Description passed to every machine run.
+const RUN_DESCRIPTION: &str = "refactoring desc";
+/// Label of the single piece produced by a no-split response.
+const LABEL_WHOLE: &str = "whole";
+/// Fake solver stdout values.
+const STDOUT_UNKNOWN: &str = "unknown";
+const STDOUT_UNSAT: &str = "unsat";
+/// Generator response that contains no formula (insist trigger).
+const NO_FORMULA: &str = "no formula here";
+/// Judge feedback that forces a fixer round.
+const JUDGE_FEEDBACK_INVARIANT: &str = "formula does not capture the loop invariant";
+/// Expected piece counts.
+const ONE_FORMULA: usize = 1;
+const TWO_FORMULAS: usize = 2;
+const FOUR_FORMULAS: usize = 4;
+/// First solver call in the timeout test.
+const FIRST_CALL: usize = 1;
+const NO_CALLS: usize = 0;
+/// Index of the first formula in the results.
+const FIRST_FORMULA: usize = 0;
+/// Fixtures below are shared by name via consts so every response is a named choice.
+const SMT_FORMULA_QF_LIA: &str = "
 (set-logic QF_LIA)
 (declare-fun x () Int)
 (declare-fun y () Int)
 (assert (= x y))
-(check-sat)"
-        .to_string()
-}
-
-fn formula_response_single() -> String {
-    format!("Here is the formula:\n\n```smt2\n{}\n```", smt_formula_single())
-}
-
-fn split_no_split() -> String {
-    "\
+(check-sat)";
+const SPLIT_NO_SPLIT_WHOLE: &str = "
 Piece: whole
 ---- BEFORE ----
 fn main() { x + 1 }
 ---- AFTER ----
-fn main() { x + 1 }"
-        .to_string()
-}
-
-fn split_two_pieces() -> String {
-    "\
+fn main() { x + 1 }";
+const SPLIT_TWO_PRELUDE_BODY: &str = "
 Piece: prelude
 ---- BEFORE ----
 let x = 1;
@@ -44,12 +52,8 @@ Piece: body
 ---- BEFORE ----
 x + 1
 ---- AFTER ----
-x + 1"
-        .to_string()
-}
-
-fn split_four_pieces() -> String {
-    "\
+x + 1";
+const SPLIT_FOUR_ABCD: &str = "
 Piece: a
 ---- BEFORE ----
 fn a() { 1 }
@@ -72,8 +76,37 @@ Piece: d
 ---- BEFORE ----
 fn d() { 4 }
 ---- AFTER ----
-fn d() { 4 }"
-        .to_string()
+fn d() { 4 }";
+
+fn smt_formula_single() -> String {
+    SMT_FORMULA_QF_LIA.to_string()
+}
+
+fn formula_response_single() -> String {
+    format!("Here is the formula:\n\n```smt2\n{}\n```", smt_formula_single())
+}
+
+const FORMULA_RESPONSE_PIECE_1: &str = "Piece 1:\n```smt2\n(set-logic QF_LIA)\n(declare-fun x () Int)\n(declare-fun y () Int)\n(assert (= x y))\n(check-sat)\n```";
+const FORMULA_RESPONSE_PIECE_2: &str = "Piece 2:\n```smt2\n(set-logic QF_LIA)\n(declare-fun a () Int)\n(declare-fun b () Int)\n(assert (= a b))\n(check-sat)\n```";
+const FORMULA_RESPONSE_PIECE_3: &str = "Piece 3:\n```smt2\n(set-logic QF_LIA)\n(declare-fun c () Int)\n(declare-fun d () Int)\n(assert (= c d))\n(check-sat)\n```";
+const FORMULA_RESPONSE_PIECE_4: &str = "Piece 4:\n```smt2\n(set-logic QF_LIA)\n(declare-fun e () Int)\n(declare-fun f () Int)\n(assert (= e f))\n(check-sat)\n```";
+const SPLIT_BIG_TIMEOUT: &str = "
+Piece: big
+---- BEFORE ----
+large code
+---- AFTER ----
+large code";
+
+fn split_no_split() -> String {
+    SPLIT_NO_SPLIT_WHOLE.to_string()
+}
+
+fn split_two_pieces() -> String {
+    SPLIT_TWO_PRELUDE_BODY.to_string()
+}
+
+fn split_four_pieces() -> String {
+    SPLIT_FOUR_ABCD.to_string()
 }
 
 /// No-split: splitter says one piece, happy path.
@@ -90,13 +123,13 @@ fn test_split_no_split_happy_path() {
     };
 
     let pm = test_pm();
-    let result = machine::run("refactoring desc", &llm, &solver, &pm)
+    let result = machine::run(RUN_DESCRIPTION, &llm, &solver, &pm)
         
         .expect("agent should succeed");
 
-    assert_eq!(result.formulas.len(), 1);
-    assert_eq!(result.formulas[0].piece_label, "whole");
-    assert_eq!(result.reasonable_unsat, 1);
+    assert_eq!(result.formulas.len(), ONE_FORMULA);
+    assert_eq!(result.formulas[FIRST_FORMULA].piece_label, LABEL_WHOLE);
+    assert_eq!(result.reasonable_unsat, ONE_FORMULA);
     assert!(result.overall_equivalent);
 }
 
@@ -117,12 +150,12 @@ fn test_split_two_pieces() {
     };
 
     let pm = test_pm();
-    let result = machine::run("refactoring desc", &llm, &solver, &pm)
+    let result = machine::run(RUN_DESCRIPTION, &llm, &solver, &pm)
         
         .expect("agent should succeed");
 
-    assert_eq!(result.formulas.len(), 2);
-    assert_eq!(result.reasonable_unsat, 2);
+    assert_eq!(result.formulas.len(), TWO_FORMULAS);
+    assert_eq!(result.reasonable_unsat, TWO_FORMULAS);
     assert!(result.overall_equivalent);
 }
 
@@ -131,18 +164,10 @@ fn test_split_two_pieces() {
 fn test_split_four_pieces() {
     let llm = SequenceLlm::with_accepting_judge(
         vec![
-            "\
-Piece 1:\n```smt2\n(set-logic QF_LIA)\n(declare-fun x () Int)\n(declare-fun y () Int)\n(assert (= x y))\n(check-sat)\n```"
-                .to_string(),
-            "\
-Piece 2:\n```smt2\n(set-logic QF_LIA)\n(declare-fun a () Int)\n(declare-fun b () Int)\n(assert (= a b))\n(check-sat)\n```"
-                .to_string(),
-            "\
-Piece 3:\n```smt2\n(set-logic QF_LIA)\n(declare-fun c () Int)\n(declare-fun d () Int)\n(assert (= c d))\n(check-sat)\n```"
-                .to_string(),
-            "\
-Piece 4:\n```smt2\n(set-logic QF_LIA)\n(declare-fun e () Int)\n(declare-fun f () Int)\n(assert (= e f))\n(check-sat)\n```"
-                .to_string(),
+            FORMULA_RESPONSE_PIECE_1.to_string(),
+            FORMULA_RESPONSE_PIECE_2.to_string(),
+            FORMULA_RESPONSE_PIECE_3.to_string(),
+            FORMULA_RESPONSE_PIECE_4.to_string(),
         ],
         vec![],
         vec![
@@ -158,12 +183,12 @@ Piece 4:\n```smt2\n(set-logic QF_LIA)\n(declare-fun e () Int)\n(declare-fun f ()
     };
 
     let pm = test_pm();
-    let result = machine::run("refactoring desc", &llm, &solver, &pm)
+    let result = machine::run(RUN_DESCRIPTION, &llm, &solver, &pm)
         
         .expect("agent should succeed");
 
-    assert_eq!(result.formulas.len(), 4);
-    assert_eq!(result.reasonable_unsat, 4);
+    assert_eq!(result.formulas.len(), FOUR_FORMULAS);
+    assert_eq!(result.reasonable_unsat, FOUR_FORMULAS);
     assert!(result.overall_equivalent);
 }
 
@@ -178,16 +203,16 @@ fn test_split_timeout_resplit() {
             let SolverRequest { context_id, .. } = input;
             let mut count = self.call_count.lock().expect("lock poisoned");
             *count += 1;
-            let value = if *count == 1 {
+            let value = if *count == FIRST_CALL {
                 SolverResult {
                     outcome: SolverOutcome::Unknown,
-                    stdout: "unknown".to_string(),
+                    stdout: STDOUT_UNKNOWN.to_string(),
                     stderr: String::new(),
                 }
             } else {
                 SolverResult {
                     outcome: SolverOutcome::Unsat,
-                    stdout: "unsat".to_string(),
+                    stdout: STDOUT_UNSAT.to_string(),
                     stderr: String::new(),
                 }
             };
@@ -207,27 +232,21 @@ fn test_split_timeout_resplit() {
             JUDGE_REASONABLE.to_string(),
         ],
         vec![
-            "\
-Piece: big
----- BEFORE ----
-large code
----- AFTER ----
-large code"
-                .to_string(),
+            SPLIT_BIG_TIMEOUT.to_string(),
             split_two_pieces(),
         ],
     );
     let solver = ToggleSolver {
-        call_count: Arc::new(Mutex::new(0)),
+        call_count: Arc::new(Mutex::new(NO_CALLS)),
     };
 
     let pm = test_pm();
-    let result = machine::run("refactoring desc", &llm, &solver, &pm)
+    let result = machine::run(RUN_DESCRIPTION, &llm, &solver, &pm)
         
         .expect("agent should succeed");
 
-    assert_eq!(result.formulas.len(), 2);
-    assert_eq!(result.reasonable_unsat, 2);
+    assert_eq!(result.formulas.len(), TWO_FORMULAS);
+    assert_eq!(result.reasonable_unsat, TWO_FORMULAS);
     assert!(result.overall_equivalent);
 }
 
@@ -245,12 +264,12 @@ fn test_split_sat_result() {
     };
 
     let pm = test_pm();
-    let result = machine::run("refactoring desc", &llm, &solver, &pm)
+    let result = machine::run(RUN_DESCRIPTION, &llm, &solver, &pm)
         
         .expect("agent should succeed");
 
-    assert_eq!(result.formulas.len(), 1);
-    assert_eq!(result.reasonable_sat, 1);
+    assert_eq!(result.formulas.len(), ONE_FORMULA);
+    assert_eq!(result.reasonable_sat, ONE_FORMULA);
     assert!(!result.overall_equivalent);
 }
 
@@ -258,7 +277,7 @@ fn test_split_sat_result() {
 #[test_log::test]
 fn test_split_generator_insist_then_ok() {
     let llm = SequenceLlm::with_accepting_judge(
-        vec!["no formula here".to_string(), formula_response_single()],
+        vec![NO_FORMULA.to_string(), formula_response_single()],
         vec![],
         vec![JUDGE_REASONABLE.to_string()],
         vec![split_no_split()],
@@ -268,11 +287,11 @@ fn test_split_generator_insist_then_ok() {
     };
 
     let pm = test_pm();
-    let result = machine::run("refactoring desc", &llm, &solver, &pm)
+    let result = machine::run(RUN_DESCRIPTION, &llm, &solver, &pm)
         
         .expect("agent should succeed");
 
-    assert_eq!(result.formulas.len(), 1);
+    assert_eq!(result.formulas.len(), ONE_FORMULA);
     assert!(result.overall_equivalent);
 }
 
@@ -290,11 +309,11 @@ fn test_split_one_piece_unsat() {
     };
 
     let pm = test_pm();
-    let result = machine::run("refactoring desc", &llm, &solver, &pm)
+    let result = machine::run(RUN_DESCRIPTION, &llm, &solver, &pm)
         
         .expect("agent should succeed");
 
-    assert_eq!(result.formulas.len(), 1);
+    assert_eq!(result.formulas.len(), ONE_FORMULA);
     assert!(result.overall_equivalent);
 }
 
@@ -305,7 +324,7 @@ fn test_split_one_piece_judge_retry_then_verified() {
         vec![formula_response_single(), formula_response_single()],
         vec![formula_response_single()],
         vec![
-            "formula does not capture the loop invariant".to_string(),
+            JUDGE_FEEDBACK_INVARIANT.to_string(),
             JUDGE_REASONABLE.to_string(),
             JUDGE_REASONABLE.to_string(),
         ],
@@ -316,12 +335,12 @@ fn test_split_one_piece_judge_retry_then_verified() {
     };
 
     let pm = test_pm();
-    let result = machine::run("refactoring desc", &llm, &solver, &pm)
+    let result = machine::run(RUN_DESCRIPTION, &llm, &solver, &pm)
         
         .expect("agent should succeed");
 
-    assert_eq!(result.formulas.len(), 2);
-    assert_eq!(result.reasonable_unsat, 2);
+    assert_eq!(result.formulas.len(), TWO_FORMULAS);
+    assert_eq!(result.reasonable_unsat, TWO_FORMULAS);
     assert!(result.overall_equivalent);
 }
 
@@ -339,11 +358,11 @@ fn test_split_sat_piece_detected() {
     };
 
     let pm = test_pm();
-    let result = machine::run("refactoring desc", &llm, &solver, &pm)
+    let result = machine::run(RUN_DESCRIPTION, &llm, &solver, &pm)
         
         .expect("agent should succeed");
 
-    assert_eq!(result.formulas.len(), 1);
-    assert_eq!(result.reasonable_sat, 1);
+    assert_eq!(result.formulas.len(), ONE_FORMULA);
+    assert_eq!(result.reasonable_sat, ONE_FORMULA);
     assert!(!result.overall_equivalent);
 }

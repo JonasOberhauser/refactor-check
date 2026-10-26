@@ -34,6 +34,33 @@ const BROKEN_PYZ3_OUT: &str =
     "```python\nfrom z3 import *\nx = Int('x')\nprove(undeclared_name_typo)\n```\n";
 const FIXED_SMT_OUT: &str =
     "```smt2\n(set-logic ALL)\n(declare-const x Int)\n(assert (> x 0))\n(check-sat)\n```\n";
+/// The judge verdict that accepts a response.
+const VERDICT_REASONABLE: &str = "REASONABLE";
+/// Separator used when flattening a fixer prompt for inspection.
+const PROMPT_JOIN_SEP: &str = "\n---\n";
+/// Marker identifying the formalizer's broken pyz3 script.
+const BROKEN_SCRIPT_MARKER: &str = "undeclared_name_typo";
+/// Fake solver stdout.
+const STDOUT_UNSAT: &str = "unsat";
+/// The single mock function and its line span.
+const FIRST_FN_NAME: &str = "f0";
+const MOCK_DEF_LINE: u32 = 1;
+const MOCK_START_LINE: u32 = 1;
+const MOCK_END_LINE: u32 = 5;
+/// Fallback paths and refs the mock git reports.
+const LIB_RS_PATH: &str = "src/lib.rs";
+const WALK_OUTPUT: &str = "src/lib.rs\n";
+const COMMIT_HASH: &str = "deadbeefcafebabe1234567890abcdef12345678";
+/// Stub file content the mock RA returns.
+const STUB_MAIN_SRC: &str = "fn main() {}";
+/// Agent's happy-path response.
+const AGENT_NO_BUG: &str = "No bug found.";
+/// Directory marker that makes the machine treat the tempdir as a repo.
+const GIT_DIR: &str = ".git";
+/// Expected counts and indexes into the recorded prompts/results.
+const EXPECTED_FIXER_CALLS: usize = 1;
+const FIRST_FIXER_PROMPT: usize = 0;
+const EXPECTED_CLOSED_PIECES: usize = 1;
 
 // ── LLM: records fixer prompts ──────────────────────────────────────────────
 
@@ -53,11 +80,11 @@ impl IOProvider<LlmRequest, WithContext<String>> for MockLlm {
                     .rev()
                     .map(|m| m.content.as_str())
                     .collect::<Vec<_>>()
-                    .join("\n---\n");
+                    .join(PROMPT_JOIN_SEP);
                 self.fixer_prompts.lock().expect("fixer log lock").push(prompt);
                 FIXED_SMT_OUT.to_string()
             }
-            LlmRole::Judge => "REASONABLE".to_string(),
+            LlmRole::Judge => VERDICT_REASONABLE.to_string(),
             LlmRole::SplittingJudge | LlmRole::Analyzer => String::new(),
         };
         Ok(WithContext { value: resp, context_id: input.context_id })
@@ -73,7 +100,7 @@ impl IOProvider<PythonRequest, PythonResponse> for FailThenEchoPython {
         // The preflight probe (`print("(check-sat)")`) must succeed; the
         // formalizer's broken pyz3 script fails exactly like a nonzero
         // python3 exit (the branch's bail; main parks the gate instead).
-        if input.script.contains("undeclared_name_typo") {
+        if input.script.contains(BROKEN_SCRIPT_MARKER) {
             return Err(anyhow!(
                 "python3 failed (exit Some(1)): NameError: name 'undeclared_name_typo' is not defined"
             ));
@@ -91,7 +118,7 @@ impl IOProvider<SolverRequest, WithContext<SolverResult>> for MockSolver {
         Ok(WithContext {
             value: SolverResult {
                 outcome: SolverOutcome::Unsat,
-                stdout: "unsat".to_string(),
+                stdout: STDOUT_UNSAT.to_string(),
                 stderr: String::new(),
             },
             context_id: input.context_id,
@@ -104,12 +131,12 @@ impl IOProvider<RustAnalyzerRequest, RustAnalyzerResponse> for MockRa {
     fn invoke(&self, input: RustAnalyzerRequest) -> Result<RustAnalyzerResponse> {
         Ok(match input {
             RustAnalyzerRequest::ListFunctions { files, .. } => {
-                let file = files.first().cloned().unwrap_or_else(|| PathBuf::from("src/lib.rs"));
+                let file = files.first().cloned().unwrap_or_else(|| PathBuf::from(LIB_RS_PATH));
                 RustAnalyzerResponse::FunctionList(vec![FunctionInfo {
-                    id: FunctionId::new(file, "f0", None, 1),
+                    id: FunctionId::new(file, FIRST_FN_NAME, None, MOCK_DEF_LINE),
                     body: String::new(),
-                    start_line: 1,
-                    end_line: 5,
+                    start_line: MOCK_START_LINE,
+                    end_line: MOCK_END_LINE,
                     docs: String::new(),
                     has_guarantees: true,
                 }])
@@ -131,7 +158,7 @@ impl IOProvider<RustAnalyzerRequest, RustAnalyzerResponse> for MockRa {
                 RustAnalyzerResponse::FunctionDocs(String::new())
             }
             RustAnalyzerRequest::GetFileContent { .. } => {
-                RustAnalyzerResponse::FileContent("fn main() {}".to_string())
+                RustAnalyzerResponse::FileContent(STUB_MAIN_SRC.to_string())
             }
         })
     }
@@ -142,10 +169,10 @@ impl IOProvider<GitRequest, GitResponse> for MockGit {
     fn invoke(&self, input: GitRequest) -> Result<GitResponse> {
         Ok(match input {
             GitRequest::WalkRustFiles { .. } => {
-                GitResponse { success: true, output: "src/lib.rs\n".to_string() }
+                GitResponse { success: true, output: WALK_OUTPUT.to_string() }
             }
             GitRequest::CurrentCommitHash => {
-                GitResponse { success: true, output: "deadbeefcafebabe1234567890abcdef12345678".to_string() }
+                GitResponse { success: true, output: COMMIT_HASH.to_string() }
             }
             _ => GitResponse { success: true, output: String::new() },
         })
@@ -163,7 +190,7 @@ struct MockAgent;
 impl IOProvider<AgentRequest, AgentResponse> for MockAgent {
     fn invoke(&self, input: AgentRequest) -> Result<AgentResponse> {
         let _ = input;
-        Ok(AgentResponse { success: true, stdout: "No bug found.".to_string() })
+        Ok(AgentResponse { success: true, stdout: AGENT_NO_BUG.to_string() })
     }
 }
 
@@ -172,7 +199,7 @@ impl IOProvider<AgentRequest, AgentResponse> for MockAgent {
 #[test]
 fn python_script_failure_goes_to_the_fixer_not_the_unknown_bucket() {
     let project = tempfile::tempdir().expect("tempdir");
-    std::fs::create_dir_all(project.path().join(".git")).expect("create .git marker");
+    std::fs::create_dir_all(project.path().join(GIT_DIR)).expect("create .git marker");
 
     let llm = MockLlm { fixer_prompts: Mutex::new(Vec::new()) };
     let mocks = Providers {
@@ -197,21 +224,21 @@ fn python_script_failure_goes_to_the_fixer_not_the_unknown_bucket() {
     let fixer_prompts = llm.fixer_prompts.lock().expect("fixer log lock");
     assert_eq!(
         fixer_prompts.len(),
-        1,
+        EXPECTED_FIXER_CALLS,
         "the failed pyz3 script must be routed to the fixer LLM exactly once; \
          prompts seen: {fixer_prompts:?} (closed={}, unverified={})",
         result.closed_pieces.len(),
         result.unverified_pieces.len(),
     );
     assert!(
-        fixer_prompts[0].contains("NameError: name 'undeclared_name_typo'"),
+        fixer_prompts[FIRST_FIXER_PROMPT].contains("NameError: name 'undeclared_name_typo'"),
         "the fixer prompt must carry the python stderr so the LLM can actually \
          fix the script; got: {}",
-        fixer_prompts[0]
+        fixer_prompts[FIRST_FIXER_PROMPT]
     );
     assert_eq!(
         result.closed_pieces.len(),
-        1,
+        EXPECTED_CLOSED_PIECES,
         "after the fix, the fixed formula must be checked and close the piece \
          (closed={}, unverified={})",
         result.closed_pieces.len(),

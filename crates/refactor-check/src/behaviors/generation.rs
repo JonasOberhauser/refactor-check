@@ -7,6 +7,24 @@ use crate::provider::{DynLlmProvider, LlmRequest, LlmRole};
 use crate::smt::{extract_all_formulas, extract_single_formula};
 use crate::states::{CodePiece, InsistState, VerifiedPiece, WaitForGeneration};
 
+/// The relation-comment marker and its prompt guidance texts.
+const RELATION_MARKER: &str = "/* relation:";
+const RELATION_GUIDE_VERIFY: &str = "\n\nIf /* relation: ... */ comments appear in the code, they specify how certain \
+         states differ between before and after. Verify that the piece satisfies the \
+         specified relation. All variables/states not mentioned in a relation comment \
+         are assumed to be equivalent between before and after. The conjunction of all \
+         relation comments applies.";
+const RELATION_GUIDE_ENCODE: &str = " If /* relation: ... */ comments are present, encode the specified relation \
+         between before and after states, not just strict equivalence. Variables/states \
+         not mentioned in the relation are assumed equivalent.";
+const RELATION_GUIDE_ENCODE_ALT: &str = " If /* relation: ... */ comments are present, encode the specified relation \
+         between before and after states, not just strict equivalence.";
+/// Verified-pieces listing header and newline for the prompt assembly.
+const VERIFIED_HEADER: &str = "Already verified pieces:\n";
+const PIECE_NEWLINE: char = '\n';
+/// First piece of a batch.
+const FIRST_PIECE: usize = 0;
+
 pub fn role_for_iteration(iteration: usize) -> LlmRole {
     if iteration == 0 {
         LlmRole::Formalizer
@@ -109,9 +127,9 @@ fn generate_insist(
         )),
     ];
 
-    let ctx = state.pieces[0].take_context().map_err(anyhow::Error::msg)?;
+    let ctx = state.pieces[FIRST_PIECE].take_context().map_err(anyhow::Error::msg)?;
     let resp = llm.invoke(LlmRequest { role, messages, context_id: ctx })?;
-    state.pieces[0].restore_context(resp.context_id);
+    state.pieces[FIRST_PIECE].restore_context(resp.context_id);
     let response = resp.value;
     let mut formulas = extract_all_formulas(&response);
 
@@ -143,16 +161,12 @@ fn build_single_piece_messages(
 ) -> Vec<crate::llm::Message> {
     let mut messages = Vec::new();
 
-    let relation_guidance = if piece.before().contains("/* relation:") || piece.after().contains("/* relation:") {
-        "\n\nIf /* relation: ... */ comments appear in the code, they specify how certain \
-         states differ between before and after. Verify that the piece satisfies the \
-         specified relation. All variables/states not mentioned in a relation comment \
-         are assumed to be equivalent between before and after. The conjunction of all \
-         piece relations must imply overall equivalence of the full refactoring. \
-         If no relation comments are present, verify strict equivalence as before."
-    } else {
-        ""
-    };
+    let relation_guidance =
+        if piece.before().contains(RELATION_MARKER) || piece.after().contains(RELATION_MARKER) {
+            RELATION_GUIDE_VERIFY
+        } else {
+            ""
+        };
 
     messages.push(crate::llm::system_message(&format!(
         "Piece ID: {id}\n\
@@ -173,11 +187,11 @@ fn build_single_piece_messages(
         content = format!("Original refactoring context:\n\n{}\n\n{}", input_content, content);
     }
     if !verified.is_empty() {
-        content.push_str("Already verified pieces:\n");
+        content.push_str(VERIFIED_HEADER);
         for v in verified {
             content.push_str(&format!("  {}: {:?}\n", v.piece.label(), v.outcome));
         }
-        content.push('\n');
+        content.push(PIECE_NEWLINE);
     }
 
     messages.push(crate::llm::user_message(&content));
@@ -192,13 +206,12 @@ pub fn build_retry_messages(
     solver_stderr: &str,
     input_content: &str,
 ) -> Vec<crate::llm::Message> {
-    let relation_guidance = if piece.before().contains("/* relation:") || piece.after().contains("/* relation:") {
-        " If /* relation: ... */ comments are present, encode the specified relation \
-         between before and after states, not just strict equivalence. Variables/states \
-         not mentioned in the relation are assumed equivalent."
-    } else {
-        ""
-    };
+    let relation_guidance =
+        if piece.before().contains(RELATION_MARKER) || piece.after().contains(RELATION_MARKER) {
+            RELATION_GUIDE_ENCODE
+        } else {
+            ""
+        };
 
     let prompt = format!(
         "Original refactoring context:\n\n{ctx}\n\n\
@@ -237,12 +250,12 @@ pub fn build_retry_insist_messages(
     last_response: &str,
     input_content: &str,
 ) -> Vec<crate::llm::Message> {
-    let relation_guidance = if piece.before().contains("/* relation:") || piece.after().contains("/* relation:") {
-        " If /* relation: ... */ comments are present, encode the specified relation \
-         between before and after states, not just strict equivalence."
-    } else {
-        ""
-    };
+    let relation_guidance =
+        if piece.before().contains(RELATION_MARKER) || piece.after().contains(RELATION_MARKER) {
+            RELATION_GUIDE_ENCODE_ALT
+        } else {
+            ""
+        };
 
     vec![
         crate::llm::system_message(&format!(

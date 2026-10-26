@@ -1,3 +1,5 @@
+#![allow(unknown_lints)] // item-level inline_literal allows below
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -163,6 +165,69 @@ use std::sync::Arc;
 use ra_ap_syntax::ast::{self, AstNode, HasName};
 use std::sync::Mutex;
 
+const RUST_PATH_SEPARATOR: &str = "::";
+const ATTR_REQUIRES: &str = "requires";
+const ATTR_ENSURES: &str = "ensures";
+const ATTR_INVARIANT: &str = "invariant";
+const ATTR_TEST: &str = "test";
+const ATTR_BENCH: &str = "bench";
+const METHOD_UNWRAP: &str = "unwrap";
+const METHOD_EXPECT: &str = "expect";
+const DOC_COMMENT_PREFIX: &str = "///";
+const INNER_DOC_COMMENT_PREFIX: &str = "//!";
+const DOC_SECTION_SAFETY: &str = "# safety";
+const DOC_SECTION_PRECONDITIONS: &str = "# preconditions";
+const DOC_SECTION_PRE_CONDITIONS: &str = "# pre-conditions";
+const DOC_SECTION_PANICS: &str = "# panics";
+const DOC_SECTION_GUARANTEES: &str = "# guarantees";
+const DOC_SECTION_POSTCONDITIONS: &str = "# postconditions";
+const DOC_SECTION_POST_CONDITIONS: &str = "# post-conditions";
+const DOC_SECTION_ENSURES: &str = "# ensures";
+const UNKNOWN_PANIC_MSG: &str = "unknown panic";
+const SKIP_SELF_NODE: usize = 1;
+const CARGO_FEATURE_VERIFICATION: &str = "verification";
+const RA_WORKER_THREADS: usize = 1;
+const RA_PROC_MACRO_PROCESSES: usize = 1;
+const FALLBACK_FIRST_LINE: usize = 1;
+const FALLBACK_CONTEXT_LINES: usize = 50;
+const LINE_SEPARATOR: &str = "\n";
+const NEWLINE_CHAR: char = '\n';
+const GIT_BINARY: &str = "git";
+const GIT_ARG_CHECKOUT: &str = "checkout";
+const GIT_ARG_NEW_BRANCH: &str = "-b";
+const GIT_ARG_COMMIT: &str = "commit";
+const GIT_ARG_MESSAGE: &str = "-m";
+const GIT_ARG_ADD: &str = "add";
+const GIT_ARG_SEPARATOR: &str = "--";
+const GIT_ARG_DIFF: &str = "diff";
+const GIT_ARG_NAME_ONLY: &str = "--name-only";
+const GIT_ARG_REV_PARSE: &str = "rev-parse";
+const GIT_ARG_HEAD: &str = "HEAD";
+const GIT_ARG_INIT: &str = "init";
+const GIT_ARG_SHOW_TOPLEVEL: &str = "--show-toplevel";
+const GIT_ADD_CHUNK_SIZE: usize = 200;
+const GIT_DIR_NAME: &str = ".git";
+const TARGET_DIR_NAME: &str = "target";
+const TESTS_DIR_NAME: &str = "tests";
+const BENCHES_DIR_NAME: &str = "benches";
+const RUST_FILE_EXTENSION: &str = "rs";
+const CURRENT_DIR: &str = ".";
+const PYTHON3_BINARY: &str = "python3";
+const PYTHON_CMD_FLAG: &str = "-c";
+const EMPTY_OUTPUT_PLACEHOLDER: &str = "(no output)";
+const WIRE_FIELD_PART: &str = "part";
+const WIRE_FIELD_TYPE: &str = "type";
+const WIRE_FIELD_TEXT: &str = "text";
+const WIRE_PART_TYPE_TEXT: &str = "text";
+const WIRE_EVENT_TYPE_ERROR: &str = "error";
+const WIRE_FIELD_ERROR: &str = "error";
+const WIRE_FIELD_DATA: &str = "data";
+const WIRE_FIELD_MESSAGE: &str = "message";
+const AGENT_FLAG_FORMAT: &str = "--format";
+const AGENT_FORMAT_JSON: &str = "json";
+const AGENT_FLAG_DIR: &str = "--dir";
+const AGENT_FLAG_FILE: &str = "-f";
+
 pub struct CliRustAnalyzerProvider {
     host: Mutex<ra_ap_ide::AnalysisHost>,
     path_to_file_id: Mutex<HashMap<PathBuf, ra_ap_vfs::FileId>>,
@@ -200,7 +265,7 @@ fn fetch_docs(analysis: &ra_ap_ide::Analysis, file_id: ra_ap_vfs::FileId, offset
                 .downcast_ref::<&str>()
                 .map(|s| s.to_string())
                 .or_else(|| panic_payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "unknown panic".to_string());
+                .unwrap_or_else(|| UNKNOWN_PANIC_MSG.to_string());
             warn!(?file_id, ?offset, panic_msg, "fetch_docs: goto_definition panicked (ra_ap bug), returning empty docs");
             String::new()
         }
@@ -239,7 +304,7 @@ fn fn_has_requires_attr(fn_ast: &ast::Fn) -> bool {
             .and_then(|m| m.path())
             .map(|p| {
                 let last = p.syntax().text().to_string();
-                last.split("::").last().unwrap_or(&last) == "requires"
+                last.split(RUST_PATH_SEPARATOR).last().unwrap_or(&last) == ATTR_REQUIRES
             })
             .unwrap_or(false)
     })
@@ -252,7 +317,7 @@ fn fn_has_ensures_attr(fn_ast: &ast::Fn) -> bool {
             .and_then(|m| m.path())
             .map(|p| {
                 let last = p.syntax().text().to_string();
-                last.split("::").last().unwrap_or(&last) == "ensures"
+                last.split(RUST_PATH_SEPARATOR).last().unwrap_or(&last) == ATTR_ENSURES
             })
             .unwrap_or(false)
     })
@@ -267,8 +332,8 @@ fn fn_in_invariant_impl(fn_ast: &ast::Fn) -> bool {
                 for attr in impl_node.attrs() {
                     if let Some(path) = attr.meta().and_then(|m| m.path()) {
                         let last = path.syntax().text().to_string();
-                        let last = last.split("::").last().unwrap_or(&last);
-                        if last == "invariant" {
+                        let last = last.split(RUST_PATH_SEPARATOR).last().unwrap_or(&last);
+                        if last == ATTR_INVARIANT {
                             return true;
                         }
                     }
@@ -326,8 +391,8 @@ fn attrs_look_like_test(fn_ast: &ra_ap_syntax::ast::Fn) -> bool {
         if let Some(meta) = attr.meta() {
             if let Some(path) = meta.path() {
                 let path_text = path.syntax().text().to_string();
-                if let Some(last) = path_text.split("::").last() {
-                    if last == "test" || last == "bench" {
+                if let Some(last) = path_text.split(RUST_PATH_SEPARATOR).last() {
+                    if last == ATTR_TEST || last == ATTR_BENCH {
                         return true;
                     }
                 }
@@ -342,13 +407,13 @@ fn docs_contain_preconditions(docs: &str) -> bool {
         return false;
     }
     let lower = docs.to_lowercase();
-    lower.contains("# safety")
-        || lower.contains("# preconditions")
-        || lower.contains("# pre-conditions")
+    lower.contains(DOC_SECTION_SAFETY)
+        || lower.contains(DOC_SECTION_PRECONDITIONS)
+        || lower.contains(DOC_SECTION_PRE_CONDITIONS)
 }
 
 fn docs_mention_panic(docs: &str) -> bool {
-    docs.to_lowercase().contains("# panics")
+    docs.to_lowercase().contains(DOC_SECTION_PANICS)
 }
 
 fn fn_body_contains_unsafe(fn_ast: &ast::Fn) -> bool {
@@ -365,7 +430,7 @@ fn fn_body_contains_assertions(fn_ast: &ast::Fn) -> bool {
     for macro_call in syntax.descendants().filter_map(ast::MacroCall::cast) {
         if let Some(path) = macro_call.path() {
             let name = path.syntax().text().to_string();
-            let last = name.split("::").last().unwrap_or(&name);
+            let last = name.split(RUST_PATH_SEPARATOR).last().unwrap_or(&name);
             if matches!(last,
                 "assert" | "assert_eq" | "assert_ne"
                 | "debug_assert" | "debug_assert_eq" | "debug_assert_ne"
@@ -379,7 +444,7 @@ fn fn_body_contains_assertions(fn_ast: &ast::Fn) -> bool {
     for method_call in syntax.descendants().filter_map(ast::MethodCallExpr::cast) {
         if let Some(name_ref) = method_call.name_ref() {
             let name = name_ref.syntax().text().to_string();
-            if name == "unwrap" || name == "expect" {
+            if name == METHOD_UNWRAP || name == METHOD_EXPECT {
                 return true;
             }
         }
@@ -393,16 +458,46 @@ fn docs_contain_guarantees(docs: &str) -> bool {
         return false;
     }
     let lower = docs.to_lowercase();
-    lower.contains("# guarantees")
-        || lower.contains("# postconditions")
-        || lower.contains("# post-conditions")
-        || lower.contains("# ensures")
-        || lower.contains("# safety")
+    lower.contains(DOC_SECTION_GUARANTEES)
+        || lower.contains(DOC_SECTION_POSTCONDITIONS)
+        || lower.contains(DOC_SECTION_POST_CONDITIONS)
+        || lower.contains(DOC_SECTION_ENSURES)
+        || lower.contains(DOC_SECTION_SAFETY)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SRC_WITH_ASSERT: &str = "fn foo() { assert!(x > 0); }";
+    const SRC_WITH_UNWRAP: &str = "fn foo() { x.unwrap(); }";
+    #[allow(inline_literal)]
+    const SRC_WITH_EXPECT: &str = r#"fn foo() { x.expect("msg"); }"#;
+    const SRC_WITH_UNREACHABLE: &str = "fn foo() { unreachable!(); }";
+    const SRC_EMPTY_FN: &str = "fn foo() {}";
+    const SRC_REQUIRES_ATTR: &str = "#[requires(self.value < 99)]\npub fn inc(&mut self) { self.value += 1; }";
+    const SRC_ENSURES_ATTR: &str = "#[ensures(ret.value == 0)]\npub fn new() -> Self { Self { value: 0 } }";
+    const SRC_INVARIANT_IMPL: &str = r#"#[invariant(self.value < 100)]
+impl Value {
+    pub fn inc(&mut self) {
+        self.value += 1;
+    }
+}"#;
+    const SRC_PLAIN_IMPL: &str = r#"impl Value {
+    pub fn inc(&mut self) {
+        self.value += 1;
+    }
+}"#;
+    const SRC_UNSAFE_FN: &str = "unsafe fn foo(x: *const i32) -> i32 { *(x) }";
+    const SRC_PLAIN_FN: &str = "fn foo(x: i32) -> i32 { x }";
+    #[allow(inline_literal)]
+    const SRC_WITH_STRING_UNSAFE: &str = r#"fn foo() { let s = "unsafe {"; }"#;
+    #[allow(inline_literal)]
+    const SRC_WITH_RAW_STRING_UNSAFE: &str = r##"fn foo() { let s = r#"unsafe {"#; }"##;
+    #[allow(inline_literal)]
+    const SRC_WITH_RAW_STRING_UNSAFE_NO_HASH: &str = r#"fn foo() { let s = r"unsafe {"; }"#;
+    #[allow(inline_literal)]
+    const SRC_WITH_BYTE_RAW_STRING_UNSAFE: &str = r##"fn foo() { let s = br#"unsafe {"#; }"##;
 
     fn parse_fn(src: &str) -> ast::Fn {
         let parse = ra_ap_syntax::SourceFile::parse(src, ra_ap_syntax::Edition::Edition2024);
@@ -435,28 +530,28 @@ mod tests {
 
     #[test]
     fn test_unsafe_in_string_ignored() {
-        assert!(!has_guarantees(&parse_fn("fn foo() { let s = \"unsafe {\"; }"), ""));
+        assert!(!has_guarantees(&parse_fn(SRC_WITH_STRING_UNSAFE), ""));
     }
 
     #[test]
     fn test_assertions_are_guarantees_not_preconditions() {
-        let f = parse_fn("fn foo() { assert!(x > 0); }");
+        let f = parse_fn(SRC_WITH_ASSERT);
         assert!(has_guarantees(&f, ""));
         assert!(!has_preconditions(&f, ""));
-        let f = parse_fn("fn foo() { x.unwrap(); }");
+        let f = parse_fn(SRC_WITH_UNWRAP);
         assert!(has_guarantees(&f, ""));
         assert!(!has_preconditions(&f, ""));
-        let f = parse_fn("fn foo() { x.expect(\"msg\"); }");
+        let f = parse_fn(SRC_WITH_EXPECT);
         assert!(has_guarantees(&f, ""));
         assert!(!has_preconditions(&f, ""));
-        let f = parse_fn("fn foo() { unreachable!(); }");
+        let f = parse_fn(SRC_WITH_UNREACHABLE);
         assert!(has_guarantees(&f, ""));
         assert!(!has_preconditions(&f, ""));
     }
 
     #[test]
     fn test_docs_guarantees() {
-        let empty_fn = parse_fn("fn foo() {}");
+        let empty_fn = parse_fn(SRC_EMPTY_FN);
         assert!(has_guarantees(&empty_fn, "# Guarantees\nThis function is safe."));
         assert!(has_guarantees(&empty_fn, "# Postconditions\nReturns non-zero."));
         assert!(has_guarantees(&empty_fn, "# Ensures\nresult >= 0"));
@@ -473,14 +568,14 @@ mod tests {
 
     #[test]
     fn test_unsafe_in_raw_string_ignored() {
-        assert!(!has_guarantees(&parse_fn("fn foo() { let s = r#\"unsafe {\"#; }"), ""));
-        assert!(!has_guarantees(&parse_fn("fn foo() { let s = r\"unsafe {\"; }"), ""));
-        assert!(!has_guarantees(&parse_fn("fn foo() { let s = br#\"unsafe {\"#; }"), ""));
+        assert!(!has_guarantees(&parse_fn(SRC_WITH_RAW_STRING_UNSAFE), ""));
+        assert!(!has_guarantees(&parse_fn(SRC_WITH_RAW_STRING_UNSAFE_NO_HASH), ""));
+        assert!(!has_guarantees(&parse_fn(SRC_WITH_BYTE_RAW_STRING_UNSAFE), ""));
     }
 
     #[test]
     fn test_requires_attr_is_precondition() {
-        let src = "#[requires(self.value < 99)]\npub fn inc(&mut self) { self.value += 1; }";
+        let src = SRC_REQUIRES_ATTR;
         let f = parse_fn(src);
         assert!(has_preconditions(&f, ""));
         assert!(!has_guarantees(&f, ""));
@@ -488,7 +583,7 @@ mod tests {
 
     #[test]
     fn test_ensures_attr_is_guarantee() {
-        let src = "#[ensures(ret.value == 0)]\npub fn new() -> Self { Self { value: 0 } }";
+        let src = SRC_ENSURES_ATTR;
         let f = parse_fn(src);
         assert!(has_guarantees(&f, ""));
         assert!(!has_preconditions(&f, ""));
@@ -496,12 +591,7 @@ mod tests {
 
     #[test]
     fn test_invariant_impl_is_both() {
-        let src = r#"#[invariant(self.value < 100)]
-impl Value {
-    pub fn inc(&mut self) {
-        self.value += 1;
-    }
-}"#;
+        let src = SRC_INVARIANT_IMPL;
         let fn_ast = parse_fn(src);
         assert!(fn_in_invariant_impl(&fn_ast));
         assert!(has_preconditions(&fn_ast, ""));
@@ -510,11 +600,7 @@ impl Value {
 
     #[test]
     fn test_no_contract_no_preconditions_no_guarantees() {
-        let src = r#"impl Value {
-    pub fn inc(&mut self) {
-        self.value += 1;
-    }
-}"#;
+        let src = SRC_PLAIN_IMPL;
         let fn_ast = parse_fn(src);
         assert!(!fn_in_invariant_impl(&fn_ast));
         assert!(!has_preconditions(&fn_ast, ""));
@@ -523,13 +609,13 @@ impl Value {
 
     #[test]
     fn test_unsafe_fn_has_preconditions() {
-        let f = parse_fn("unsafe fn foo(x: *const i32) -> i32 { *(x) }");
+        let f = parse_fn(SRC_UNSAFE_FN);
         assert!(has_preconditions(&f, ""));
     }
 
     #[test]
     fn test_docs_mention_panic_is_precondition() {
-        let f = parse_fn("fn foo(x: i32) -> i32 { x }");
+        let f = parse_fn(SRC_PLAIN_FN);
         assert!(has_preconditions(&f, "# Panics\nIf x is negative."));
     }
 }
@@ -542,7 +628,7 @@ fn byte_offset_to_line(source: &str, offset: ra_ap_ide::TextSize) -> u32 {
         if i >= byte {
             break;
         }
-        if ch == '\n' {
+        if ch == NEWLINE_CHAR {
             line += 1;
         }
     }
@@ -557,7 +643,7 @@ fn line_to_byte_offset(source: &str, line: u32) -> ra_ap_ide::TextSize {
             break;
         }
         byte_offset += ch.len_utf8();
-        if ch == '\n' {
+        if ch == NEWLINE_CHAR {
             current_line += 1;
         }
     }
@@ -587,7 +673,7 @@ fn fn_is_in_trait(fn_ast: &ra_ap_syntax::ast::Fn) -> bool {
     fn_ast
         .syntax()
         .ancestors()
-        .skip(1)
+        .skip(SKIP_SELF_NODE)
         .any(|a| ra_ap_syntax::ast::Trait::can_cast(a.kind()))
 }
 
@@ -600,7 +686,7 @@ impl CliRustAnalyzerProvider {
 
         let cargo_config = ra_ap_project_model::CargoConfig {
             features: ra_ap_project_model::CargoFeatures::Selected {
-                features: vec!["verification".to_string()],
+                features: vec![CARGO_FEATURE_VERIFICATION.to_string()],
                 no_default_features: false,
             },
             set_test: false,
@@ -621,8 +707,8 @@ impl CliRustAnalyzerProvider {
             load_out_dirs_from_check: false,
             with_proc_macro_server: ra_ap_load_cargo::ProcMacroServerChoice::Sysroot,
             prefill_caches: false,
-            num_worker_threads: 1,
-            proc_macro_processes: 1,
+            num_worker_threads: RA_WORKER_THREADS,
+            proc_macro_processes: RA_PROC_MACRO_PROCESSES,
         };
 
         let (raw_db, vfs, proc_macro_client) = ra_ap_load_cargo::load_workspace(
@@ -752,7 +838,7 @@ impl CliRustAnalyzerProvider {
                             .downcast_ref::<&str>()
                             .map(|s| s.to_string())
                             .or_else(|| panic_payload.downcast_ref::<String>().cloned())
-                            .unwrap_or_else(|| "unknown panic".to_string());
+                            .unwrap_or_else(|| UNKNOWN_PANIC_MSG.to_string());
                         warn!(?file_id, ?nav_offset, panic_msg, "outgoing_calls panicked (ra_ap bug), skipping precondition check for {}", name);
                     }
                 }
@@ -806,9 +892,9 @@ impl CliRustAnalyzerProvider {
         }
 
         let lines: Vec<&str> = source.lines().collect();
-        let start = usize::try_from(function_id.line).unwrap_or(1).saturating_sub(1);
-        let end = (start + 50).min(lines.len());
-        let code = lines[start..end].join("\n");
+        let start = usize::try_from(function_id.line).unwrap_or(FALLBACK_FIRST_LINE).saturating_sub(1);
+        let end = (start + FALLBACK_CONTEXT_LINES).min(lines.len());
+        let code = lines[start..end].join(LINE_SEPARATOR);
         if code.trim().is_empty() {
             anyhow::bail!("Function {} at {:?}:{} resolved to empty code", function_id.name, function_id.file, function_id.line);
         }
@@ -986,27 +1072,27 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
         let dir = &self.project_path;
         match input {
             GitRequest::CreateBranch { name } => {
-                let output = std::process::Command::new("git")
-                    .args(["checkout", "-b", &name])
+                let output = std::process::Command::new(GIT_BINARY)
+                    .args([GIT_ARG_CHECKOUT, GIT_ARG_NEW_BRANCH, &name])
                     .current_dir(dir)
                     .output()
                     ?;
                 Ok(git_response(output))
             }
             GitRequest::Commit { message } => {
-                let output = std::process::Command::new("git")
-                    .args(["commit", "-m", &message])
+                let output = std::process::Command::new(GIT_BINARY)
+                    .args([GIT_ARG_COMMIT, GIT_ARG_MESSAGE, &message])
                     .current_dir(dir)
                     .output()
                     ?;
                 Ok(git_response(output))
             }
             GitRequest::AddFiles { paths } => {
-                let mut args = vec!["add".to_string()];
+                let mut args = vec![GIT_ARG_ADD.to_string()];
                 for p in &paths {
                     args.push(p.to_string_lossy().to_string());
                 }
-                let output = std::process::Command::new("git")
+                let output = std::process::Command::new(GIT_BINARY)
                     .args(&args)
                     .current_dir(dir)
                     .output()
@@ -1014,16 +1100,16 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
                 Ok(git_response(output))
             }
             GitRequest::FindChangedRustFiles { base_commit } => {
-                let output = std::process::Command::new("git")
-                    .args(["diff", "--name-only", &base_commit])
+                let output = std::process::Command::new(GIT_BINARY)
+                    .args([GIT_ARG_DIFF, GIT_ARG_NAME_ONLY, &base_commit])
                     .current_dir(dir)
                     .output()
                     ?;
                 Ok(git_response(output))
             }
             GitRequest::CurrentCommitHash => {
-                let output = std::process::Command::new("git")
-                    .args(["rev-parse", "HEAD"])
+                let output = std::process::Command::new(GIT_BINARY)
+                    .args([GIT_ARG_REV_PARSE, GIT_ARG_HEAD])
                     .current_dir(dir)
                     .output()
                     ?;
@@ -1041,12 +1127,12 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
                 let files = walkdir_rust_files(&canonical);
                 Ok(GitResponse {
                     success: true,
-                    output: files.into_iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>().join("\n"),
+                    output: files.into_iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>().join(LINE_SEPARATOR),
                 })
             }
             GitRequest::Init { path: _ } => {
-                let output = std::process::Command::new("git")
-                    .args(["init"])
+                let output = std::process::Command::new(GIT_BINARY)
+                    .args([GIT_ARG_INIT])
                     .current_dir(dir)
                     .output()
                     ?;
@@ -1061,7 +1147,7 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
                     .into_iter()
                     .filter_entry(|e| {
                         let name = e.file_name().to_string_lossy();
-                        name != ".git" && name != "target"
+                        name != GIT_DIR_NAME && name != TARGET_DIR_NAME
                     })
                     .flatten()
                 {
@@ -1074,10 +1160,10 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
                         }
                     }
                 }
-                for chunk in matches.chunks(200) {
-                    let mut args = vec!["add".to_string(), "--".to_string()];
+                for chunk in matches.chunks(GIT_ADD_CHUNK_SIZE) {
+                    let mut args = vec![GIT_ARG_ADD.to_string(), GIT_ARG_SEPARATOR.to_string()];
                     args.extend(chunk.iter().cloned());
-                    let output = std::process::Command::new("git")
+                    let output = std::process::Command::new(GIT_BINARY)
                         .args(&args)
                         .current_dir(dir)
                         .output()
@@ -1090,8 +1176,8 @@ impl IOProvider<GitRequest, GitResponse> for CliGitProvider {
                 Ok(GitResponse { success: true, output: String::new() })
             }
             GitRequest::RepoRoot => {
-                let output = std::process::Command::new("git")
-                    .args(["rev-parse", "--show-toplevel"])
+                let output = std::process::Command::new(GIT_BINARY)
+                    .args([GIT_ARG_REV_PARSE, GIT_ARG_SHOW_TOPLEVEL])
                     .current_dir(dir)
                     .output()
                     ?;
@@ -1137,21 +1223,21 @@ fn extract_impl_context(source: &str, func_offset: usize) -> String {
 
             for attr in impl_node.attrs() {
                 let text = attr.syntax().text().to_string();
-                if text.contains("invariant")
-                    || text.contains("requires")
-                    || text.contains("ensures")
+                if text.contains(ATTR_INVARIANT)
+                    || text.contains(ATTR_REQUIRES)
+                    || text.contains(ATTR_ENSURES)
                 {
                     context.push_str(&text);
-                    context.push('\n');
+                    context.push(NEWLINE_CHAR);
                 }
             }
 
             for token in impl_node.syntax().descendants_with_tokens() {
                 if let ra_ap_syntax::SyntaxElement::Token(t) = token {
                     let text = t.text();
-                    if text.trim_start().starts_with("///") || text.trim_start().starts_with("//!") {
+                    if text.trim_start().starts_with(DOC_COMMENT_PREFIX) || text.trim_start().starts_with(INNER_DOC_COMMENT_PREFIX) {
                         context.push_str(text.trim());
-                        context.push('\n');
+                        context.push(NEWLINE_CHAR);
                     }
                 }
             }
@@ -1164,9 +1250,9 @@ fn extract_impl_context(source: &str, func_offset: usize) -> String {
                             for token in s.syntax().descendants_with_tokens() {
                                 if let ra_ap_syntax::SyntaxElement::Token(t) = token {
                                     let text = t.text();
-                                    if text.trim_start().starts_with("///") {
+                                    if text.trim_start().starts_with(DOC_COMMENT_PREFIX) {
                                         context.push_str(text.trim());
-                                        context.push('\n');
+                                        context.push(NEWLINE_CHAR);
                                     }
                                 }
                             }
@@ -1190,12 +1276,12 @@ fn walkdir_rust_files(path: &PathBuf) -> Vec<PathBuf> {
             let p = entry.path();
             if p.is_dir() {
                 let dir_name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if dir_name == "tests" || dir_name == "target" || dir_name == "benches" {
+                if dir_name == TESTS_DIR_NAME || dir_name == TARGET_DIR_NAME || dir_name == BENCHES_DIR_NAME {
                     continue;
                 }
                 files.extend(walkdir_rust_files(&p));
             } else if let Some(ext) = p.extension() {
-                if ext == "rs" {
+                if ext == RUST_FILE_EXTENSION {
                     files.push(p);
                 }
             }
@@ -1224,7 +1310,7 @@ impl IOProvider<FileSystemRequest, FileSystemResponse> for LocalFileSystemProvid
 
 impl Default for CliGitProvider {
     fn default() -> Self {
-        Self::new(PathBuf::from("."))
+        Self::new(PathBuf::from(CURRENT_DIR))
     }
 }
 
@@ -1260,8 +1346,8 @@ impl Default for ProcessPythonProvider {
 impl IOProvider<PythonRequest, PythonResponse> for ProcessPythonProvider {
     fn invoke(&self, input: PythonRequest) -> Result<PythonResponse> {
         loop {
-            let output = match std::process::Command::new("python3")
-                .arg("-c")
+            let output = match std::process::Command::new(PYTHON3_BINARY)
+                .arg(PYTHON_CMD_FLAG)
                 .arg(&input.script)
                 .output()
             {
@@ -1357,18 +1443,18 @@ fn extract_text_from_json_events(stdout: &str) -> String {
             continue;
         }
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(part) = value.get("part") {
-                if let Some(part_type) = part.get("type") {
-                    if part_type.as_str() == Some("text") {
-                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+            if let Some(part) = value.get(WIRE_FIELD_PART) {
+                if let Some(part_type) = part.get(WIRE_FIELD_TYPE) {
+                    if part_type.as_str() == Some(WIRE_PART_TYPE_TEXT) {
+                        if let Some(text) = part.get(WIRE_FIELD_TEXT).and_then(|t| t.as_str()) {
                             texts.push(text.to_string());
                         }
                     }
                 }
             }
-            if value.get("type").and_then(|t| t.as_str()) == Some("error") {
-                if let Some(err) = value.get("error") {
-                    if let Some(msg) = err.get("data").and_then(|d| d.get("message")).and_then(|m| m.as_str()) {
+            if value.get(WIRE_FIELD_TYPE).and_then(|t| t.as_str()) == Some(WIRE_EVENT_TYPE_ERROR) {
+                if let Some(err) = value.get(WIRE_FIELD_ERROR) {
+                    if let Some(msg) = err.get(WIRE_FIELD_DATA).and_then(|d| d.get(WIRE_FIELD_MESSAGE)).and_then(|m| m.as_str()) {
                         texts.push(format!("[agent error: {msg}]"));
                     }
                 }
@@ -1383,12 +1469,12 @@ impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
         loop {
             let mut args = self.base_args.clone();
             args.push(input.prompt.clone());
-            args.push("--format".to_string());
-            args.push("json".to_string());
-            args.push("--dir".to_string());
+            args.push(AGENT_FLAG_FORMAT.to_string());
+            args.push(AGENT_FORMAT_JSON.to_string());
+            args.push(AGENT_FLAG_DIR.to_string());
             args.push(input.working_directory.to_string_lossy().to_string());
             for file in &input.files_to_read {
-                args.push("-f".to_string());
+                args.push(AGENT_FLAG_FILE.to_string());
                 args.push(file.to_string_lossy().to_string());
             }
 
@@ -1437,7 +1523,7 @@ impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
                 } else if !stderr_raw.trim().is_empty() {
                     stderr_raw.trim()
                 } else {
-                    "(no output)"
+                    EMPTY_OUTPUT_PLACEHOLDER
                 };
                 let message = format!(
                     "opencode failed (exit {:?}): {detail}\n\
@@ -1467,23 +1553,34 @@ impl IOProvider<AgentRequest, AgentResponse> for CliAgentProvider {
 mod agent_tests {
     use super::extract_text_from_json_events;
 
+    #[allow(inline_literal)]
+    const JSON_EVENT_TEXT: &str = r#"{"type":"text","part":{"type":"text","text":"Hello world"}}"#;
+    #[allow(inline_literal)]
+    const JSON_EVENTS_WITH_TEXT: &str = r#"{"type":"step_start","part":{"type":"step-start"}}
+{"type":"text","part":{"type":"text","text":"Bug: overflow"}}
+{"type":"step_finish","part":{"type":"step-finish"}}"#;
+    #[allow(inline_literal)]
+    const JSON_EVENT_ERROR: &str = r#"{"type":"error","error":{"name":"APIError","data":{"message":"Missing Auth","statusCode":401}}}"#;
+    #[allow(inline_literal)]
+    const JSON_LINES_MIXED_INVALID: &str = r#"not json
+{"type":"text","part":{"type":"text","text":"ok"}}
+also not json"#;
+
     #[test]
     fn test_extract_text_from_single_text_event() {
-        let input = r#"{"type":"text","part":{"type":"text","text":"Hello world"}}"#;
+        let input = JSON_EVENT_TEXT;
         assert_eq!(extract_text_from_json_events(input), "Hello world");
     }
 
     #[test]
     fn test_extract_text_from_multiple_events() {
-        let input = r#"{"type":"step_start","part":{"type":"step-start"}}
-{"type":"text","part":{"type":"text","text":"Bug: overflow"}}
-{"type":"step_finish","part":{"type":"step-finish"}}"#;
+        let input = JSON_EVENTS_WITH_TEXT;
         assert_eq!(extract_text_from_json_events(input), "Bug: overflow");
     }
 
     #[test]
     fn test_extract_text_from_error_event() {
-        let input = r#"{"type":"error","error":{"name":"APIError","data":{"message":"Missing Auth","statusCode":401}}}"#;
+        let input = JSON_EVENT_ERROR;
         assert_eq!(extract_text_from_json_events(input), "[agent error: Missing Auth]");
     }
 
@@ -1494,7 +1591,7 @@ mod agent_tests {
 
     #[test]
     fn test_extract_text_invalid_json_lines() {
-        let input = "not json\n{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"ok\"}}\nalso not json";
+        let input = JSON_LINES_MIXED_INVALID;
         assert_eq!(extract_text_from_json_events(input), "ok");
     }
 }

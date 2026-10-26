@@ -52,21 +52,25 @@ pub fn run(
     Ok(())
 }
 
+/// Explanation-prompt system texts, by solver outcome.
+const EXPLAIN_SYSTEM_SAT: &str = "You are an expert in program analysis and formal verification. \
+         The SMT solver found a counterexample (SAT) for an equivalence formula. \
+         Explain the source of the bug: what behavioral difference between \
+         the 'before' and 'after' code does the counterexample represent?";
+const EXPLAIN_SYSTEM_UNKNOWN: &str = "You are an expert in program analysis and formal verification. \
+         The SMT solver could not decide (UNKNOWN) for an equivalence formula. \
+         Evaluate whether there is likely a real bug, or whether the formula \
+         is simply too complex for the solver. Highlight that the solver's result is INCONCLUSIVE.";
+
 pub fn build_explanation_messages(
     input_content: &str,
     formula: &str,
     outcome: &SolverOutcome,
 ) -> Vec<Message> {
     let system = if matches!(outcome, SolverOutcome::Sat) {
-        "You are an expert in program analysis and formal verification. \
-         The SMT solver found a counterexample (SAT) for an equivalence formula. \
-         Explain the source of the bug: what behavioral difference between \
-         the 'before' and 'after' code does the counterexample represent?"
+        EXPLAIN_SYSTEM_SAT
     } else {
-        "You are an expert in program analysis and formal verification. \
-         The SMT solver could not decide (UNKNOWN) for an equivalence formula. \
-         Evaluate whether there is likely a real bug, or whether the formula \
-         is simply too complex for the solver. Highlight that the solver's result is INCONCLUSIVE."
+        EXPLAIN_SYSTEM_UNKNOWN
     };
 
     let prompt = format!(

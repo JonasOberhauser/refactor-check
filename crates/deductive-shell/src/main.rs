@@ -1,3 +1,8 @@
+//! `#![allow(inline_literal)]`: the clap attribute literals accept
+//! neither named constants nor item-level allows — the sanctioned
+//! necessity escape; the exit codes below are named.
+#![allow(unknown_lints)]
+#![allow(inline_literal)]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -6,6 +11,9 @@ use clap::Parser;
 use refactor_check_core::protocols::{all_protocols, resolve_active_server, StatusSnapshot};
 use refactor_check_core::status_layer::{spawn_status_poller, StatusLayer, LogSink};
 use servatui_display::Display;
+
+/// Exit codes for user-facing failures.
+const EXIT_USAGE: i32 = 1;
 
 #[derive(Parser)]
 #[command(
@@ -27,7 +35,7 @@ fn main() {
             "No active deductive-check server found at {}. Is deductive-check running?",
             cli.socket_path.display()
         );
-        std::process::exit(1);
+        std::process::exit(EXIT_USAGE);
     };
     if socket != cli.socket_path {
         eprintln!("deductive-shell: connecting to {}", socket.display());
@@ -46,6 +54,6 @@ fn main() {
     let protocols = all_protocols(&socket);
     if let Err(e) = display.run(&socket, &protocols) {
         eprintln!("{e}");
-        std::process::exit(1);
+        std::process::exit(EXIT_USAGE);
     }
 }

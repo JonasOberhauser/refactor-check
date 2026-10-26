@@ -3,10 +3,26 @@ use deductive_check::core_provider::IOProvider;
 use deductive_check::provider::{CliRustAnalyzerProvider, RustAnalyzerRequest, RustAnalyzerResponse};
 use std::path::PathBuf;
 
+/// Test-fixture project layout.
+const TESTS_DIR: &str = "tests";
+const TEST_DUMMY_DIR: &str = "test_dummy";
+const SRC_DIR: &str = "src";
+const LIB_RS_FILE: &str = "lib.rs";
+/// Function names expected in the listing.
+const INCREMENT_FN_NAME: &str = "increment";
+const RAW_PTR_FN_NAME: &str = "raw_ptr";
+const PROCESS_FN_NAME: &str = "process";
+const WITH_DOCS_GUARANTEE_FN_NAME: &str = "with_docs_guarantee";
+const READ_PTR_FN_NAME: &str = "read_ptr";
+const WITH_DOC_ATTR_FN_NAME: &str = "with_doc_attr";
+const CALLS_PRECONDITION_FN_NAME: &str = "calls_precondition_fn";
+const SAFE_READ_FN_NAME: &str = "safe_read";
+const WITH_PRECONDITIONS_FN_NAME: &str = "with_preconditions";
+
 fn test_dummy_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("test_dummy")
+        .join(TESTS_DIR)
+        .join(TEST_DUMMY_DIR)
 }
 
 fn listed_function_names(functions: &[deductive_check::provider::FunctionInfo]) -> Vec<String> {
@@ -21,7 +37,7 @@ fn test_excludes_test_functions() {
     let provider = CliRustAnalyzerProvider::new(path.to_string_lossy().to_string())
         .expect("Failed to create provider for test_dummy");
 
-    let lib_path = path.join("src").join("lib.rs");
+    let lib_path = path.join(SRC_DIR).join(LIB_RS_FILE);
     let resp = provider
         .invoke(RustAnalyzerRequest::ListFunctions {
             files: vec![lib_path],
@@ -106,7 +122,7 @@ fn test_verification_feature_functions() {
     let provider = CliRustAnalyzerProvider::new(path.to_string_lossy().to_string())
         .expect("Failed to create provider for test_dummy");
 
-    let lib_path = path.join("src").join("lib.rs");
+    let lib_path = path.join(SRC_DIR).join(LIB_RS_FILE);
     let resp = provider
         .invoke(RustAnalyzerRequest::ListFunctions {
             files: vec![lib_path],
@@ -135,7 +151,7 @@ fn test_has_guarantees_detection() {
     let provider = CliRustAnalyzerProvider::new(path.to_string_lossy().to_string())
         .expect("Failed to create provider for test_dummy");
 
-    let lib_path = path.join("src").join("lib.rs");
+    let lib_path = path.join(SRC_DIR).join(LIB_RS_FILE);
     let resp = provider
         .invoke(RustAnalyzerRequest::ListFunctions {
             files: vec![lib_path],
@@ -195,7 +211,7 @@ fn test_impl_for_detection() {
     let provider = CliRustAnalyzerProvider::new(path.to_string_lossy().to_string())
         .expect("Failed to create provider for test_dummy");
 
-    let lib_path = path.join("src").join("lib.rs");
+    let lib_path = path.join(SRC_DIR).join(LIB_RS_FILE);
     let resp = provider
         .invoke(RustAnalyzerRequest::ListFunctions {
             files: vec![lib_path],
@@ -211,7 +227,7 @@ fn test_impl_for_detection() {
 
     let counter_methods: Vec<_> = functions
         .iter()
-        .filter(|f| f.id.name == "increment" || f.id.name == "raw_ptr")
+        .filter(|f| f.id.name == INCREMENT_FN_NAME || f.id.name == RAW_PTR_FN_NAME)
         .collect();
 
     for method in &counter_methods {
@@ -230,7 +246,7 @@ fn test_impl_for_detection() {
 
     let trait_impl: Vec<_> = functions
         .iter()
-        .filter(|f| f.id.name == "process")
+        .filter(|f| f.id.name == PROCESS_FN_NAME)
         .collect();
 
     for method in &trait_impl {
@@ -247,7 +263,7 @@ fn test_fetch_docs_returns_doc_comments() {
     let provider = CliRustAnalyzerProvider::new(path.to_string_lossy().to_string())
         .expect("Failed to create provider for test_dummy");
 
-    let lib_path = path.join("src").join("lib.rs");
+    let lib_path = path.join(SRC_DIR).join(LIB_RS_FILE);
     let resp = provider
         .invoke(RustAnalyzerRequest::ListFunctions {
             files: vec![lib_path],
@@ -261,14 +277,14 @@ fn test_fetch_docs_returns_doc_comments() {
         _ => panic!("Expected FunctionList"),
     };
 
-    let with_docs_guarantee = functions.iter().find(|f| f.id.name == "with_docs_guarantee")
+    let with_docs_guarantee = functions.iter().find(|f| f.id.name == WITH_DOCS_GUARANTEE_FN_NAME)
         .expect("should find with_docs_guarantee");
     assert!(
         with_docs_guarantee.docs.contains("Guarantees"),
         "docs should contain 'Guarantees', got: {:?}", with_docs_guarantee.docs
     );
 
-    let read_ptr = functions.iter().find(|f| f.id.name == "read_ptr")
+    let read_ptr = functions.iter().find(|f| f.id.name == READ_PTR_FN_NAME)
         .expect("should find read_ptr");
     assert!(
         read_ptr.docs.contains("Safety"),
@@ -282,7 +298,7 @@ fn test_fetch_docs_includes_doc_attrs() {
     let provider = CliRustAnalyzerProvider::new(path.to_string_lossy().to_string())
         .expect("Failed to create provider for test_dummy");
 
-    let lib_path = path.join("src").join("lib.rs");
+    let lib_path = path.join(SRC_DIR).join(LIB_RS_FILE);
     let resp = provider
         .invoke(RustAnalyzerRequest::ListFunctions {
             files: vec![lib_path],
@@ -296,7 +312,7 @@ fn test_fetch_docs_includes_doc_attrs() {
         _ => panic!("Expected FunctionList"),
     };
 
-    let with_doc_attr = functions.iter().find(|f| f.id.name == "with_doc_attr")
+    let with_doc_attr = functions.iter().find(|f| f.id.name == WITH_DOC_ATTR_FN_NAME)
         .expect("should find with_doc_attr");
     assert!(
         with_doc_attr.docs.contains("Ensures"),
@@ -310,7 +326,7 @@ fn test_has_guarantees_via_outgoing_calls() {
     let provider = CliRustAnalyzerProvider::new(path.to_string_lossy().to_string())
         .expect("Failed to create provider for test_dummy");
 
-    let lib_path = path.join("src").join("lib.rs");
+    let lib_path = path.join(SRC_DIR).join(LIB_RS_FILE);
     let resp = provider
         .invoke(RustAnalyzerRequest::ListFunctions {
             files: vec![lib_path],
@@ -324,7 +340,7 @@ fn test_has_guarantees_via_outgoing_calls() {
         _ => panic!("Expected FunctionList"),
     };
 
-    let calls_precondition_fn = functions.iter().find(|f| f.id.name == "calls_precondition_fn")
+    let calls_precondition_fn = functions.iter().find(|f| f.id.name == CALLS_PRECONDITION_FN_NAME)
         .expect("should find calls_precondition_fn");
     assert!(
         calls_precondition_fn.has_guarantees,
@@ -333,7 +349,7 @@ fn test_has_guarantees_via_outgoing_calls() {
         calls_precondition_fn.docs,
     );
 
-    let safe_read = functions.iter().find(|f| f.id.name == "safe_read")
+    let safe_read = functions.iter().find(|f| f.id.name == SAFE_READ_FN_NAME)
         .expect("should find safe_read");
     assert!(
         safe_read.has_guarantees,
@@ -348,7 +364,7 @@ fn test_preconditions_detected_in_docs() {
     let provider = CliRustAnalyzerProvider::new(path.to_string_lossy().to_string())
         .expect("Failed to create provider for test_dummy");
 
-    let lib_path = path.join("src").join("lib.rs");
+    let lib_path = path.join(SRC_DIR).join(LIB_RS_FILE);
     let resp = provider
         .invoke(RustAnalyzerRequest::ListFunctions {
             files: vec![lib_path],
@@ -362,7 +378,7 @@ fn test_preconditions_detected_in_docs() {
         _ => panic!("Expected FunctionList"),
     };
 
-    let with_preconditions = functions.iter().find(|f| f.id.name == "with_preconditions")
+    let with_preconditions = functions.iter().find(|f| f.id.name == WITH_PRECONDITIONS_FN_NAME)
         .expect("should find with_preconditions");
     assert!(
         with_preconditions.docs.contains("Preconditions"),

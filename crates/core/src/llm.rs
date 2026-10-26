@@ -55,12 +55,12 @@ impl SyncChatClient {
     }
 
     fn open_stream(&self, body: &serde_json::Value) -> Result<SseStream, String> {
-        let url = format!("{}/chat/completions", self.api_base.trim_end_matches('/'));
+        let url = format!("{}{}", self.api_base.trim_end_matches(URL_PATH_SEPARATOR), CHAT_COMPLETIONS_PATH);
         match self
             .agent
             .post(&url)
-            .set("Authorization", &format!("Bearer {}", self.api_key))
-            .set("Accept", "text/event-stream")
+            .set(HEADER_AUTHORIZATION, &format!("Bearer {}", self.api_key))
+            .set(HEADER_ACCEPT, MIME_EVENT_STREAM)
             .send_json(body.clone())
         {
             Ok(response) => Ok(SseStream::new(response)),
@@ -105,9 +105,9 @@ impl SseStream {
                 match lines.next() {
                     Some(Ok(line)) => {
                         let line = line.trim_start();
-                        if let Some(payload) = line.strip_prefix("data:") {
+                        if let Some(payload) = line.strip_prefix(SSE_DATA_PREFIX) {
                             let payload = payload.trim();
-                            if payload == "[DONE]" {
+                            if payload == SSE_DONE {
                                 break;
                             }
                             if !payload.is_empty() && tx.send(SseEvent::Data(payload.to_string())).is_err() {
@@ -168,6 +168,77 @@ use crate::error_gate::ErrorGate;
 use crate::live_config::LiveConfig;
 use crate::provider::{IOProvider, LlmRequest, LlmRole, WithContext};
 
+/// Wire constants: HTTP headers, SSE framing, JSON keys, role labels.
+const HEADER_AUTHORIZATION: &str = "Authorization";
+const HEADER_ACCEPT: &str = "Accept";
+const MIME_EVENT_STREAM: &str = "text/event-stream";
+const URL_PATH_SEPARATOR: &str = "/";
+const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
+const SSE_DATA_PREFIX: &str = "data:";
+const SSE_DONE: &str = "[DONE]";
+const KEY_MODEL: &str = "model";
+const KEY_MESSAGES: &str = "messages";
+const KEY_STREAM: &str = "stream";
+const KEY_SERVICE_TIER: &str = "service_tier";
+const KEY_ROLE: &str = "role";
+const KEY_CONTENT: &str = "content";
+const ROLE_SYSTEM: &str = "system";
+const ROLE_USER: &str = "user";
+const ROLE_ASSISTANT: &str = "assistant";
+/// Role tracing labels and judge verdicts.
+const LABEL_FORMALIZER: &str = "formalizer";
+const LABEL_FIXER: &str = "fixer";
+const LABEL_JUDGE: &str = "judge";
+const LABEL_SPLITTER: &str = "splitter";
+const LABEL_SPLITTING_JUDGE: &str = "splitting_judge";
+const LABEL_ANALYZER: &str = "analyzer";
+const VERDICT_REASONABLE: &str = "REASONABLE";
+const VERDICT_RETRY: &str = "RETRY";
+const SPAN_FIELD_MODEL: &str = "model";
+/// Rate-limit signatures in error bodies.
+const SIG_RATE_LIMIT: &str = "rate limit";
+const SIG_RATE_LIMIT_SLASH: &str = "rate_limit";
+const SIG_TOO_MANY_REQUESTS: &str = "too many requests";
+const SIG_HTTP_429: &str = "code: 429";
+const SIG_CODE_1302: &str = "code: 1302";
+const SIG_CODE_1305: &str = "code: 1305";
+/// Backoff/retry/timeout knobs.
+const TRANSIENT_BACKOFF_START_SECS: u64 = 5;
+const TRANSIENT_BACKOFF_MAX_SECS: u64 = 120;
+const CTX_STREAM_FAILED: &str = "LLM streaming request failed after all retries";
+const RETRY_PAUSE_SECS: u64 = 2;
+const JITTER_BOUND: u128 = 3;
+const HEARTBEAT_EMPTIES: u64 = 1000;
+const EMPTY_CHUNKS_RESET: u64 = 0;
+const NO_BYTES_RECEIVED: usize = 0;
+const FIRST_CONTENT_TIMEOUT_FACTOR: u32 = 4;
+const DEFAULT_STREAM_TIMEOUT_MS: u64 = 3000;
+const DEFAULT_MAX_STREAM_RETRIES: u32 = 5;
+/// Log prefix markers and line join.
+const LOG_PREFIX_RESPONSE: &str = "<\t";
+const LOG_PREFIX_MESSAGE: &str = ">\t";
+const LINE_JOIN: &str = "\n";
+/// Debug field labels and the redaction placeholder.
+const DEBUG_STRUCT_NAME: &str = "LlmConfig";
+const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
+const FIELD_API_KEY: &str = "api_key";
+const FIELD_JUDGE_API_KEY: &str = "judge_api_key";
+const FIELD_FORMALIZER_API_KEY: &str = "formalizer_api_key";
+const FIELD_FIXER_API_KEY: &str = "fixer_api_key";
+const FIELD_SPLITTER_API_KEY: &str = "splitter_api_key";
+const FIELD_SPLITTING_JUDGE_API_KEY: &str = "splitting_judge_api_key";
+const FIELD_ANALYZER_API_KEY: &str = "analyzer_api_key";
+const FIELD_API_BASE: &str = "api_base";
+const FIELD_SERVICE_TIER: &str = "service_tier";
+const FIELD_STREAM_TIMEOUT: &str = "stream_timeout_ms";
+const FIELD_MAX_RETRIES: &str = "max_stream_retries";
+const FIELD_FORMALIZER_MODEL: &str = "formalizer_model";
+const FIELD_FIXER_MODEL: &str = "fixer_model";
+const FIELD_JUDGE_MODEL: &str = "judge_model";
+const FIELD_SPLITTING_JUDGE_MODEL: &str = "splitting_judge_model";
+const FIELD_SPLITTER_MODEL: &str = "splitter_model";
+const FIELD_ANALYZER_MODEL: &str = "analyzer_model";
+
 #[derive(Debug, Clone, Copy)]
 pub enum Role {
     System,
@@ -215,11 +286,11 @@ pub struct LlmConfig {
 }
 
 fn default_stream_timeout_ms() -> u64 {
-    3000
+    DEFAULT_STREAM_TIMEOUT_MS
 }
 
 fn default_max_stream_retries() -> u32 {
-    5
+    DEFAULT_MAX_STREAM_RETRIES
 }
 
 fn default_service_tier() -> ServiceTier {
@@ -252,24 +323,24 @@ impl Default for LlmConfig {
 
 impl fmt::Debug for LlmConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LlmConfig")
-            .field("api_key", &"[REDACTED]")
-            .field("judge_api_key", &self.judge_api_key.as_ref().map(|_| "[REDACTED]"))
-            .field("formalizer_api_key", &self.formalizer_api_key.as_ref().map(|_| "[REDACTED]"))
-            .field("fixer_api_key", &self.fixer_api_key.as_ref().map(|_| "[REDACTED]"))
-            .field("splitter_api_key", &self.splitter_api_key.as_ref().map(|_| "[REDACTED]"))
-            .field("splitting_judge_api_key", &self.splitting_judge_api_key.as_ref().map(|_| "[REDACTED]"))
-            .field("analyzer_api_key", &self.analyzer_api_key.as_ref().map(|_| "[REDACTED]"))
-            .field("api_base", &self.api_base)
-            .field("formalizer_model", &self.formalizer_model)
-            .field("fixer_model", &self.fixer_model)
-            .field("judge_model", &self.judge_model)
-            .field("splitting_judge_model", &self.splitting_judge_model)
-            .field("splitter_model", &self.splitter_model)
-            .field("analyzer_model", &self.analyzer_model)
-            .field("stream_timeout_ms", &self.stream_timeout_ms)
-            .field("max_stream_retries", &self.max_stream_retries)
-            .field("service_tier", &self.service_tier)
+        f.debug_struct(DEBUG_STRUCT_NAME)
+            .field(FIELD_API_KEY, &REDACTED_PLACEHOLDER)
+            .field(FIELD_JUDGE_API_KEY, &self.judge_api_key.as_ref().map(|_| REDACTED_PLACEHOLDER))
+            .field(FIELD_FORMALIZER_API_KEY, &self.formalizer_api_key.as_ref().map(|_| REDACTED_PLACEHOLDER))
+            .field(FIELD_FIXER_API_KEY, &self.fixer_api_key.as_ref().map(|_| REDACTED_PLACEHOLDER))
+            .field(FIELD_SPLITTER_API_KEY, &self.splitter_api_key.as_ref().map(|_| REDACTED_PLACEHOLDER))
+            .field(FIELD_SPLITTING_JUDGE_API_KEY, &self.splitting_judge_api_key.as_ref().map(|_| REDACTED_PLACEHOLDER))
+            .field(FIELD_ANALYZER_API_KEY, &self.analyzer_api_key.as_ref().map(|_| REDACTED_PLACEHOLDER))
+            .field(FIELD_API_BASE, &self.api_base)
+            .field(FIELD_FORMALIZER_MODEL, &self.formalizer_model)
+            .field(FIELD_FIXER_MODEL, &self.fixer_model)
+            .field(FIELD_JUDGE_MODEL, &self.judge_model)
+            .field(FIELD_SPLITTING_JUDGE_MODEL, &self.splitting_judge_model)
+            .field(FIELD_SPLITTER_MODEL, &self.splitter_model)
+            .field(FIELD_ANALYZER_MODEL, &self.analyzer_model)
+            .field(FIELD_STREAM_TIMEOUT, &self.stream_timeout_ms)
+            .field(FIELD_MAX_RETRIES, &self.max_stream_retries)
+            .field(FIELD_SERVICE_TIER, &self.service_tier)
             .finish()
     }
 }
@@ -323,7 +394,7 @@ impl ConnectionTracer {
 
     fn on_content(&mut self, label: &str, text: &str) -> u64 {
         let skipped = self.empty_chunks;
-        self.empty_chunks = 0;
+        self.empty_chunks = EMPTY_CHUNKS_RESET;
         self.total_content_bytes += text.len() as u64;
         trace!(%label, content_len = text.len(), empties_since_last = skipped, content = %text, "SSE content chunk");
         skipped
@@ -331,7 +402,7 @@ impl ConnectionTracer {
 
     fn on_empty(&mut self, label: &str) {
         self.empty_chunks += 1;
-        if self.empty_chunks.is_multiple_of(1000) {
+        if self.empty_chunks.is_multiple_of(HEARTBEAT_EMPTIES) {
             trace!(%label, total_empty_chunks = self.empty_chunks, total_content_bytes = self.total_content_bytes, "SSE heartbeat");
         }
     }
@@ -339,12 +410,12 @@ impl ConnectionTracer {
 
 fn is_rate_limit(reason: &str) -> bool {
     let lower = reason.to_lowercase();
-    lower.contains("rate limit")
-        || lower.contains("rate_limit")
-        || lower.contains("too many requests")
-        || lower.contains("code: 429")
-        || lower.contains("code: 1302")
-        || lower.contains("code: 1305")
+    lower.contains(SIG_RATE_LIMIT)
+        || lower.contains(SIG_RATE_LIMIT_SLASH)
+        || lower.contains(SIG_TOO_MANY_REQUESTS)
+        || lower.contains(SIG_HTTP_429)
+        || lower.contains(SIG_CODE_1302)
+        || lower.contains(SIG_CODE_1305)
 }
 
 fn rand_random() -> u128 {
@@ -387,17 +458,17 @@ impl<'a> StreamHandler<'a> {
         is_valid: &impl Fn(&str) -> bool,
     ) -> Result<String> {
         let mut attempt: u32 = 0;
-        let mut transient_backoff_secs: u64 = 5;
+        let mut transient_backoff_secs: u64 = TRANSIENT_BACKOFF_START_SECS;
         loop {
             if attempt > 0 {
-                std::thread::sleep(Duration::from_secs(2));
+                std::thread::sleep(Duration::from_secs(RETRY_PAUSE_SECS));
             }
 
             let request = serde_json::json!({
-                "model": model,
-                "messages": request_messages,
-                "stream": true,
-                "service_tier": self.service_tier,
+                KEY_MODEL: model,
+                KEY_MESSAGES: request_messages,
+                KEY_STREAM: true,
+                KEY_SERVICE_TIER: self.service_tier,
             });
 
             debug!(%self.label, %self.context_id, attempt, "sending LLM streaming request");
@@ -405,15 +476,15 @@ impl<'a> StreamHandler<'a> {
             let stream = loop {
                 match self.client.open_stream(&request) {
                     Ok(s) => {
-                        transient_backoff_secs = 5;
+                        transient_backoff_secs = TRANSIENT_BACKOFF_START_SECS;
                         break s;
                     }
                     Err(reason) => {
                         if is_rate_limit(&reason) {
-                            let jitter = (rand_random() % 3) as u64;
-                            warn!(%self.label, %self.context_id, bytes = 0usize, backoff_secs = transient_backoff_secs + jitter, reason, "LLM transient error, retrying without incrementing attempt");
+                            let jitter = (rand_random() % JITTER_BOUND) as u64;
+                            warn!(%self.label, %self.context_id, bytes = NO_BYTES_RECEIVED, backoff_secs = transient_backoff_secs + jitter, reason, "LLM transient error, retrying without incrementing attempt");
                             std::thread::sleep(Duration::from_secs(transient_backoff_secs + jitter));
-                            transient_backoff_secs = (transient_backoff_secs * 2).min(120);
+                            transient_backoff_secs = (transient_backoff_secs * 2).min(TRANSIENT_BACKOFF_MAX_SECS);
                             continue;
                         }
                         if attempt < self.max_retries {
@@ -422,7 +493,7 @@ impl<'a> StreamHandler<'a> {
                             continue;
                         }
                         return Err(anyhow::anyhow!(reason))
-                            .context("LLM streaming request failed after all retries");
+                            .context(CTX_STREAM_FAILED);
                     }
                 }
             };
@@ -436,7 +507,7 @@ impl<'a> StreamHandler<'a> {
             let mut transient_retry = false;
 
             loop {
-                let current_timeout = if got_first_content { self.timeout } else { self.timeout * 4 };
+                let current_timeout = if got_first_content { self.timeout } else { self.timeout * FIRST_CONTENT_TIMEOUT_FACTOR };
                 match stream.next_event(current_timeout) {
                     Some(SseEvent::Data(payload)) => {
                         if payload.is_empty() {
@@ -470,10 +541,10 @@ impl<'a> StreamHandler<'a> {
                     }
                     Some(SseEvent::Error(reason)) => {
                         if is_rate_limit(&reason) && content.is_empty() {
-                            let jitter = (rand_random() % 3) as u64;
-                            warn!(%self.label, %self.context_id, bytes = 0usize, backoff_secs = transient_backoff_secs + jitter, reason, "LLM transient error, retrying without incrementing attempt");
+                            let jitter = (rand_random() % JITTER_BOUND) as u64;
+                            warn!(%self.label, %self.context_id, bytes = NO_BYTES_RECEIVED, backoff_secs = transient_backoff_secs + jitter, reason, "LLM transient error, retrying without incrementing attempt");
                             std::thread::sleep(Duration::from_secs(transient_backoff_secs + jitter));
-                            transient_backoff_secs = (transient_backoff_secs * 2).min(120);
+                            transient_backoff_secs = (transient_backoff_secs * 2).min(TRANSIENT_BACKOFF_MAX_SECS);
                             transient_retry = true;
                             break;
                         }
@@ -545,7 +616,11 @@ impl<'a> StreamHandler<'a> {
         }
         let content = content.trim().to_string();
         info!(%self.label, %self.context_id, bytes = content.len(), "LLM response received");
-        let prefixed_response: String = content.lines().map(|l| format!("<\t{l}")).collect::<Vec<_>>().join("\n");
+        let prefixed_response: String = content
+            .lines()
+            .map(|l| format!("{LOG_PREFIX_RESPONSE}{l}"))
+            .collect::<Vec<_>>()
+            .join(LINE_JOIN);
         debug!(%self.label, %self.context_id, content = %prefixed_response, "full LLM response");
         Ok(content)
     }
@@ -598,10 +673,10 @@ impl LlmClient {
     #[instrument(skip_all, fields(model))]
     pub fn chat_formalizer(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
         let config = self.ensure_current();
-        let _span = tracing::Span::current().record("model", &config.formalizer_model);
+        let _span = tracing::Span::current().record(SPAN_FIELD_MODEL, &config.formalizer_model);
         let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).formalizer.clone();
         self.chat_inner(
-            ChatCtx { label: "formalizer", client: &client, model: &config.formalizer_model, config: &config, context_id },
+            ChatCtx { label: LABEL_FORMALIZER, client: &client, model: &config.formalizer_model, config: &config, context_id },
             messages,
             |content| !content.trim().is_empty(),
         )
@@ -610,10 +685,10 @@ impl LlmClient {
     #[instrument(skip_all, fields(model))]
     pub fn chat_fixer(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
         let config = self.ensure_current();
-        let _span = tracing::Span::current().record("model", &config.fixer_model);
+        let _span = tracing::Span::current().record(SPAN_FIELD_MODEL, &config.fixer_model);
         let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).fixer.clone();
         self.chat_inner(
-            ChatCtx { label: "fixer", client: &client, model: &config.fixer_model, config: &config, context_id },
+            ChatCtx { label: LABEL_FIXER, client: &client, model: &config.fixer_model, config: &config, context_id },
             messages,
             |content| !content.trim().is_empty(),
         )
@@ -622,15 +697,15 @@ impl LlmClient {
     #[instrument(skip_all, fields(model))]
     pub fn chat_judge(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
         let config = self.ensure_current();
-        let _span = tracing::Span::current().record("model", &config.judge_model);
+        let _span = tracing::Span::current().record(SPAN_FIELD_MODEL, &config.judge_model);
         let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).judge.clone();
         self.chat_inner(
-            ChatCtx { label: "judge", client: &client, model: &config.judge_model, config: &config, context_id },
+            ChatCtx { label: LABEL_JUDGE, client: &client, model: &config.judge_model, config: &config, context_id },
             messages,
             |content| {
                 let upper = content.trim().to_uppercase();
                 let trimmed = upper.trim_start_matches(|c: char| !c.is_alphabetic());
-                trimmed.starts_with("REASONABLE") || trimmed.starts_with("RETRY")
+                trimmed.starts_with(VERDICT_REASONABLE) || trimmed.starts_with(VERDICT_RETRY)
             },
         )
     }
@@ -638,10 +713,10 @@ impl LlmClient {
     #[instrument(skip_all, fields(model))]
     pub fn chat_splitter(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
         let config = self.ensure_current();
-        let _span = tracing::Span::current().record("model", &config.splitter_model);
+        let _span = tracing::Span::current().record(SPAN_FIELD_MODEL, &config.splitter_model);
         let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).splitter.clone();
         self.chat_inner(
-            ChatCtx { label: "splitter", client: &client, model: &config.splitter_model, config: &config, context_id },
+            ChatCtx { label: LABEL_SPLITTER, client: &client, model: &config.splitter_model, config: &config, context_id },
             messages,
             |content| !content.trim().is_empty(),
         )
@@ -650,15 +725,15 @@ impl LlmClient {
     #[instrument(skip_all, fields(model))]
     pub fn chat_splitting_judge(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
         let config = self.ensure_current();
-        let _span = tracing::Span::current().record("model", &config.splitting_judge_model);
+        let _span = tracing::Span::current().record(SPAN_FIELD_MODEL, &config.splitting_judge_model);
         let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).splitting_judge.clone();
         self.chat_inner(
-            ChatCtx { label: "splitting_judge", client: &client, model: &config.splitting_judge_model, config: &config, context_id },
+            ChatCtx { label: LABEL_SPLITTING_JUDGE, client: &client, model: &config.splitting_judge_model, config: &config, context_id },
             messages,
             |content| {
                 let upper = content.trim().to_uppercase();
                 let trimmed = upper.trim_start_matches(|c: char| !c.is_alphabetic());
-                trimmed.starts_with("REASONABLE") || trimmed.starts_with("RETRY")
+                trimmed.starts_with(VERDICT_REASONABLE) || trimmed.starts_with(VERDICT_RETRY)
             },
         )
     }
@@ -666,10 +741,10 @@ impl LlmClient {
     #[instrument(skip_all, fields(model))]
     pub fn chat_analyzer(&self, messages: Vec<Message>, context_id: &ContextId) -> Result<String> {
         let config = self.ensure_current();
-        let _span = tracing::Span::current().record("model", &config.analyzer_model);
+        let _span = tracing::Span::current().record(SPAN_FIELD_MODEL, &config.analyzer_model);
         let client = self.clients.read().unwrap_or_else(|e| e.into_inner()).analyzer.clone();
         self.chat_inner(
-            ChatCtx { label: "analyzer", client: &client, model: &config.analyzer_model, config: &config, context_id },
+            ChatCtx { label: LABEL_ANALYZER, client: &client, model: &config.analyzer_model, config: &config, context_id },
             messages,
             |content| !content.trim().is_empty(),
         )
@@ -684,22 +759,27 @@ impl LlmClient {
         let ChatCtx { label, client, model, config, context_id } = ctx;
         for msg in &messages {
             if !matches!(msg.role, Role::System) {
-                let prefixed: String = msg.content.lines().map(|l| format!(">\t{l}")).collect::<Vec<_>>().join("\n");
+                let prefixed: String = msg
+            .content
+            .lines()
+            .map(|l| format!("{LOG_PREFIX_MESSAGE}{l}"))
+            .collect::<Vec<_>>()
+            .join(LINE_JOIN);
                 debug!(%label, %context_id, role = ?msg.role, content = %prefixed, "LLM message");
             }
         }
 
         let role_str = |role: Role| match role {
-            Role::System => "system",
-            Role::User => "user",
-            Role::Assistant => "assistant",
+            Role::System => ROLE_SYSTEM,
+            Role::User => ROLE_USER,
+            Role::Assistant => ROLE_ASSISTANT,
         };
         let request_messages: Vec<serde_json::Value> = messages
             .into_iter()
             .map(|msg| {
                 serde_json::json!({
-                    "role": role_str(msg.role),
-                    "content": msg.content,
+                    KEY_ROLE: role_str(msg.role),
+                    KEY_CONTENT: msg.content,
                 })
             })
             .collect();

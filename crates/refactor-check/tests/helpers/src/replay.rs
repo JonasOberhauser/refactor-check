@@ -5,6 +5,14 @@ use anyhow::Result;
 use refactor_check::provider::{IOProvider, LlmRequest, LlmRole, SolverRequest, WithContext};
 use refactor_check::smt::{SolverOutcome, SolverResult};
 
+/// Role names for replay diagnostics.
+const ROLE_SPLITTER: &str = "Splitter";
+const ROLE_SPLITTING_JUDGE: &str = "SplittingJudge";
+const ROLE_FORMALIZER: &str = "Formalizer";
+const ROLE_FIXER: &str = "Fixer";
+const ROLE_JUDGE: &str = "Judge";
+const ROLE_ANALYZER: &str = "Analyzer";
+
 pub struct LogReplayLlm {
     formalizer: Arc<Mutex<Vec<String>>>,
     fixer: Arc<Mutex<Vec<String>>>,
@@ -73,12 +81,12 @@ impl IOProvider<LlmRequest, WithContext<String>> for LogReplayLlm {
     fn invoke(&self, input: LlmRequest) -> Result<WithContext<String>> {
         let LlmRequest { role, context_id, .. } = input;
         let value = match role {
-            LlmRole::Splitter => Self::take_first(&self.splitter, "Splitter")?,
-            LlmRole::SplittingJudge => Self::take_first(&self.splitting_judge, "SplittingJudge")?,
-            LlmRole::Formalizer => Self::take_first(&self.formalizer, "Formalizer")?,
-            LlmRole::Fixer => Self::take_first(&self.fixer, "Fixer")?,
-            LlmRole::Judge => Self::take_first(&self.judge, "Judge")?,
-            LlmRole::Analyzer => Self::take_first(&self.analyzer, "Analyzer")?,
+            LlmRole::Splitter => Self::take_first(&self.splitter, ROLE_SPLITTER)?,
+            LlmRole::SplittingJudge => Self::take_first(&self.splitting_judge, ROLE_SPLITTING_JUDGE)?,
+            LlmRole::Formalizer => Self::take_first(&self.formalizer, ROLE_FORMALIZER)?,
+            LlmRole::Fixer => Self::take_first(&self.fixer, ROLE_FIXER)?,
+            LlmRole::Judge => Self::take_first(&self.judge, ROLE_JUDGE)?,
+            LlmRole::Analyzer => Self::take_first(&self.analyzer, ROLE_ANALYZER)?,
         };
         Ok(WithContext { value, context_id })
     }

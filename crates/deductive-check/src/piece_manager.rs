@@ -161,8 +161,21 @@ mod tests {
     use crate::phase::{CodePiecePhase, FormulaPhase};
     use std::path::PathBuf;
 
+    const TEST_FILE: &str = "test.rs";
+    const TRANSITIONS_FN_NAME: &str = "foo";
+    const INVALID_TRANSITION_FN_NAME: &str = "bar";
+    const FORMULA_TRANSITIONS_FN_NAME: &str = "baz";
+    const FIX_LOOP_FN_NAME: &str = "qux";
+    const FIX_RETRY_FN_NAME: &str = "fix_retry";
+    const FORMALIZER_FN_NAME: &str = "quux";
+    const PIECE_START_LINE: u32 = 1;
+    const PIECE_END_LINE: u32 = 5;
+    const TALL_PIECE_END_LINE: u32 = 10;
+    const PIECE_CODE: &str = "code";
+    const SMT_CHECK_SAT: &str = "(check-sat)";
+
     fn make_function_id(name: &str) -> FunctionId {
-        FunctionId::new(PathBuf::from("test.rs"), name, None, 1)
+        FunctionId::new(PathBuf::from(TEST_FILE), name, None, PIECE_START_LINE)
     }
 
     #[test]
@@ -171,11 +184,11 @@ mod tests {
         let root = ContextId::root();
         let (_piece, ctx) = pm.new_piece(
             root,
-            PathBuf::from("test.rs"),
-            make_function_id("foo"),
-            1,
-            10,
-            "code".to_string(),
+            PathBuf::from(TEST_FILE),
+            make_function_id(TRANSITIONS_FN_NAME),
+            PIECE_START_LINE,
+            TALL_PIECE_END_LINE,
+            PIECE_CODE.to_string(),
         );
 
         assert_eq!(pm.piece_phase(&ctx), Some(CodePiecePhase::Open));
@@ -203,11 +216,11 @@ mod tests {
         let root = ContextId::root();
         let (_piece, ctx) = pm.new_piece(
             root,
-            PathBuf::from("test.rs"),
-            make_function_id("bar"),
-            1,
-            5,
-            "code".to_string(),
+            PathBuf::from(TEST_FILE),
+            make_function_id(INVALID_TRANSITION_FN_NAME),
+            PIECE_START_LINE,
+            PIECE_END_LINE,
+            PIECE_CODE.to_string(),
         );
 
         pm.advance_piece(&ctx, Some(CodePiecePhase::Formalizer), CodePiecePhase::Check);
@@ -219,13 +232,13 @@ mod tests {
         let root = ContextId::root();
         let (_piece, ctx) = pm.new_piece(
             root,
-            PathBuf::from("test.rs"),
-            make_function_id("baz"),
-            1,
-            5,
-            "code".to_string(),
+            PathBuf::from(TEST_FILE),
+            make_function_id(FORMULA_TRANSITIONS_FN_NAME),
+            PIECE_START_LINE,
+            PIECE_END_LINE,
+            PIECE_CODE.to_string(),
         );
-        let (_formula, fctx) = pm.new_formula(&ctx, "(check-sat)".to_string(), FormulaSource::SmtLib, 0);
+        let (_formula, fctx) = pm.new_formula(&ctx, SMT_CHECK_SAT.to_string(), FormulaSource::SmtLib, 0);
 
         assert_eq!(pm.formula_phase(&fctx), Some(FormulaPhase::Open));
 
@@ -242,13 +255,13 @@ mod tests {
         let root = ContextId::root();
         let (_piece, ctx) = pm.new_piece(
             root,
-            PathBuf::from("test.rs"),
-            make_function_id("qux"),
-            1,
-            5,
-            "code".to_string(),
+            PathBuf::from(TEST_FILE),
+            make_function_id(FIX_LOOP_FN_NAME),
+            PIECE_START_LINE,
+            PIECE_END_LINE,
+            PIECE_CODE.to_string(),
         );
-        let (_formula, fctx) = pm.new_formula(&ctx, "(check-sat)".to_string(), FormulaSource::SmtLib, 0);
+        let (_formula, fctx) = pm.new_formula(&ctx, SMT_CHECK_SAT.to_string(), FormulaSource::SmtLib, 0);
 
         pm.advance_formula(&fctx, Some(FormulaPhase::Open), FormulaPhase::Check);
 
@@ -268,13 +281,13 @@ mod tests {
         let root = ContextId::root();
         let (_piece, ctx) = pm.new_piece(
             root,
-            PathBuf::from("test.rs"),
-            make_function_id("fix_retry"),
-            1,
-            5,
-            "code".to_string(),
+            PathBuf::from(TEST_FILE),
+            make_function_id(FIX_RETRY_FN_NAME),
+            PIECE_START_LINE,
+            PIECE_END_LINE,
+            PIECE_CODE.to_string(),
         );
-        let (_formula, fctx) = pm.new_formula(&ctx, "(check-sat)".to_string(), FormulaSource::SmtLib, 0);
+        let (_formula, fctx) = pm.new_formula(&ctx, SMT_CHECK_SAT.to_string(), FormulaSource::SmtLib, 0);
 
         pm.advance_formula(&fctx, Some(FormulaPhase::Open), FormulaPhase::Check);
         pm.advance_formula(&fctx, Some(FormulaPhase::Check), FormulaPhase::Fix);
@@ -296,11 +309,11 @@ mod tests {
         let root = ContextId::root();
         let (_piece, ctx) = pm.new_piece(
             root,
-            PathBuf::from("test.rs"),
-            make_function_id("quux"),
-            1,
-            5,
-            "code".to_string(),
+            PathBuf::from(TEST_FILE),
+            make_function_id(FORMALIZER_FN_NAME),
+            PIECE_START_LINE,
+            PIECE_END_LINE,
+            PIECE_CODE.to_string(),
         );
 
         pm.enter_piece_formalizer(&ctx, CodePiecePhase::GetContext);

@@ -1,3 +1,8 @@
+//! `#![allow(inline_literal)]`: this file's literals live in clap
+//! attribute positions, which accept neither named constants nor
+//! item-level allows — the sanctioned necessity escape.
+#![allow(unknown_lints)]
+#![allow(inline_literal)]
 use std::sync::Arc;
 
 use anyhow::Result;

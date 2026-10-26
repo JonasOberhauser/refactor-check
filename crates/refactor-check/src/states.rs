@@ -27,9 +27,12 @@ pub enum InsistState {
 }
 
 impl InsistState {
+    /// Attempts recorded before any insisting round.
+    const IDLE_ATTEMPTS: usize = 0;
+
     pub fn attempt(&self) -> usize {
         match self {
-            InsistState::Idle => 0,
+            InsistState::Idle => Self::IDLE_ATTEMPTS,
             InsistState::Insisting { attempt, .. } => *attempt,
         }
     }
