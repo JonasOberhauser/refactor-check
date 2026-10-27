@@ -2714,7 +2714,7 @@ dependencies = [
 [[package]]
 name = "servyi-states"
 version = "0.1.0"
-source = "git+https://github.com/servyi/states.git?branch=ctx-execute#be03d541380cfc0e66211c052b9c6935acd98c03"
+source = "git+https://github.com/servyi/states.git?branch=main#fdde54c37b7b4eac418b453429b8a1953bfe0cfd"
 dependencies = [
  "anyhow",
  "dashmap",

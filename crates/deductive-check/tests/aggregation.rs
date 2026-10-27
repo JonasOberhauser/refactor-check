@@ -232,16 +232,19 @@ struct Mocks {
 }
 
 impl Mocks {
-    fn providers(&self) -> Providers<'_> {
-        Providers {
-            llm: &self.llm,
-            solver: &self.solver,
-            rust_analyzer: &self.ra,
-            git: &self.git,
-            filesystem: &self.fs,
-            python: &self.python,
-            agent: &self.agent,
-        }
+    /// Leak the mocks once per test: the machine runs for the whole
+    /// workload under one pair, so its providers live for the process.
+    fn leaked_providers(self) -> &'static Providers<'static> {
+        let m: &'static Mocks = Box::leak(Box::new(self));
+        Box::leak(Box::new(Providers {
+            llm: &m.llm,
+            solver: &m.solver,
+            rust_analyzer: &m.ra,
+            git: &m.git,
+            filesystem: &m.fs,
+            python: &m.python,
+            agent: &m.agent,
+        }))
     }
 }
 
@@ -274,11 +277,13 @@ fn bug_report_survives_restart_cycle() {
         },
     };
 
-    let pm = DefaultDeductivePieceManager::default();
+    let providers = mocks.leaked_providers();
+    let pm: &'static DefaultDeductivePieceManager =
+        Box::leak(Box::new(DefaultDeductivePieceManager::default()));
     let result = machine::run(
         project.path().to_str().expect("utf8 temp path"),
-        &mocks.providers(),
-        &pm,
+        providers,
+        pm,
     )
     
     .expect("machine ran");
@@ -330,11 +335,13 @@ fn totals_reported_when_terminating_via_problem_analyzer() {
         },
     };
 
-    let pm = DefaultDeductivePieceManager::default();
+    let providers = mocks.leaked_providers();
+    let pm: &'static DefaultDeductivePieceManager =
+        Box::leak(Box::new(DefaultDeductivePieceManager::default()));
     let result = machine::run(
         project.path().to_str().expect("utf8 temp path"),
-        &mocks.providers(),
-        &pm,
+        providers,
+        pm,
     )
     
     .expect("machine ran");
@@ -378,13 +385,15 @@ fn no_formula_on_last_judge_attempt_does_not_panic() {
         },
     };
 
-    let pm = DefaultDeductivePieceManager::default();
     // Before the fix this panics inside process_piece; after, the piece
     // surfaces as unverified/bug.
+    let providers = mocks.leaked_providers();
+    let pm: &'static DefaultDeductivePieceManager =
+        Box::leak(Box::new(DefaultDeductivePieceManager::default()));
     let result = machine::run(
         project.path().to_str().expect("utf8 temp path"),
-        &mocks.providers(),
-        &pm,
+        providers,
+        pm,
     )
     
     .expect("machine must not panic; piece should surface as bug/unverified");

@@ -201,9 +201,9 @@ fn python_script_failure_goes_to_the_fixer_not_the_unknown_bucket() {
     let project = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(project.path().join(GIT_DIR)).expect("create .git marker");
 
-    let llm = MockLlm { fixer_prompts: Mutex::new(Vec::new()) };
+    let llm: &'static MockLlm = Box::leak(Box::new(MockLlm { fixer_prompts: Mutex::new(Vec::new()) }));
     let mocks = Providers {
-        llm: &llm,
+        llm,
         solver: &MockSolver,
         rust_analyzer: &MockRa,
         git: &MockGit,
@@ -212,11 +212,13 @@ fn python_script_failure_goes_to_the_fixer_not_the_unknown_bucket() {
         agent: &MockAgent,
     };
 
-    let pm = DefaultDeductivePieceManager::default();
+    let providers: &'static Providers<'static> = Box::leak(Box::new(mocks));
+    let pm: &'static DefaultDeductivePieceManager =
+        Box::leak(Box::new(DefaultDeductivePieceManager::default()));
     let result = machine::run(
         project.path().to_str().expect("utf8 temp path"),
-        &mocks,
-        &pm,
+        providers,
+        pm,
     )
     
     .expect("machine ran");

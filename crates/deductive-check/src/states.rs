@@ -1,12 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
 use refactor_check_core::context_id::ContextId;
-use servyi_states::checkpoint::Ctx;
-use servyi_states::state::{Context, State, Step};
+use servyi_states::state::{State, Step};
 use tracing::{debug, info, warn};
 
 use crate::code_piece::{ArcCodePiece, FunctionId};
@@ -76,43 +74,54 @@ pub struct MachineEnv<'a> {
     pub pm: &'a dyn crate::piece_manager::DeductivePieceManager,
 }
 
-/// Drive a phase's children through `ctx`: the fan-out lives in the
-/// calling state's `execute` — one dedicated thread per child, each
-/// child run to completion through its own handle, results landing in
-/// the children's slots, returned in spawn order. The first child
-/// error aborts the phase.
-fn run_child_batch<'e, K>(
-    ctx: &mut Ctx<'_, '_>,
-    children: &mut [Context<'e, K, MachineEnv<'e>>],
-    env: &MachineEnv<'e>,
-) -> Result<Vec<K>>
-where
-    K: Send + Sync + 'static,
-{
-    ctx.safepoint();
-    let first_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-    ctx.fanout(
-        children,
-        |mut child: servyi_states::checkpoint::Handle<'_, Context<'e, K, MachineEnv<'e>>>| {
-            match child.run_to_completion(env) {
-                Ok(result) => child.result = Some(result),
-                Err(e) => {
-                    let mut slot = first_error.lock().unwrap_or_else(|e| e.into_inner());
-                    if slot.is_none() {
-                        *slot = Some(e);
-                    }
-                }
-            }
-        },
-    );
-    if let Some(e) = first_error.into_inner().unwrap_or_else(|e| e.into_inner()) {
-        return Err(e);
-    }
-    Ok(children
-        .iter_mut()
-        .map(|c| c.result.take())
-        .collect::<Option<Vec<_>>>()
-        .unwrap_or_else(|| unreachable!("every child ran to completion and landed")))
+/// What one fan-out child lands: a splitter worker's pieces, or a
+/// formalizer worker's piece outcome. One landing type, so the phase
+/// driving needs no per-phase machinery.
+pub enum Landed {
+    /// A splitter child's pieces for one function.
+    Pieces(Vec<(ArcCodePiece, ContextId)>),
+    /// A formalizer child's outcome for one piece.
+    Outcome(Box<PieceOutcome>),
+}
+
+/// What a linear state yields: spawn a fan-out phase, or finish the
+/// machine.
+pub enum Signal {
+    /// Split these functions in parallel: one worker per function.
+    SplitFunctions(SplitBatch),
+    /// Formalize these pieces in parallel: one worker per piece.
+    FormalizePieces(FormalizeBatch),
+    /// The machine's final result.
+    Finished(VerificationResult),
+}
+
+/// Resume data carried around a split fan-out phase.
+pub struct SplitBatch {
+    pub project_path: PathBuf,
+    pub verification_dir: PathBuf,
+    pub branch_name: String,
+    /// One entry per fan-out child; emptied when the phase is built.
+    pub functions: Vec<FunctionWork>,
+    pub accumulated_bugs: Vec<BugReport>,
+}
+
+/// One function's splitting work, handed to a fan-out child.
+pub struct FunctionWork {
+    pub file: PathBuf,
+    pub function_id: FunctionId,
+    pub body: String,
+}
+
+/// Resume data carried around a formalize fan-out phase.
+pub struct FormalizeBatch {
+    pub project_path: PathBuf,
+    pub verification_dir: PathBuf,
+    pub branch_name: String,
+    /// One entry per fan-out child; emptied when the phase is built.
+    pub pieces: Vec<(ArcCodePiece, ContextId)>,
+    pub accumulated_bugs: Vec<BugReport>,
+    pub total_functions: usize,
+    pub total_pieces: usize,
 }
 
 pub struct Initializer {
@@ -137,8 +146,8 @@ impl PreflightGit {
         Self { project_path }
     }
 }
-impl<'a> State<VerificationResult, MachineEnv<'a>> for PreflightGit {
-    fn execute<'r>(&mut self, _ctx: &mut Ctx<'_, '_>, env: &MachineEnv<'a>) -> Result<Step<'r, VerificationResult, MachineEnv<'a>>> {
+impl<'a> State<Signal, MachineEnv<'a>> for PreflightGit {
+    fn execute<'r>(&mut self, env: &MachineEnv<'a>) -> Result<Step<'r, Signal, MachineEnv<'a>>> {
         info!("preflight: checking git");
         let _resp = env.providers.git.invoke(GitRequest::CurrentCommitHash)?;
         info!("preflight: git OK");
@@ -149,8 +158,8 @@ impl<'a> State<VerificationResult, MachineEnv<'a>> for PreflightGit {
 pub struct PreflightSolver {
     project_path: PathBuf,
 }
-impl<'a> State<VerificationResult, MachineEnv<'a>> for PreflightSolver {
-    fn execute<'r>(&mut self, _ctx: &mut Ctx<'_, '_>, env: &MachineEnv<'a>) -> Result<Step<'r, VerificationResult, MachineEnv<'a>>> {
+impl<'a> State<Signal, MachineEnv<'a>> for PreflightSolver {
+    fn execute<'r>(&mut self, env: &MachineEnv<'a>) -> Result<Step<'r, Signal, MachineEnv<'a>>> {
         info!("preflight: checking z3 solver");
         let root = ContextId::root();
         let resp = env.providers.solver.invoke(SolverRequest {
@@ -165,8 +174,8 @@ impl<'a> State<VerificationResult, MachineEnv<'a>> for PreflightSolver {
 pub struct PreflightPython {
     project_path: PathBuf,
 }
-impl<'a> State<VerificationResult, MachineEnv<'a>> for PreflightPython {
-    fn execute<'r>(&mut self, _ctx: &mut Ctx<'_, '_>, env: &MachineEnv<'a>) -> Result<Step<'r, VerificationResult, MachineEnv<'a>>> {
+impl<'a> State<Signal, MachineEnv<'a>> for PreflightPython {
+    fn execute<'r>(&mut self, env: &MachineEnv<'a>) -> Result<Step<'r, Signal, MachineEnv<'a>>> {
         info!("preflight: checking python3");
         let _resp = env.providers.python.invoke(PythonRequest {
             script: PREFLIGHT_PYTHON_SCRIPT.to_string(),
@@ -179,8 +188,8 @@ impl<'a> State<VerificationResult, MachineEnv<'a>> for PreflightPython {
 pub struct PreflightAgent {
     project_path: PathBuf,
 }
-impl<'a> State<VerificationResult, MachineEnv<'a>> for PreflightAgent {
-    fn execute<'r>(&mut self, _ctx: &mut Ctx<'_, '_>, env: &MachineEnv<'a>) -> Result<Step<'r, VerificationResult, MachineEnv<'a>>> {
+impl<'a> State<Signal, MachineEnv<'a>> for PreflightAgent {
+    fn execute<'r>(&mut self, env: &MachineEnv<'a>) -> Result<Step<'r, Signal, MachineEnv<'a>>> {
         info!("preflight: checking opencode agent");
         let resp = env.providers.agent.invoke(AgentRequest {
             prompt: PREFLIGHT_AGENT_PROMPT.to_string(),
@@ -202,8 +211,8 @@ impl<'a> State<VerificationResult, MachineEnv<'a>> for PreflightAgent {
 pub struct PreflightProject {
     project_path: PathBuf,
 }
-impl<'a> State<VerificationResult, MachineEnv<'a>> for PreflightProject {
-    fn execute<'r>(&mut self, _ctx: &mut Ctx<'_, '_>, env: &MachineEnv<'a>) -> Result<Step<'r, VerificationResult, MachineEnv<'a>>> {
+impl<'a> State<Signal, MachineEnv<'a>> for PreflightProject {
+    fn execute<'r>(&mut self, env: &MachineEnv<'a>) -> Result<Step<'r, Signal, MachineEnv<'a>>> {
         info!("preflight: checking project files");
         let resp = env.providers.git.invoke(GitRequest::WalkRustFiles {
             path: self.project_path.clone(),
@@ -218,12 +227,11 @@ impl<'a> State<VerificationResult, MachineEnv<'a>> for PreflightProject {
     }
 }
 
-impl<'a> State<VerificationResult, MachineEnv<'a>> for Initializer {
+impl<'a> State<Signal, MachineEnv<'a>> for Initializer {
     fn execute<'r>(
         &mut self,
-        _ctx: &mut Ctx<'_, '_>,
         env: &MachineEnv<'a>,
-    ) -> Result<Step<'r, VerificationResult, MachineEnv<'a>>> {
+    ) -> Result<Step<'r, Signal, MachineEnv<'a>>> {
         let timestamp = chrono::Local::now().format(TIMESTAMP_FORMAT).to_string();
         let branch_name = format!("verification/{timestamp}");
 
@@ -315,12 +323,11 @@ pub struct FunctionLister {
     accumulated_bugs: Vec<BugReport>,
 }
 
-impl<'a> State<VerificationResult, MachineEnv<'a>> for FunctionLister {
+impl<'a> State<Signal, MachineEnv<'a>> for FunctionLister {
     fn execute<'r>(
         &mut self,
-        _ctx: &mut Ctx<'_, '_>,
         env: &MachineEnv<'a>,
-    ) -> Result<Step<'r, VerificationResult, MachineEnv<'a>>> {
+    ) -> Result<Step<'r, Signal, MachineEnv<'a>>> {
         info!("IO: rust-analyzer ListFunctions");
         let resp = env.providers
             .rust_analyzer
@@ -437,12 +444,11 @@ pub struct FunctionAnalyzer {
     accumulated_bugs: Vec<BugReport>,
 }
 
-impl<'a> State<VerificationResult, MachineEnv<'a>> for FunctionAnalyzer {
+impl<'a> State<Signal, MachineEnv<'a>> for FunctionAnalyzer {
     fn execute<'r>(
         &mut self,
-        _ctx: &mut Ctx<'_, '_>,
         env: &MachineEnv<'a>,
-    ) -> Result<Step<'r, VerificationResult, MachineEnv<'a>>> {
+    ) -> Result<Step<'r, Signal, MachineEnv<'a>>> {
         let mut function_bodies = Vec::new();
         for (file, function_ids) in &self.functions {
             for fid in function_ids {
@@ -483,37 +489,79 @@ pub struct Splitter {
     accumulated_bugs: Vec<BugReport>,
 }
 
-impl<'a> State<VerificationResult, MachineEnv<'a>> for Splitter {
+impl<'a> State<Signal, MachineEnv<'a>> for Splitter {
     fn execute<'r>(
         &mut self,
-        ctx: &mut Ctx<'_, '_>,
         env: &MachineEnv<'a>,
-    ) -> Result<Step<'r, VerificationResult, MachineEnv<'a>>> {
+    ) -> Result<Step<'r, Signal, MachineEnv<'a>>> {
         for (function_id, docs) in std::mem::take(&mut self.function_docs) {
             env.pm.store_function_docs(function_id, docs);
         }
 
-        // One splitter child per function; the fan-out lives here, in
-        // the enclosing tree.
-        let mut children: Vec<Context<'a, Vec<(ArcCodePiece, ContextId)>, MachineEnv<'a>>> =
-            std::mem::take(&mut self.function_bodies)
-                .into_iter()
-                .map(|(file, function_id, body)| {
-                    Context::new(
-                        ContextId::root(),
-                        Box::new(SplitWork { file, function_id, body }),
-                    )
-                })
-                .collect();
-        let per_function = run_child_batch(ctx, &mut children, env)?;
-        let pieces: Vec<(ArcCodePiece, ContextId)> = per_function.into_iter().flatten().collect();
-
-        Ok(Step::Continue(Box::new(FullFormalizer {
+        Ok(Step::Done(Signal::SplitFunctions(SplitBatch {
             project_path: std::mem::take(&mut self.project_path),
             verification_dir: std::mem::take(&mut self.verification_dir),
             branch_name: std::mem::take(&mut self.branch_name),
-            pieces,
+            functions: std::mem::take(&mut self.function_bodies)
+                .into_iter()
+                .map(|(file, function_id, body)| FunctionWork { file, function_id, body })
+                .collect(),
             accumulated_bugs: std::mem::take(&mut self.accumulated_bugs),
+        })))
+    }
+}
+
+/// Per-function splitter worker: a fan-out child running the split
+/// attempts for one function.
+pub struct SplitWork {
+    pub file: PathBuf,
+    pub function_id: FunctionId,
+    pub body: String,
+}
+
+impl<'a> State<Landed, MachineEnv<'a>> for SplitWork {
+    fn execute<'r>(
+        &mut self,
+        env: &MachineEnv<'a>,
+    ) -> Result<Step<'r, Landed, MachineEnv<'a>>> {
+        let pieces = split_function(
+            env.providers,
+            env.pm,
+            &self.file,
+            &self.function_id,
+            &self.body,
+        )?;
+        Ok(Step::Done(Landed::Pieces(pieces)))
+    }
+}
+
+/// Collects the per-function split results and enters full
+/// formalization.
+pub struct SplitCollect {
+    pub resume: SplitBatch,
+    pub landed: Vec<Landed>,
+}
+
+impl<'a> State<Signal, MachineEnv<'a>> for SplitCollect {
+    fn execute<'r>(
+        &mut self,
+        _env: &MachineEnv<'a>,
+    ) -> Result<Step<'r, Signal, MachineEnv<'a>>> {
+        let pieces: Vec<(ArcCodePiece, ContextId)> = std::mem::take(&mut self.landed)
+            .into_iter()
+            .filter_map(|l| match l {
+                Landed::Pieces(ps) => Some(ps),
+                Landed::Outcome(_) => None,
+            })
+            .flatten()
+            .collect();
+
+        Ok(Step::Continue(Box::new(FullFormalizer {
+            project_path: std::mem::take(&mut self.resume.project_path),
+            verification_dir: std::mem::take(&mut self.resume.verification_dir),
+            branch_name: std::mem::take(&mut self.resume.branch_name),
+            pieces,
+            accumulated_bugs: std::mem::take(&mut self.resume.accumulated_bugs),
         })))
     }
 }
@@ -615,31 +663,6 @@ fn parse_split_pieces(
     pieces
 }
 
-
-/// Per-function splitter worker: a fan-out child running the split
-/// attempts for one function.
-pub struct SplitWork {
-    pub file: PathBuf,
-    pub function_id: FunctionId,
-    pub body: String,
-}
-
-impl<'a> State<Vec<(ArcCodePiece, ContextId)>, MachineEnv<'a>> for SplitWork {
-    fn execute<'r>(
-        &mut self,
-        __ctx: &mut Ctx<'_, '_>,
-        env: &MachineEnv<'a>,
-    ) -> Result<Step<'r, Vec<(ArcCodePiece, ContextId)>, MachineEnv<'a>>> {
-        let pieces = split_function(
-            env.providers,
-            env.pm,
-            &self.file,
-            &self.function_id,
-            &self.body,
-        )?;
-        Ok(Step::Done(pieces))
-    }
-}
 
 pub struct FullFormalizer {
     project_path: PathBuf,
@@ -1173,71 +1196,29 @@ fn process_piece(
     })
 }
 
-impl<'a> State<VerificationResult, MachineEnv<'a>> for FullFormalizer {
+impl<'a> State<Signal, MachineEnv<'a>> for FullFormalizer {
     fn execute<'r>(
         &mut self,
-        ctx: &mut Ctx<'_, '_>,
-        env: &MachineEnv<'a>,
-    ) -> Result<Step<'r, VerificationResult, MachineEnv<'a>>> {
+        _env: &MachineEnv<'a>,
+    ) -> Result<Step<'r, Signal, MachineEnv<'a>>> {
         let total_functions = self.functions_count();
         let total_pieces = self.pieces.len();
-
-        // One formalizer child per piece; the fan-out lives here, in
-        // the enclosing tree. A processing error maps to an
-        // unverified piece so one bad piece never aborts the batch.
-        let verification_dir = self.verification_dir.clone();
-        let mut children: Vec<Context<'a, PieceOutcome, MachineEnv<'a>>> =
-            std::mem::take(&mut self.pieces)
-                .into_iter()
-                .map(|(piece, ctx)| {
-                    Context::new(
-                        ContextId::root(),
-                        Box::new(PieceWork {
-                            piece,
-                            ctx: Some(ctx),
-                            verification_dir: verification_dir.clone(),
-                        }),
-                    )
-                })
-                .collect();
-        let outcomes = run_child_batch(ctx, &mut children, env)?;
-
-        let mut closed_pieces = Vec::new();
-        let mut unverified_pieces = Vec::new();
-        for outcome in outcomes {
-            if let Some(cp) = outcome.closed {
-                closed_pieces.push(cp);
-            }
-            if let Some(up) = outcome.unverified {
-                unverified_pieces.push(up);
-            }
-        }
-
-        if unverified_pieces.is_empty() {
-            Ok(Step::Done(VerificationResult {
-                closed_pieces,
-                unverified_pieces,
-                bug_reports: std::mem::take(&mut self.accumulated_bugs),
-                total_functions,
-                total_pieces,
-            }))
-        } else {
-            Ok(Step::Continue(Box::new(ProblemAnalyzer {
-                project_path: std::mem::take(&mut self.project_path),
-                verification_dir: std::mem::take(&mut self.verification_dir),
-                branch_name: std::mem::take(&mut self.branch_name),
-                closed: closed_pieces,
-                unverified: unverified_pieces,
-                recheck_files: Vec::new(),
-                base_commit: String::new(),
-                accumulated_bugs: std::mem::take(&mut self.accumulated_bugs),
-                total_pieces,
-                total_functions,
-            })))
-        }
+        Ok(Step::Done(Signal::FormalizePieces(FormalizeBatch {
+            project_path: std::mem::take(&mut self.project_path),
+            verification_dir: std::mem::take(&mut self.verification_dir),
+            branch_name: std::mem::take(&mut self.branch_name),
+            pieces: std::mem::take(&mut self.pieces),
+            accumulated_bugs: std::mem::take(&mut self.accumulated_bugs),
+            total_functions,
+            total_pieces,
+        })))
     }
 }
 
+/// Per-piece formalizer worker: a fan-out child running the whole
+/// formalize/SMT/fix/judge loop for one piece. A processing error
+/// maps to an unverified piece so one bad piece never aborts the
+/// batch.
 pub struct PieceWork {
     pub piece: ArcCodePiece,
     /// The piece's registered context id (from the split phase),
@@ -1246,12 +1227,11 @@ pub struct PieceWork {
     pub verification_dir: PathBuf,
 }
 
-impl<'a> State<PieceOutcome, MachineEnv<'a>> for PieceWork {
+impl<'a> State<Landed, MachineEnv<'a>> for PieceWork {
     fn execute<'r>(
         &mut self,
-        __ctx: &mut Ctx<'_, '_>,
         env: &MachineEnv<'a>,
-    ) -> Result<Step<'r, PieceOutcome, MachineEnv<'a>>> {
+    ) -> Result<Step<'r, Landed, MachineEnv<'a>>> {
         let ctx_label = self
             .ctx
             .as_ref()
@@ -1282,7 +1262,59 @@ impl<'a> State<PieceOutcome, MachineEnv<'a>> for PieceWork {
                 }
             }
         };
-        Ok(Step::Done(outcome))
+        Ok(Step::Done(Landed::Outcome(Box::new(outcome))))
+    }
+}
+
+/// Collects the per-piece outcomes and decides: done, or analyze the
+/// problems.
+pub struct FormalizeCollect {
+    pub resume: FormalizeBatch,
+    pub landed: Vec<Landed>,
+}
+
+impl<'a> State<Signal, MachineEnv<'a>> for FormalizeCollect {
+    fn execute<'r>(
+        &mut self,
+        _env: &MachineEnv<'a>,
+    ) -> Result<Step<'r, Signal, MachineEnv<'a>>> {
+        let mut closed_pieces = Vec::new();
+        let mut unverified_pieces = Vec::new();
+        for landed in std::mem::take(&mut self.landed) {
+            let outcome = match landed {
+                Landed::Outcome(outcome) => *outcome,
+                Landed::Pieces(_) => continue,
+            };
+            if let Some(cp) = outcome.closed {
+                closed_pieces.push(cp);
+            }
+            if let Some(up) = outcome.unverified {
+                unverified_pieces.push(up);
+            }
+        }
+
+        if unverified_pieces.is_empty() {
+            Ok(Step::Done(Signal::Finished(VerificationResult {
+                closed_pieces,
+                unverified_pieces,
+                bug_reports: std::mem::take(&mut self.resume.accumulated_bugs),
+                total_functions: self.resume.total_functions,
+                total_pieces: self.resume.total_pieces,
+            })))
+        } else {
+            Ok(Step::Continue(Box::new(ProblemAnalyzer {
+                project_path: std::mem::take(&mut self.resume.project_path),
+                verification_dir: std::mem::take(&mut self.resume.verification_dir),
+                branch_name: std::mem::take(&mut self.resume.branch_name),
+                closed: closed_pieces,
+                unverified: unverified_pieces,
+                recheck_files: Vec::new(),
+                base_commit: String::new(),
+                accumulated_bugs: std::mem::take(&mut self.resume.accumulated_bugs),
+                total_pieces: self.resume.total_pieces,
+                total_functions: self.resume.total_functions,
+            })))
+        }
     }
 }
 
@@ -1299,12 +1331,11 @@ pub struct ProblemAnalyzer {
     total_functions: usize,
 }
 
-impl<'a> State<VerificationResult, MachineEnv<'a>> for ProblemAnalyzer {
+impl<'a> State<Signal, MachineEnv<'a>> for ProblemAnalyzer {
     fn execute<'r>(
         &mut self,
-        _ctx: &mut Ctx<'_, '_>,
         env: &MachineEnv<'a>,
-    ) -> Result<Step<'r, VerificationResult, MachineEnv<'a>>> {
+    ) -> Result<Step<'r, Signal, MachineEnv<'a>>> {
         info!(
             unverified_count = self.unverified.len(),
             closed_count = self.closed.len(),
@@ -1478,13 +1509,13 @@ If you respond RETRY, make sure to commit your changes first."#,
         all_bugs.extend(bug_reports);
 
         if remaining_unverified.is_empty() {
-            Ok(Step::Done(VerificationResult {
+            Ok(Step::Done(Signal::Finished(VerificationResult {
                 closed_pieces: std::mem::take(&mut self.closed),
                 unverified_pieces: Vec::new(),
                 bug_reports: all_bugs,
                 total_functions: self.total_functions,
                 total_pieces: self.total_pieces,
-            }))
+            })))
         } else {
             Ok(Step::Continue(Box::new(Restarter {
                 project_path: std::mem::take(&mut self.project_path),
@@ -1507,12 +1538,11 @@ pub struct Restarter {
     accumulated_bugs: Vec<BugReport>,
 }
 
-impl<'a> State<VerificationResult, MachineEnv<'a>> for Restarter {
+impl<'a> State<Signal, MachineEnv<'a>> for Restarter {
     fn execute<'r>(
         &mut self,
-        _ctx: &mut Ctx<'_, '_>,
         env: &MachineEnv<'a>,
-    ) -> Result<Step<'r, VerificationResult, MachineEnv<'a>>> {
+    ) -> Result<Step<'r, Signal, MachineEnv<'a>>> {
         info!("IO: git FindChangedRustFiles");
         let resp = env.providers
             .git

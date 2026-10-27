@@ -342,19 +342,29 @@ fn main() -> Result<()> {
                 let _v = bg_config.update(|cfg| cfg.llm.api_key = api_key.clone());
 
                 info!("creating llm client");
-                let llm = refactor_check_core::llm::LlmClient::with_live_config(bg_config.clone())
-                    .with_error_gate(gate.clone());
+                let llm: &'static _ = Box::leak(Box::new(
+                    refactor_check_core::llm::LlmClient::with_live_config(bg_config.clone())
+                        .with_error_gate(gate.clone()),
+                ));
                 info!("creating solver");
-                let solver = Z3Solver::with_live_config(bg_config.clone())
-                    .with_error_gate(gate.clone());
+                let solver: &'static _ = Box::leak(Box::new(
+                    Z3Solver::with_live_config(bg_config.clone()).with_error_gate(gate.clone()),
+                ));
 
                 info!(project = %bg_project, "loading rust-analyzer workspace");
-                let rust_analyzer = deductive_check::provider::CliRustAnalyzerProvider::new(bg_project.clone())?;
+                let rust_analyzer: &'static _ = Box::leak(Box::new(
+                    deductive_check::provider::CliRustAnalyzerProvider::new(bg_project.clone())?,
+                ));
                 info!("rust-analyzer workspace loaded");
-                let git = deductive_check::provider::CliGitProvider::new(PathBuf::from(&bg_project));
-                let filesystem = deductive_check::provider::LocalFileSystemProvider::new();
-                let python = deductive_check::provider::ProcessPythonProvider::new()
-                    .with_error_gate(gate.clone());
+                let git: &'static _ = Box::leak(Box::new(
+                    deductive_check::provider::CliGitProvider::new(PathBuf::from(&bg_project)),
+                ));
+                let filesystem: &'static _ =
+                    Box::leak(Box::new(deductive_check::provider::LocalFileSystemProvider::new()));
+                let python: &'static _ = Box::leak(Box::new(
+                    deductive_check::provider::ProcessPythonProvider::new()
+                        .with_error_gate(gate.clone()),
+                ));
 
                 let mut agent_args = vec![agent_subcommand];
                 if agent_skip_permissions {
@@ -365,24 +375,32 @@ fn main() -> Result<()> {
                     agent_args.push(agent_model);
                 }
                 let key_env = api_key_env_var(&api_base_for_agent);
-                let agent = deductive_check::provider::CliAgentProvider::new(agent_binary, agent_args)
-                    .with_live_api_key(key_env, bg_config.clone())
-                    .with_api_key(key_env, api_key.clone())
-                    .with_error_gate(gate.clone());
+                let agent: &'static _ = Box::leak(Box::new(
+                    deductive_check::provider::CliAgentProvider::new(agent_binary, agent_args)
+                        .with_live_api_key(key_env, bg_config.clone())
+                        .with_api_key(key_env, api_key.clone())
+                        .with_error_gate(gate.clone()),
+                ));
 
-                let providers = deductive_check::provider::Providers {
-                    llm: &llm,
-                    solver: &solver,
-                    rust_analyzer: &rust_analyzer,
-                    git: &git,
-                    filesystem: &filesystem,
-                    python: &python,
-                    agent: &agent,
-                };
+                let providers: &'static deductive_check::provider::Providers<'static> =
+                    Box::leak(Box::new(deductive_check::provider::Providers {
+                        llm,
+                        solver,
+                        rust_analyzer,
+                        git,
+                        filesystem,
+                        python,
+                        agent,
+                    }));
 
-                let pm = deductive_check::piece_manager::DefaultDeductivePieceManager::new(bg_log.clone());
+                let pm: &'static deductive_check::piece_manager::DefaultDeductivePieceManager =
+                    Box::leak(Box::new(
+                        deductive_check::piece_manager::DefaultDeductivePieceManager::new(
+                            bg_log.clone(),
+                        ),
+                    ));
 
-                let result = deductive_check::machine::run(&bg_project, &providers, &pm)?;
+                let result = deductive_check::machine::run(&bg_project, providers, pm)?;
 
                 let result_path = std::path::PathBuf::from(&result_file);
                 if let Some(parent) = result_path.parent() {
